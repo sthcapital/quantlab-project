@@ -3,9 +3,9 @@ import html
 import re
 from collections import Counter
 from datetime import datetime, timedelta
-
 from ib_insync import IB, Stock
-
+import csv
+from pathlib import Path
 
 NEWS_RE = re.compile(r"\{.*?\}!?")
 
