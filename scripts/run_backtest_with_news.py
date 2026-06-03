@@ -259,7 +259,9 @@ def print_summary(label, subset):
 
 
 def export_trades_csv(symbol: str, mode: str, trades):
-    output_dir = Path("output")
+    script_dir = Path(__file__).resolve().parent
+    project_dir = script_dir.parent
+    output_dir = project_dir / "output"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     file_path = output_dir / f"{symbol}_{mode}_news_trades.csv"
@@ -287,6 +289,9 @@ def export_trades_csv(symbol: str, mode: str, trades):
         for trade in trades:
             writer.writerow(trade)
 
+    if not file_path.exists():
+        raise SystemExit(f"CSV export failed: {file_path}")
+
     return file_path
 
 
@@ -308,6 +313,9 @@ def main() -> None:
     ib = IB()
 
     try:
+        print(f"script_path={Path(__file__).resolve()}")
+        print(f"cwd={Path.cwd()}")
+
         ib.connect(args.host, args.port, clientId=args.client_id, timeout=10)
 
         contract, bars = fetch_bars(ib, args.symbol, args.start, args.end)
@@ -353,8 +361,9 @@ def main() -> None:
             if len(subset) >= 2:
                 print_summary(f"category={category}", subset)
 
+        print("about to export")
         csv_path = export_trades_csv(args.symbol, args.mode, trades)
-        print(f"\ncsv_export={csv_path}")
+        print(f"\ncsv_export={csv_path.resolve()}")
 
     finally:
         if ib.isConnected():
