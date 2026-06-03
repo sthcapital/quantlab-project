@@ -55,11 +55,7 @@ def fetch_bars(ib: IB, symbol: str, start: str, end: str):
 
     contract = qualified[0]
 
-    bars = ib.reqHistoricalData(
-        contract,
-        endDateTime="",
-        durationStr="180 D",
-        barSizeSetting="1 day",
+    bars = ib.reqHistoricalData(`r`n        contract,`r`n        endDateTime="",`r`n        durationStr="180 D",`r`n        barSizeSetting="1 day",
         whatToShow="TRADES",
         useRTH=True,
         formatDate=1,
@@ -227,3 +223,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
