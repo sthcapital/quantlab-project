@@ -1,11 +1,13 @@
 from argparse import ArgumentParser
+import csv
 import html
 import re
 from collections import Counter
 from datetime import datetime, timedelta
-from ib_insync import IB, Stock
-import csv
 from pathlib import Path
+
+from ib_insync import IB, Stock
+
 
 NEWS_RE = re.compile(r"\{.*?\}!?")
 
@@ -256,6 +258,38 @@ def print_summary(label, subset):
     print(f"MAE avg={fmt_pct(mae['avg'])} med={fmt_pct(mae['med'])}")
 
 
+def export_trades_csv(symbol: str, mode: str, trades):
+    output_dir = Path("output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    file_path = output_dir / f"{symbol}_{mode}_news_trades.csv"
+
+    fieldnames = [
+        "date",
+        "close",
+        "ret_1d",
+        "ret_3d",
+        "ret_5d",
+        "mfe_5d",
+        "mae_5d",
+        "dominant_news_category",
+        "recent_news_count",
+        "recent_upgrade_count",
+        "recent_analyst_action_count",
+        "recent_earnings_count",
+        "recent_management_count",
+        "recent_other_count",
+    ]
+
+    with file_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for trade in trades:
+            writer.writerow(trade)
+
+    return file_path
+
+
 def main() -> None:
     parser = ArgumentParser(description="Run a simple backtest with IBKR news features.")
     parser.add_argument("--symbol", required=True)
@@ -318,6 +352,9 @@ def main() -> None:
             subset = [t for t in trades if t["dominant_news_category"] == category]
             if len(subset) >= 2:
                 print_summary(f"category={category}", subset)
+
+        csv_path = export_trades_csv(args.symbol, args.mode, trades)
+        print(f"\ncsv_export={csv_path}")
 
     finally:
         if ib.isConnected():
