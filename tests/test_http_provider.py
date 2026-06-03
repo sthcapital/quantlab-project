@@ -1,5 +1,7 @@
 from datetime import date
 
+import pytest
+
 from quantlab.providers.http import HttpMarketDataProvider
 
 
@@ -58,3 +60,26 @@ def test_http_provider_parses_daily_bars(monkeypatch):
     assert bars[0].close == 102.0
     assert bars[1].as_of.isoformat() == "2026-01-03"
     assert bars[1].close == 103.0
+
+
+def test_http_provider_raises_on_information_payload(monkeypatch):
+    payload = {
+        "Information": (
+            "Thank you for using Alpha Vantage! "
+            "The outputsize=full parameter value is a premium feature."
+        )
+    }
+
+    def fake_get(*args, **kwargs):
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("quantlab.providers.http.requests.get", fake_get)
+
+    provider = HttpMarketDataProvider("https://example.com", "test-key")
+
+    with pytest.raises(ValueError, match="Alpha Vantage information"):
+        provider.get_daily_bars(
+            symbol="AAPL",
+            start_date=date(2026, 1, 2),
+            end_date=date(2026, 1, 3),
+        )
