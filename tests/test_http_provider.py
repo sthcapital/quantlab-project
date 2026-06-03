@@ -106,3 +106,25 @@ def test_http_provider_raises_on_note_payload(monkeypatch):
             start_date=date(2026, 1, 2),
             end_date=date(2026, 1, 3),
         )
+
+def test_http_provider_raises_on_error_message_payload(monkeypatch):
+    payload = {
+        "Error Message": (
+            "the parameter apikey is invalid or missing. "
+            "Please claim your free API key."
+        )
+    }
+
+    def fake_get(*args, **kwargs):
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("quantlab.providers.http.requests.get", fake_get)
+
+    provider = HttpMarketDataProvider("https://example.com", "test-key")
+
+    with pytest.raises(ValueError, match="Alpha Vantage error"):
+        provider.get_daily_bars(
+            symbol="AAPL",
+            start_date=date(2026, 1, 2),
+            end_date=date(2026, 1, 3),
+        )
