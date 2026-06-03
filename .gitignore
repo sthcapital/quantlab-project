@@ -7,3 +7,7 @@ output/
 data/raw/
 data/processed/
 data/external/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
