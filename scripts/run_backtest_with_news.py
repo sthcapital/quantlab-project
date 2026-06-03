@@ -54,12 +54,11 @@ def fetch_bars(ib: IB, symbol: str, start: str, end: str):
         raise SystemExit(f"Could not qualify contract for {symbol}")
 
     contract = qualified[0]
-    end_dt = end.replace("-", "") + " 23:59:59"
 
     bars = ib.reqHistoricalData(
         contract,
-        endDateTime=end_dt,
-        durationStr="90 D",
+        endDateTime="",
+        durationStr="180 D",
         barSizeSetting="1 day",
         whatToShow="TRADES",
         useRTH=True,
