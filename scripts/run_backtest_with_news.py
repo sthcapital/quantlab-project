@@ -4,7 +4,6 @@ import re
 from collections import Counter
 from datetime import datetime, timedelta
 
-
 from ib_insync import IB, Stock
 
 
