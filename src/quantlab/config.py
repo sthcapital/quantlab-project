@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 
 from quantlab.paths import (
@@ -13,7 +14,12 @@ from quantlab.paths import (
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "quantlab"
-    log_level: str = "INFO"
+    environment: str = os.getenv("QUANTLAB_ENV", "dev")
+    log_level: str = os.getenv("QUANTLAB_LOG_LEVEL", "INFO")
+    market_data_provider: str = os.getenv("MARKET_DATA_PROVIDER", "")
+    market_data_api_key: str = os.getenv("MARKET_DATA_API_KEY", "")
+    market_data_api_secret: str = os.getenv("MARKET_DATA_API_SECRET", "")
+    market_data_base_url: str = os.getenv("MARKET_DATA_BASE_URL", "")
     project_root: str = str(PROJECT_ROOT)
     data_dir: str = str(DATA_DIR)
     raw_data_dir: str = str(RAW_DATA_DIR)
