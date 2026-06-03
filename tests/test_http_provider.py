@@ -83,3 +83,26 @@ def test_http_provider_raises_on_information_payload(monkeypatch):
             start_date=date(2026, 1, 2),
             end_date=date(2026, 1, 3),
         )
+
+
+def test_http_provider_raises_on_note_payload(monkeypatch):
+    payload = {
+        "Note": (
+            "Thank you for using Alpha Vantage! "
+            "Our standard API rate limit is 25 requests per day."
+        )
+    }
+
+    def fake_get(*args, **kwargs):
+        return DummyResponse(payload)
+
+    monkeypatch.setattr("quantlab.providers.http.requests.get", fake_get)
+
+    provider = HttpMarketDataProvider("https://example.com", "test-key")
+
+    with pytest.raises(ValueError, match="Alpha Vantage note"):
+        provider.get_daily_bars(
+            symbol="AAPL",
+            start_date=date(2026, 1, 2),
+            end_date=date(2026, 1, 3),
+        )
