@@ -191,7 +191,7 @@ def run_strategy(bars, mode: str, lookback: int, news_rows, news_lookback: int):
         future_3 = bars[i + 3]["close"] if i + 3 < len(bars) else None
         future_5 = bars[i + 5]["close"] if i + 5 < len(bars) else None
 
-        forward_window = bars[i + 1:i + 6]
+        forward_window = bars[i + 1 : i + 6]
         mfe_5d = None
         mae_5d = None
         if forward_window:
