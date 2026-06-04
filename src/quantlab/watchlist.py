@@ -76,6 +76,9 @@ def _layers_fired(scan_result) -> str:
     if getattr(scan_result, "multi_lookback_confirmed", False):
         layers.append("MULTI_LB")
 
+    if getattr(scan_result, "sector_cluster", False):
+        layers.append("SECTOR_CLUSTER")
+
     opt = getattr(scan_result, "options_conviction", 0.0)
     if opt >= 0.6:
         layers.append("OPTIONS")

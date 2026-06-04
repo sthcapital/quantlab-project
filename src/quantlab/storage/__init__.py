@@ -253,9 +253,20 @@ def _ensure_schema(con) -> None:
             accumulation_ratio   DOUBLE,
             volume_trend         DOUBLE,
             climactic_volume     DOUBLE,
+            sector               VARCHAR,
+            sector_cluster       BOOLEAN DEFAULT FALSE,
             created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migration: add sector columns to scan_results if absent (added later)
+    try:
+        _sr_cols = {r[1] for r in con.execute("PRAGMA table_info(scan_results)").fetchall()}
+        for _col, _dtype in [("sector", "VARCHAR"), ("sector_cluster", "BOOLEAN")]:
+            if _col not in _sr_cols:
+                con.execute(f"ALTER TABLE scan_results ADD COLUMN {_col} {_dtype}")
+    except Exception:
+        pass
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS walk_forward_windows (
@@ -577,7 +588,8 @@ def append_scan_results(scan_id: str, results: list) -> None:
                     rel_volume, atr_stop,
                     base_quality, absorption, volume_character, wyckoff_spring,
                     earnings_acceleration,
-                    accumulation_ratio, volume_trend, climactic_volume
+                    accumulation_ratio, volume_trend, climactic_volume,
+                    sector, sector_cluster
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
@@ -585,7 +597,8 @@ def append_scan_results(scan_id: str, results: list) -> None:
                     ?, ?,
                     ?, ?, ?, ?,
                     ?,
-                    ?, ?, ?
+                    ?, ?, ?,
+                    ?, ?
                 )
             """, [
                 scan_id, r.scan_date, r.symbol, r.signal_type, r.lookback,
@@ -595,6 +608,7 @@ def append_scan_results(scan_id: str, results: list) -> None:
                 r.base_quality, r.absorption, r.volume_character, r.wyckoff_spring,
                 r.earnings_acceleration,
                 r.accumulation_ratio, r.volume_trend, r.climactic_volume,
+                getattr(r, "sector", ""), getattr(r, "sector_cluster", False),
             ])
         con.close()
     except Exception as e:

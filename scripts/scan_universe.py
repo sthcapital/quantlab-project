@@ -148,17 +148,20 @@ def main() -> None:
     print(f"{'─'*60}")
 
     for i, r in enumerate(results, 1):
-        stop_str = f"  stop={r.atr_stop:.2f}" if r.atr_stop else ""
-        rv_str   = f"  rel_vol={r.rel_volume:.2f}x" if r.rel_volume else ""
-        ea_str   = f"  ea={r.earnings_acceleration:.2f}" \
-                   if r.earnings_acceleration > 0 else "  ea=0.00"
-        vol_str  = (
+        from quantlab.execution import _SECTOR_ABBREV
+        stop_str    = f"  stop={r.atr_stop:.2f}" if r.atr_stop else ""
+        rv_str      = f"  rel_vol={r.rel_volume:.2f}x" if r.rel_volume else ""
+        ea_str      = f"  ea={r.earnings_acceleration:.2f}" \
+                      if r.earnings_acceleration > 0 else "  ea=0.00"
+        vol_str     = (
             f"  ar={r.accumulation_ratio:.2f}"
             f"  vt={r.volume_trend:.2f}"
             f"  cv={r.climactic_volume:.2f}"
         )
-        multi_str = " ✓" if r.multi_lookback_confirmed else "  "
-        opt_str   = f"  opt={r.options_conviction:.2f}" if r.options_conviction > 0 else ""
+        multi_str   = " ✓" if r.multi_lookback_confirmed else "  "
+        opt_str     = f"  opt={r.options_conviction:.2f}" if r.options_conviction > 0 else ""
+        sector_abbr = _SECTOR_ABBREV.get(r.sector, r.sector[:6]) if r.sector else "?"
+        sector_str  = f"  [{sector_abbr}{'⚑' if r.sector_cluster else ''}]"
         print(
             f"  {i:2d}. {r.symbol:<8} "
             f"conviction={r.conviction_score:.2f}{multi_str}  "
@@ -166,7 +169,7 @@ def main() -> None:
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
-            f"{ea_str}{opt_str}{vol_str}{rv_str}{stop_str}"
+            f"{ea_str}{opt_str}{sector_str}{vol_str}{rv_str}{stop_str}"
         )
 
     print(f"\n{'='*60}\n")

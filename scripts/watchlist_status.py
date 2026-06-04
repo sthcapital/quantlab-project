@@ -155,7 +155,7 @@ def print_active(entries: list[dict], prices: dict[str, float]) -> None:
         print("  (no active entries)")
         return
 
-    hdr = (f"  {'#':>2}  {'symbol':<8}  {'added':>10}  {'entry':>7}  "
+    hdr = (f"  {'#':>2}  {'symbol':<8}  {'sector':<7}  {'added':>10}  {'entry':>7}  "
            f"{'current':>8}  {'return':>9}  {'days':>4}  "
            f"{'stop':>7}  {'dist':>6}  layers")
     print(hdr)
@@ -182,10 +182,13 @@ def print_active(entries: list[dict], prices: dict[str, float]) -> None:
         dist_s = f"{dist:>+.1f}%" if dist is not None else "    --"
 
         from quantlab.watchlist import _trading_days_elapsed
-        days = _trading_days_elapsed(da)
+        from quantlab.execution import SECTOR_MAP, _SECTOR_ABBREV
+        days        = _trading_days_elapsed(da)
+        raw_sector  = SECTOR_MAP.get(sym, "")
+        sector_disp = _SECTOR_ABBREV.get(raw_sector, raw_sector[:7])
 
         print(
-            f"  {i:>2}.  {sym:<8}  {str(da):>10}  {entry_p:>7.2f}  "
+            f"  {i:>2}.  {sym:<8}  {sector_disp:<7}  {str(da):>10}  {entry_p:>7.2f}  "
             f"{cur_s}  {ret_s}  {days:>4}  "
             f"{atr_stop:>7.2f}  {dist_s:>6}{alarm}  {layers}"
         )

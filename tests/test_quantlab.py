@@ -2894,3 +2894,140 @@ class TestWatchlistStatusFormatters:
         ws = self._import()
         assert callable(ws.main)
         assert callable(ws.run_dashboard)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Sector correlation filter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSectorFilter:
+
+    def _scan_result(self, symbol: str, conviction: float) -> ScanResult:
+        from quantlab.execution import SECTOR_MAP
+        r = ScanResult(
+            symbol=symbol, scan_date="2026-06-04",
+            signal_type="breakout", signal=True,
+            entry_close=100.0, indicator_value=None, lookback=5,
+            conviction_score=conviction,
+        )
+        r.sector = SECTOR_MAP.get(symbol, "")
+        return r
+
+    # ── SECTOR_MAP coverage ───────────────────────────────────────────────────
+
+    def test_sector_map_covers_all_sp500_sample(self):
+        from quantlab.execution import SECTOR_MAP, SP500_SAMPLE
+        missing = [s for s in SP500_SAMPLE if s not in SECTOR_MAP]
+        assert missing == [], f"Missing sectors for: {missing}"
+
+    def test_sector_map_has_10_sectors(self):
+        from quantlab.execution import SECTOR_MAP
+        sectors = set(SECTOR_MAP.values())
+        assert len(sectors) == 10
+
+    def test_sector_map_known_assignments(self):
+        from quantlab.execution import SECTOR_MAP
+        assert SECTOR_MAP["AAPL"]   == "Technology"
+        assert SECTOR_MAP["UNH"]    == "Health Care"
+        assert SECTOR_MAP["JPM"]    == "Financials"
+        assert SECTOR_MAP["XOM"]    == "Energy"
+        assert SECTOR_MAP["BRK B"]  == "Financials"
+        assert SECTOR_MAP["NEE"]    == "Utilities"
+        assert SECTOR_MAP["LIN"]    == "Materials"
+
+    def test_sector_abbrev_covers_all_sectors(self):
+        from quantlab.execution import SECTOR_MAP, _SECTOR_ABBREV
+        sectors = set(SECTOR_MAP.values())
+        for s in sectors:
+            assert s in _SECTOR_ABBREV, f"No abbreviation for sector: {s}"
+
+    # ── sector_filter() behaviour ─────────────────────────────────────────────
+
+    def test_cluster_of_3_triggers_penalty(self):
+        from quantlab.execution import sector_filter
+        results = [
+            self._scan_result("ABT",  0.70),  # Health Care
+            self._scan_result("UNH",  0.65),  # Health Care
+            self._scan_result("LLY",  0.62),  # Health Care
+        ]
+        sector_filter(results)
+        assert all(r.sector_cluster is True for r in results)
+        # 0.70−0.05=0.65, 0.65−0.05=0.60, 0.62−0.05=0.57 (results re-sorted desc)
+        expected = [0.65, 0.60, 0.57]
+        assert all(abs(r.conviction_score - exp) < 1e-4
+                   for r, exp in zip(sorted(results, key=lambda x: -x.conviction_score),
+                                     expected))
+
+    def test_cluster_of_2_no_penalty(self):
+        from quantlab.execution import sector_filter
+        results = [
+            self._scan_result("XOM", 0.70),   # Energy
+            self._scan_result("CVX", 0.65),   # Energy
+        ]
+        sector_filter(results)
+        assert all(r.sector_cluster is False for r in results)
+        assert results[0].conviction_score == pytest.approx(0.70)
+        assert results[1].conviction_score == pytest.approx(0.65)
+
+    def test_non_clustered_symbol_unaffected(self):
+        from quantlab.execution import sector_filter
+        results = [
+            self._scan_result("ABT",  0.70),  # Health Care ×3 → cluster
+            self._scan_result("UNH",  0.65),
+            self._scan_result("LLY",  0.62),
+            self._scan_result("AAPL", 0.75),  # Technology ×1 → no cluster
+        ]
+        sector_filter(results)
+        aapl = next(r for r in results if r.symbol == "AAPL")
+        assert aapl.sector_cluster is False
+        assert aapl.conviction_score == pytest.approx(0.75)
+
+    def test_penalty_capped_at_zero(self):
+        from quantlab.execution import sector_filter
+        results = [
+            self._scan_result("ABT",  0.02),
+            self._scan_result("UNH",  0.02),
+            self._scan_result("LLY",  0.02),
+        ]
+        sector_filter(results)
+        assert all(r.conviction_score >= 0.0 for r in results)
+
+    def test_cluster_flag_in_layers_fired(self):
+        from quantlab.execution import sector_filter
+        from quantlab.watchlist import _layers_fired
+        results = [
+            self._scan_result("ABT",  0.70),
+            self._scan_result("UNH",  0.65),
+            self._scan_result("LLY",  0.62),
+        ]
+        sector_filter(results)
+        r = results[0]
+        r.regime_bullish = True
+        layers = _layers_fired(r)
+        assert "SECTOR_CLUSTER" in layers
+
+    def test_results_re_sorted_after_penalty(self):
+        from quantlab.execution import sector_filter
+        results = [
+            self._scan_result("AAPL", 0.72),  # Tech ×1 — no penalty
+            self._scan_result("ABT",  0.70),  # HC ×3 → 0.65
+            self._scan_result("UNH",  0.65),  # HC ×3 → 0.60
+            self._scan_result("LLY",  0.62),  # HC ×3 → 0.57
+        ]
+        out = sector_filter(results)
+        # After penalty AAPL (0.72) should be first
+        assert out[0].symbol == "AAPL"
+        # Scores descending
+        scores = [r.conviction_score for r in out]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_scan_result_sector_defaults_empty(self):
+        r = ScanResult("X","2026-06-04","breakout",True,100.0,None,5)
+        assert r.sector == ""
+        assert r.sector_cluster is False
+
+    def test_scan_symbol_populates_sector(self):
+        bars = make_bars(100, trend=0.002)
+        result = scan_symbol("AAPL", bars, signal_type="breakout", lookback=5)
+        assert result is not None
+        assert result.sector == "Technology"

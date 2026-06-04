@@ -109,6 +109,10 @@ class ScanResult:
     # Multi-lookback confirmation (set post-scan when signal fires at ≥2 lookbacks)
     multi_lookback_confirmed: bool = False  # True → +0.05 structural confirmation bonus
 
+    # Sector metadata (from SECTOR_MAP; used by sector_filter)
+    sector: str = ""               # GICS sector (e.g. "Health Care", "Technology")
+    sector_cluster: bool = False   # True when ≥3 same-sector signals on same day
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -265,6 +269,60 @@ SP500_SAMPLE = [
 ]
 
 WATCHLIST_SMALL = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "GOOGL", "META"]
+
+# ── GICS sector map ────────────────────────────────────────────────────────────
+# Maps every SP500_SAMPLE symbol to its GICS sector.
+# Used by sector_filter() to detect and penalise same-day sector clustering.
+
+SECTOR_MAP: dict[str, str] = {
+    # Information Technology (13)
+    "AAPL": "Technology",  "MSFT": "Technology",  "NVDA": "Technology",
+    "AVGO": "Technology",  "ADBE": "Technology",  "ACN":  "Technology",
+    "CRM":  "Technology",  "CSCO": "Technology",  "ORCL": "Technology",
+    "TXN":  "Technology",  "INTC": "Technology",  "QCOM": "Technology",
+    "IBM":  "Technology",
+    # Consumer Discretionary (6)
+    "AMZN": "Consumer Discretionary",  "TSLA": "Consumer Discretionary",
+    "HD":   "Consumer Discretionary",  "MCD":  "Consumer Discretionary",
+    "NKE":  "Consumer Discretionary",  "NFLX": "Consumer Discretionary",
+    # Communication Services (2)
+    "GOOGL": "Communication Services",  "META": "Communication Services",
+    # Health Care (9)
+    "UNH":  "Health Care",  "LLY":  "Health Care",  "MRK":  "Health Care",
+    "ABBV": "Health Care",  "TMO":  "Health Care",  "DHR":  "Health Care",
+    "ABT":  "Health Care",  "AMGN": "Health Care",  "BMY":  "Health Care",
+    # Financials (6)
+    "BRK B": "Financials",  "JPM": "Financials",  "V":   "Financials",
+    "MA":    "Financials",  "BAC": "Financials",  "GS":  "Financials",
+    # Energy (2)
+    "XOM": "Energy",  "CVX": "Energy",
+    # Consumer Staples (6)
+    "PG":   "Consumer Staples",  "KO":   "Consumer Staples",
+    "PEP":  "Consumer Staples",  "COST": "Consumer Staples",
+    "WMT":  "Consumer Staples",  "PM":   "Consumer Staples",
+    # Industrials (4)
+    "HON": "Industrials",  "RTX": "Industrials",
+    "UPS": "Industrials",  "CAT": "Industrials",
+    # Materials (1)
+    "LIN": "Materials",
+    # Utilities (1)
+    "NEE": "Utilities",
+}
+
+# Short display labels for scan output (≤ 7 chars)
+_SECTOR_ABBREV: dict[str, str] = {
+    "Technology":             "Tech",
+    "Consumer Discretionary": "CnDisc",
+    "Communication Services": "CommSvc",
+    "Health Care":            "HlthCr",
+    "Financials":             "Fin",
+    "Energy":                 "Energy",
+    "Consumer Staples":       "CnStap",
+    "Industrials":            "Indust",
+    "Materials":              "Matls",
+    "Utilities":              "Util",
+}
+
 
 # ── Stock profile classification ───────────────────────────────────────────────
 
@@ -446,6 +504,7 @@ def scan_symbol(
         accumulation_ratio=accum_ratio,
         volume_trend=vol_trend,
         climactic_volume=climax,
+        sector=SECTOR_MAP.get(symbol, ""),
     )
 
     result.conviction_score = score_conviction(result)
@@ -458,6 +517,55 @@ def scan_symbol(
         )
 
     return result
+
+
+def sector_filter(
+    results: list[ScanResult],
+    cluster_threshold: int = 3,
+    penalty: float = 0.05,
+) -> list[ScanResult]:
+    """
+    Penalise same-sector signal clusters on the same scan day.
+
+    When three or more symbols from the same GICS sector appear in the
+    results list simultaneously, each symbol in that cluster receives a
+    −0.05 conviction penalty and is flagged with sector_cluster=True.
+
+    Rationale: a broad macro move (e.g. rising oil prices) can cause all
+    Energy names to break out together.  Letting every correlated signal
+    land in the watchlist at full conviction inflates exposure to a single
+    factor.  The penalty reduces their scores relative to single-sector
+    breakouts that represent more idiosyncratic edge.
+
+    Args:
+        results:           List of ScanResult objects (any status — filter
+                           happens before the actionable threshold is applied).
+        cluster_threshold: Minimum signals in a sector to trigger penalty (default 3).
+        penalty:           Conviction reduction per clustered symbol (default 0.05).
+
+    Returns:
+        The same list, modified in-place and re-sorted by conviction descending.
+    """
+    from collections import Counter
+
+    sector_counts = Counter(
+        r.sector for r in results if r.sector and r.signal
+    )
+
+    clustered: list[str] = []
+    for r in results:
+        if r.sector and sector_counts[r.sector] >= cluster_threshold:
+            r.conviction_score = max(0.0, round(r.conviction_score - penalty, 4))
+            r.sector_cluster   = True
+            if r.sector not in clustered:
+                clustered.append(r.sector)
+                logger.info(
+                    "sector_filter: %s has %d signals — applying −%.2f penalty",
+                    r.sector, sector_counts[r.sector], penalty,
+                )
+
+    results.sort(key=lambda r: r.conviction_score, reverse=True)
+    return results
 
 
 def run_universe_scan(
@@ -541,6 +649,9 @@ def run_universe_scan(
 
     # Sort by conviction score, highest first
     results.sort(key=lambda r: r.conviction_score, reverse=True)
+
+    # Apply sector correlation filter — penalises clusters of ≥3 same-sector signals
+    results = sector_filter(results)
 
     # Filter to actionable
     actionable = [r for r in results if r.is_actionable(min_conviction)]
