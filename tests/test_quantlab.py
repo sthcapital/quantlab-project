@@ -3610,3 +3610,85 @@ class TestBreadthScanThreshold:
         )
         assert "--backfill" in result.stdout
         assert "--start-date" in result.stdout
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# breadth_override_note column — watchlist audit trail
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWatchlistBreadthNote:
+
+    def _setup_db(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        import quantlab.watchlist as _watchlist
+        monkeypatch.setattr(_storage,   "DB_PATH", tmp_path / "test.duckdb")
+        monkeypatch.setattr(_watchlist, "DB_PATH", tmp_path / "test.duckdb")
+        return str(tmp_path / "test.duckdb")
+
+    def _add_abt(self, db):
+        """Insert a synthetic ABT entry and return watch_id."""
+        r = ScanResult("ABT","2026-06-04","breakout",True,90.93,None,5,
+                       regime_bullish=True, earnings_acceleration=0.65,
+                       conviction_score=0.70, atr_stop=86.72,
+                       multi_lookback_confirmed=True)
+        from quantlab.watchlist import add_to_watchlist
+        add_to_watchlist(r)
+        return "ABT_2026-06-04"
+
+    def test_note_stored_on_insert(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        r = ScanResult("ABT","2026-06-04","breakout",True,90.93,None,5,
+                       conviction_score=0.70, atr_stop=86.72)
+        from quantlab.watchlist import add_to_watchlist
+        add_to_watchlist(r, note="Added pre-breadth-load — tape=BEAR at time of scan")
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        note = con.execute(
+            "SELECT breadth_override_note FROM watchlist WHERE symbol='ABT'"
+        ).fetchone()[0]
+        con.close()
+        assert note == "Added pre-breadth-load — tape=BEAR at time of scan"
+
+    def test_note_empty_by_default(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        self._add_abt(db)
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        note = con.execute(
+            "SELECT breadth_override_note FROM watchlist WHERE symbol='ABT'"
+        ).fetchone()[0]
+        con.close()
+        assert note == "" or note is None
+
+    def test_set_watchlist_note_updates_existing(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        watch_id = self._add_abt(db)
+        from quantlab.watchlist import set_watchlist_note, get_active_watchlist
+        set_watchlist_note(watch_id, "Retroactive note — bear tape was active")
+        entries = get_active_watchlist(db_path=db)
+        abt = next(e for e in entries if e["symbol"] == "ABT")
+        assert abt["breadth_override_note"] == "Retroactive note — bear tape was active"
+
+    def test_get_active_watchlist_includes_note_column(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        self._add_abt(db)
+        from quantlab.watchlist import get_active_watchlist
+        entries = get_active_watchlist(db_path=db)
+        assert len(entries) == 1
+        assert "breadth_override_note" in entries[0]
+
+    def test_note_survives_price_update(self, tmp_path, monkeypatch):
+        """set_watchlist_note should not touch other columns."""
+        db = self._setup_db(tmp_path, monkeypatch)
+        watch_id = self._add_abt(db)
+        from quantlab.watchlist import set_watchlist_note, get_active_watchlist
+        set_watchlist_note(watch_id, "BEAR tape flag")
+        entries = get_active_watchlist(db_path=db)
+        abt = entries[0]
+        assert abt["conviction_score"] == pytest.approx(0.70)
+        assert abt["entry_price"]     == pytest.approx(90.93)
+        assert abt["breadth_override_note"] == "BEAR tape flag"

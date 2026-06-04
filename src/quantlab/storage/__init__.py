@@ -316,9 +316,19 @@ def _ensure_schema(con) -> None:
             -- Status lifecycle: watching → triggered/stopped_out/expired
             status              VARCHAR DEFAULT 'watching',
             date_updated        DATE,
+            -- Audit / override notes
+            breadth_override_note VARCHAR DEFAULT '',
             created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migration: add breadth_override_note to existing watchlist tables
+    try:
+        _wl_cols = {r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()}
+        if "breadth_override_note" not in _wl_cols:
+            con.execute("ALTER TABLE watchlist ADD COLUMN breadth_override_note VARCHAR DEFAULT ''")
+    except Exception:
+        pass
 
 
     con.execute("""

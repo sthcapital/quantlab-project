@@ -96,6 +96,7 @@ def _layers_fired(scan_result) -> str:
 def add_to_watchlist(
     scan_result,
     min_conviction: float = MIN_CONVICTION_FOR_WATCHLIST,
+    note: str = "",
 ) -> bool:
     """
     Add a scan result to the watchlist if conviction meets the threshold.
@@ -106,6 +107,8 @@ def add_to_watchlist(
     Args:
         scan_result:    ScanResult dataclass instance.
         min_conviction: Minimum conviction score to accept (default 0.70).
+        note:           Optional audit note stored in breadth_override_note
+                        (e.g. "Added pre-breadth-load — tape=BEAR at time of scan").
 
     Returns:
         True if the entry was inserted; False if skipped (below threshold or
@@ -125,8 +128,8 @@ def add_to_watchlist(
             INSERT OR IGNORE INTO watchlist (
                 watch_id, symbol, date_added, entry_price, atr_stop,
                 conviction_score, signal_layers, lookback, signal_type,
-                status, date_updated
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?)
+                status, date_updated, breadth_override_note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?)
         """, [
             watch_id,
             scan_result.symbol,
@@ -138,12 +141,36 @@ def add_to_watchlist(
             getattr(scan_result, "lookback", None),
             getattr(scan_result, "signal_type", None),
             today.isoformat(),
+            note,
         ])
         con.close()
         return True
     except Exception as e:
         print(f"[watchlist] insert failed for {scan_result.symbol}: {e}")
         return False
+
+
+def set_watchlist_note(watch_id: str, note: str) -> None:
+    """
+    Update the breadth_override_note on an existing watchlist entry.
+
+    Used to annotate entries that were added before breadth data was available,
+    or to flag any other post-hoc context that should travel with the record.
+
+    Args:
+        watch_id: The watchlist primary key (e.g. "ABT_2026-06-04").
+        note:     The note to store (replaces any existing note).
+    """
+    try:
+        con = get_db()
+        con.execute(
+            "UPDATE watchlist SET breadth_override_note=?, date_updated=? WHERE watch_id=?",
+            [note, date.today().isoformat(), watch_id],
+        )
+        con.close()
+        print(f"[watchlist] note set on {watch_id}: {note!r}")
+    except Exception as e:
+        print(f"[watchlist] set_watchlist_note failed for {watch_id}: {e}")
 
 
 def get_active_watchlist(db_path: str | None = None) -> list[dict[str, Any]]:
@@ -162,6 +189,7 @@ def get_active_watchlist(db_path: str | None = None) -> list[dict[str, Any]]:
         "price_1d", "price_3d", "price_5d",
         "realized_ret_1d", "realized_ret_3d", "realized_ret_5d",
         "current_price", "unrealized_ret", "days_on_watch", "status", "date_updated",
+        "breadth_override_note",
     ]
     try:
         import duckdb

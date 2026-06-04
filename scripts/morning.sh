@@ -4,10 +4,14 @@
 #
 # A single launch covers the full trading day via background sleep jobs:
 #
-#   IMMEDIATE  Step 1: track_forward_returns.py --no-ibkr  (catch-up closes)
-#   IMMEDIATE  Step 2: daily_scan.sh --with-news           (morning scan)
-#   12:30 ET   Step 3: scan_universe.py --no-news          (midday check)
-#   16:30 ET   Step 4: track_forward_returns.py            (record closes)
+#   IMMEDIATE  Step 1: update_breadth.py --no-polygon      (load tape from DuckDB)
+#   IMMEDIATE  Step 2: track_forward_returns.py --no-ibkr  (catch-up closes)
+#   IMMEDIATE  Step 3: daily_scan.sh --with-news           (morning scan, breadth loaded)
+#   12:30 ET   Step 4: scan_universe.py --no-news          (midday check)
+#   16:30 ET   Step 5: track_forward_returns.py + update_breadth.py  (EOD close)
+#
+# Breadth MUST run before the scan so the tape condition is consulted during
+# conviction scoring and the min_conviction threshold is set correctly.
 #
 # Steps 3 and 4 are fire-and-forget background processes (disowned so they
 # survive terminal closure). If morning.sh is launched after 12:30 ET, the
@@ -91,14 +95,22 @@ SLEEP_EOD=$(echo    "$_SCHED" | sed -n '2p')
 DUR_MIDDAY=$(echo   "$_SCHED" | sed -n '3p')
 DUR_EOD=$(echo      "$_SCHED" | sed -n '4p')
 
-# ── Step 1: Forward return catch-up ───────────────────────────────────────────
+# ── Step 1: Load breadth tape from DuckDB ─────────────────────────────────────
+# Must run BEFORE the scan so scan_universe.py reads the current tape condition
+# and raises min_conviction to 0.80 if tape=BEAR.  --no-polygon skips the API
+# call and only recomputes rolling metrics from stored data (fast, offline).
 echo ""
-echo "── [$(et)] Step 1: Forward return catch-up ──────────────────"
+echo "── [$(et)] Step 1: Breadth tape load ────────────────────────"
+python scripts/update_breadth.py --no-polygon 2>/dev/null || true
+
+# ── Step 2: Forward return catch-up ───────────────────────────────────────────
+echo ""
+echo "── [$(et)] Step 2: Forward return catch-up ──────────────────"
 python scripts/track_forward_returns.py --no-ibkr 2>/dev/null || true
 
-# ── Step 2: Morning scan ───────────────────────────────────────────────────────
+# ── Step 3: Morning scan ───────────────────────────────────────────────────────
 echo ""
-echo "── [$(et)] Step 2: Morning scan ─────────────────────────────"
+echo "── [$(et)] Step 3: Morning scan ─────────────────────────────"
 if [[ -n "$WITH_NEWS" ]]; then
     bash scripts/daily_scan.sh --with-news
 else
@@ -140,9 +152,9 @@ else
 fi
 sep
 
-# ── Step 3: Watchlist dashboard ───────────────────────────────────────────────
+# ── Step 4: Watchlist dashboard ───────────────────────────────────────────────
 echo ""
-echo "── [$(et)] Step 3: Watchlist dashboard ──────────────────────"
+echo "── [$(et)] Step 4: Watchlist dashboard ──────────────────────"
 python scripts/watchlist_status.py --no-ibkr || true
 
 echo ""
