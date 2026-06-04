@@ -3692,3 +3692,238 @@ class TestWatchlistBreadthNote:
         assert abt["conviction_score"] == pytest.approx(0.70)
         assert abt["entry_price"]     == pytest.approx(90.93)
         assert abt["breadth_override_note"] == "BEAR tape flag"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FactSet provider — full coverage, mock mode only (credentials pending)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestFactSetProvider:
+    """All tests use mock mode — no real credentials or network calls needed."""
+
+    @staticmethod
+    def _p():
+        from quantlab.providers.factset import FactSetProvider
+        return FactSetProvider(use_mock=True)
+
+    # ── Factory ───────────────────────────────────────────────────────────────
+
+    def test_factory_creates_factset(self):
+        from quantlab.providers import create_market_data_provider
+        from quantlab.providers.factset import FactSetProvider
+        p = create_market_data_provider("factset")
+        assert isinstance(p, FactSetProvider)
+
+    def test_mock_mode_default(self):
+        from quantlab.providers.factset import FactSetProvider
+        p = FactSetProvider()
+        assert p.use_mock is True
+
+    # ── get_earnings_estimates ────────────────────────────────────────────────
+
+    def test_estimates_returns_list(self):
+        from quantlab.providers.factset import EarningsEstimate
+        estimates = self._p().get_earnings_estimates("AAPL")
+        assert len(estimates) > 0
+        assert all(isinstance(e, EarningsEstimate) for e in estimates)
+
+    def test_estimates_has_quarterly_and_annual(self):
+        estimates = self._p().get_earnings_estimates("MSFT")
+        types = {e.period_type for e in estimates}
+        assert "quarterly" in types
+        assert "annual" in types
+
+    def test_estimates_symbol_preserved(self):
+        ests = self._p().get_earnings_estimates("NVDA")
+        assert all(e.symbol == "NVDA" for e in ests)
+
+    def test_estimates_consensus_positive(self):
+        for e in self._p().get_earnings_estimates("AAPL"):
+            if e.consensus_eps is not None:
+                assert e.consensus_eps > 0, "EPS estimate should be positive for healthy co"
+
+    def test_estimates_high_above_low(self):
+        for e in self._p().get_earnings_estimates("AAPL"):
+            if e.high_eps and e.low_eps:
+                assert e.high_eps >= e.low_eps
+
+    def test_estimates_num_analysts_nonneg(self):
+        for e in self._p().get_earnings_estimates("AAPL"):
+            assert e.num_analysts_eps >= 0
+            assert e.num_analysts_revenue >= 0
+
+    def test_estimates_deterministic(self):
+        """Same symbol always returns same values (seed-based mock)."""
+        e1 = self._p().get_earnings_estimates("ABBV")
+        e2 = self._p().get_earnings_estimates("ABBV")
+        assert [e.consensus_eps for e in e1] == [e.consensus_eps for e in e2]
+
+    def test_different_symbols_give_different_estimates(self):
+        aapl = self._p().get_earnings_estimates("AAPL")[0].consensus_eps
+        xom  = self._p().get_earnings_estimates("XOM")[0].consensus_eps
+        assert aapl != xom
+
+    # ── get_surprise_history ──────────────────────────────────────────────────
+
+    def test_surprise_history_default_8_quarters(self):
+        from quantlab.providers.factset import EarningsSurprise
+        hist = self._p().get_surprise_history("AAPL")
+        assert len(hist) == 8
+        assert all(isinstance(s, EarningsSurprise) for s in hist)
+
+    def test_surprise_history_ordered_oldest_first(self):
+        hist = self._p().get_surprise_history("MSFT")
+        dates = [s.report_date for s in hist]
+        assert dates == sorted(dates)
+
+    def test_surprise_pct_computed(self):
+        for s in self._p().get_surprise_history("AAPL"):
+            if s.actual_eps and s.consensus_eps and s.consensus_eps != 0:
+                expected = (s.actual_eps - s.consensus_eps) / abs(s.consensus_eps) * 100
+                assert abs(s.surprise_pct - expected) < 0.01
+
+    def test_surprise_fiscal_quarter_in_range(self):
+        for s in self._p().get_surprise_history("NVDA"):
+            assert 1 <= s.fiscal_quarter <= 4
+
+    def test_surprise_guidance_raised_is_bool_or_none(self):
+        for s in self._p().get_surprise_history("AAPL"):
+            assert s.guidance_raised is None or isinstance(s.guidance_raised, bool)
+
+    # ── get_fundamentals ──────────────────────────────────────────────────────
+
+    def test_fundamentals_returns_dataclass(self):
+        from quantlab.providers.factset import CompanyFundamentals
+        f = self._p().get_fundamentals("AAPL")
+        assert isinstance(f, CompanyFundamentals)
+
+    def test_fundamentals_symbol_preserved(self):
+        assert self._p().get_fundamentals("CAT").symbol == "CAT"
+
+    def test_fundamentals_market_cap_positive(self):
+        f = self._p().get_fundamentals("AAPL")
+        assert f.market_cap is None or f.market_cap > 0
+
+    def test_fundamentals_margins_plausible(self):
+        f = self._p().get_fundamentals("AAPL")
+        if f.gross_margin:
+            assert 0.0 <= f.gross_margin <= 100.0
+        if f.operating_margin:
+            assert -50.0 <= f.operating_margin <= 100.0
+
+    def test_fundamentals_acceleration_is_bool(self):
+        f = self._p().get_fundamentals("NVDA")
+        assert isinstance(f.earnings_acceleration, bool)
+
+    def test_fundamentals_deterministic(self):
+        f1 = self._p().get_fundamentals("LLY")
+        f2 = self._p().get_fundamentals("LLY")
+        assert f1.pe_forward == f2.pe_forward
+        assert f1.revenue_ttm == f2.revenue_ttm
+
+    def test_fundamentals_different_symbols_differ(self):
+        aapl = self._p().get_fundamentals("AAPL")
+        xom  = self._p().get_fundamentals("XOM")
+        assert aapl.pe_ratio != xom.pe_ratio
+
+    # ── get_transcript ────────────────────────────────────────────────────────
+
+    def test_transcript_returns_dataclass(self):
+        from quantlab.providers.factset import EarningsTranscript
+        t = self._p().get_transcript("AAPL")
+        assert isinstance(t, EarningsTranscript)
+
+    def test_transcript_has_segments(self):
+        t = self._p().get_transcript("MSFT")
+        assert len(t.segments) > 0
+
+    def test_transcript_raw_text_populated(self):
+        t = self._p().get_transcript("AAPL")
+        assert len(t.raw_text) > 100
+
+    def test_transcript_segment_roles_present(self):
+        from quantlab.providers.factset import TranscriptSegment
+        t = self._p().get_transcript("NVDA")
+        for seg in t.segments:
+            assert isinstance(seg, TranscriptSegment)
+            assert seg.speaker
+            assert seg.text
+
+    def test_transcript_contains_ceo_segment(self):
+        t = self._p().get_transcript("AAPL")
+        roles = {seg.role for seg in t.segments}
+        assert "CEO" in roles
+
+    def test_transcript_has_factset_event_id(self):
+        t = self._p().get_transcript("AAPL", "2026-01-29")
+        assert t.factset_event_id.startswith("FSET-")
+
+    def test_transcript_symbol_preserved(self):
+        t = self._p().get_transcript("ABT")
+        assert t.symbol == "ABT"
+
+    # ── get_options_chain ─────────────────────────────────────────────────────
+
+    def test_options_chain_returns_list(self):
+        from quantlab.providers.factset import FactSetOptionContract
+        chain = self._p().get_options_chain("AAPL")
+        assert len(chain) > 0
+        assert all(isinstance(c, FactSetOptionContract) for c in chain)
+
+    def test_options_chain_has_calls_and_puts(self):
+        chain = self._p().get_options_chain("AAPL")
+        rights = {c.right for c in chain}
+        assert "C" in rights
+        assert "P" in rights
+
+    def test_options_bid_below_ask(self):
+        for c in self._p().get_options_chain("MSFT"):
+            if c.bid and c.ask:
+                assert c.bid <= c.ask, f"{c.symbol}: bid {c.bid} > ask {c.ask}"
+
+    def test_options_strike_positive(self):
+        for c in self._p().get_options_chain("NVDA"):
+            assert c.strike > 0
+
+    def test_options_iv_positive(self):
+        for c in self._p().get_options_chain("AAPL"):
+            if c.implied_vol is not None:
+                assert c.implied_vol > 0
+
+    def test_options_call_delta_positive(self):
+        for c in self._p().get_options_chain("AAPL"):
+            if c.right == "C" and c.delta is not None:
+                assert c.delta > 0, f"Call delta should be positive: {c.delta}"
+
+    def test_options_put_delta_negative(self):
+        for c in self._p().get_options_chain("AAPL"):
+            if c.right == "P" and c.delta is not None:
+                assert c.delta < 0, f"Put delta should be negative: {c.delta}"
+
+    def test_options_sorted_by_expiry_then_strike(self):
+        chain = self._p().get_options_chain("AAPL")
+        pairs = [(c.expiry, c.strike) for c in chain]
+        assert pairs == sorted(pairs)
+
+    def test_options_open_interest_nonneg(self):
+        for c in self._p().get_options_chain("AAPL"):
+            if c.open_interest is not None:
+                assert c.open_interest >= 0
+
+    # ── Symbol normalisation ──────────────────────────────────────────────────
+
+    def test_normalise_plain_ticker(self):
+        from quantlab.providers.factset import FactSetProvider
+        p = FactSetProvider()
+        assert p._normalise_symbol("AAPL") == "AAPL-US"
+
+    def test_normalise_already_factset_format(self):
+        from quantlab.providers.factset import FactSetProvider
+        p = FactSetProvider()
+        assert p._normalise_symbol("AAPL-US") == "AAPL-US"
+        assert p._normalise_symbol("MSFT-US") == "MSFT-US"
+
+    def test_normalise_lowercase_ticker(self):
+        from quantlab.providers.factset import FactSetProvider
+        p = FactSetProvider()
+        assert p._normalise_symbol("aapl") == "AAPL-US"

@@ -46,9 +46,13 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
         from quantlab.providers.polygon import PolygonProvider
         return PolygonProvider(**kwargs)
 
+    if normalized == "factset":
+        from quantlab.providers.factset import FactSetProvider
+        return FactSetProvider(**kwargs)
+
     raise ValueError(
         f"Unknown market data provider: '{name}'. "
-        f"Valid choices: ibkr, alpha_vantage, mock"
+        f"Valid choices: ibkr, alpha_vantage, mock, polygon, factset"
     )
 
 
