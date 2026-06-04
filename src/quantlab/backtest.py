@@ -327,3 +327,161 @@ def print_walk_forward_summary(windows: list[WalkForwardWindow]) -> None:
         )
 
     print(sep)
+
+
+# ── Universe backtest ──────────────────────────────────────────────────────────
+
+@dataclass
+class UniverseBacktestResult:
+    """Walk-forward result for a single symbol in a universe run."""
+
+    symbol: str
+    bar_count: int
+    windows: list[WalkForwardWindow]
+    baseline: BacktestOutput            # full-period single run
+    avg_oos_sharpe: float | None        # mean across windows with valid OOS
+    avg_oos_return: float | None
+    oos_window_count: int               # windows with valid OOS metrics
+
+
+def run_universe_backtest(
+    provider,
+    symbols: list[str],
+    start_date,
+    end_date,
+    signal_type: str = "breakout",
+    lookback: int = 5,
+    is_bars: int = 252,
+    oos_bars: int = 63,
+    initial_capital: float = 10_000.0,
+    cost_bps: float = DEFAULT_COST_BPS,
+    verbose: bool = True,
+) -> list[UniverseBacktestResult]:
+    """
+    Run walk-forward backtest across a universe of symbols.
+
+    For each symbol: fetches bars, runs baseline + walk-forward, computes
+    avg OOS Sharpe. Returns results sorted by avg_oos_sharpe descending
+    (symbols with no valid OOS windows sort last).
+
+    Args:
+        provider:        Any MarketDataProvider (mock or live).
+        symbols:         List of ticker symbols.
+        start_date:      Bar history start date.
+        end_date:        Bar history end date.
+        signal_type:     "breakout" or "sma".
+        lookback:        Signal lookback period.
+        is_bars:         In-sample window size in bars.
+        oos_bars:        Out-of-sample step size in bars.
+        initial_capital: Starting capital per window.
+        cost_bps:        Round-trip transaction cost.
+        verbose:         Print a one-line status per symbol.
+
+    Returns:
+        List of UniverseBacktestResult sorted by avg_oos_sharpe descending.
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    results: list[UniverseBacktestResult] = []
+    total = len(symbols)
+
+    for i, symbol in enumerate(symbols, 1):
+        try:
+            bars = list(provider.get_daily_bars(symbol, start_date, end_date))
+            if len(bars) <= lookback:
+                if verbose:
+                    print(f"  [{i:>2}/{total}] {symbol:<8}  SKIP — only {len(bars)} bars")
+                continue
+
+            baseline = run_backtest(
+                bars, symbol, signal_type, lookback, initial_capital, cost_bps
+            )
+            windows = walk_forward(
+                bars, symbol, signal_type, lookback, is_bars, oos_bars,
+                initial_capital, cost_bps,
+            )
+
+            valid_oos = [w.out_of_sample for w in windows if w.out_of_sample is not None]
+            oos_sharpes = [m.sharpe_ratio for m in valid_oos if m.sharpe_ratio is not None]
+            avg_oos_sh = sum(oos_sharpes) / len(oos_sharpes) if oos_sharpes else None
+            avg_oos_ret = (
+                sum(m.total_return for m in valid_oos) / len(valid_oos) if valid_oos else None
+            )
+
+            result = UniverseBacktestResult(
+                symbol=symbol,
+                bar_count=len(bars),
+                windows=windows,
+                baseline=baseline,
+                avg_oos_sharpe=avg_oos_sh,
+                avg_oos_return=avg_oos_ret,
+                oos_window_count=len(valid_oos),
+            )
+            results.append(result)
+
+            if verbose:
+                oos_str = f"{avg_oos_sh:+.3f}" if avg_oos_sh is not None else "   N/A"
+                print(
+                    f"  [{i:>2}/{total}] {symbol:<8}  bars={len(bars)}  "
+                    f"trades={baseline.metrics.trade_count:>3}  "
+                    f"oos_wins={len(valid_oos)}  avg_oos_sharpe={oos_str}"
+                )
+
+        except Exception as e:
+            logger.error(f"{symbol}: backtest error — {e}")
+            if verbose:
+                print(f"  [{i:>2}/{total}] {symbol:<8}  ERROR — {e}")
+
+    # Sort: valid OOS Sharpe descending, None last
+    results.sort(key=lambda r: (r.avg_oos_sharpe is None, -(r.avg_oos_sharpe or 0)))
+    return results
+
+
+def print_universe_ranking(
+    results: list[UniverseBacktestResult],
+    top_n: int = 10,
+    label: str = "Universe Walk-Forward Ranking",
+) -> None:
+    """Print top-N symbols ranked by average OOS Sharpe."""
+    from quantlab.risk import fmt_float, fmt_pct
+
+    hdr = (
+        f"{'#':>3}  {'symbol':<8}  {'avg OOS sh':>11}  {'avg OOS ret':>12}  "
+        f"{'avg IS sh':>10}  {'IS→OOS':>8}  {'OOS wins':>9}  {'full trades':>12}"
+    )
+    sep = "=" * len(hdr)
+    print(f"\n{sep}")
+    print(f"  {label}")
+    print(sep)
+    print(hdr)
+    print("-" * len(hdr))
+
+    shown = [r for r in results if r.avg_oos_sharpe is not None][:top_n]
+    if not shown:
+        print("  (no symbols with valid OOS windows)")
+        print(sep)
+        return
+
+    for rank, r in enumerate(shown, 1):
+        is_sharpes = [
+            w.in_sample.sharpe_ratio
+            for w in r.windows
+            if w.in_sample.sharpe_ratio is not None
+        ]
+        avg_is = sum(is_sharpes) / len(is_sharpes) if is_sharpes else 0.0
+        decay = (r.avg_oos_sharpe or 0) - avg_is
+        flag = "  *" if not r.baseline.metrics.sufficient_sample else ""
+        print(
+            f"{rank:>3}.  {r.symbol:<8}  "
+            f"{fmt_float(r.avg_oos_sharpe):>11}  "
+            f"{fmt_pct(r.avg_oos_return):>12}  "
+            f"{fmt_float(avg_is):>10}  "
+            f"{decay:>+8.3f}  "
+            f"{r.oos_window_count:>9}  "
+            f"{r.baseline.metrics.trade_count:>12}{flag}"
+        )
+
+    print(sep)
+    if any(not r.baseline.metrics.sufficient_sample for r in shown):
+        print("  * full-period trade count below 30 — directional signal only")

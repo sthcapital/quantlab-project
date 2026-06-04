@@ -228,6 +228,29 @@ def _ensure_schema(con) -> None:
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS walk_forward_windows (
+            run_id              VARCHAR,
+            symbol              VARCHAR,
+            signal_type         VARCHAR,
+            lookback            INTEGER,
+            window_index        INTEGER,
+            is_start_bar        INTEGER,
+            is_end_bar          INTEGER,
+            oos_start_bar       INTEGER,
+            oos_end_bar         INTEGER,
+            is_sharpe           DOUBLE,
+            is_total_return     DOUBLE,
+            is_trade_count      INTEGER,
+            is_sufficient       BOOLEAN,
+            oos_sharpe          DOUBLE,
+            oos_total_return    DOUBLE,
+            oos_trade_count     INTEGER,
+            oos_sufficient      BOOLEAN,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 
 def save_equity_curve_chart(
     equity_curve: list[float],
@@ -340,6 +363,89 @@ def append_backtest_run(
         con.close()
     except Exception as e:
         print(f"[storage] DuckDB backtest_runs insert failed: {e}")
+
+
+def append_walk_forward_windows(
+    run_id: str,
+    symbol: str,
+    signal_type: str,
+    lookback: int,
+    windows: list,
+) -> None:
+    """
+    Insert all IS/OOS window rows for a single symbol into walk_forward_windows.
+
+    One row per WalkForwardWindow. OOS columns are NULL when the OOS slice was
+    too short to backtest (out_of_sample is None).
+
+    Storage errors are caught and printed — they never crash the research loop.
+    """
+    try:
+        con = get_db()
+        for w in windows:
+            oos = w.out_of_sample
+            con.execute("""
+                INSERT INTO walk_forward_windows (
+                    run_id, symbol, signal_type, lookback, window_index,
+                    is_start_bar, is_end_bar, oos_start_bar, oos_end_bar,
+                    is_sharpe, is_total_return, is_trade_count, is_sufficient,
+                    oos_sharpe, oos_total_return, oos_trade_count, oos_sufficient
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [
+                run_id, symbol, signal_type, lookback, w.window_index,
+                w.is_start_bar, w.is_end_bar, w.oos_start_bar, w.oos_end_bar,
+                w.in_sample.sharpe_ratio, w.in_sample.total_return,
+                w.in_sample.trade_count, w.in_sample.sufficient_sample,
+                oos.sharpe_ratio if oos else None,
+                oos.total_return if oos else None,
+                oos.trade_count if oos else None,
+                oos.sufficient_sample if oos else None,
+            ])
+        con.close()
+    except Exception as e:
+        print(f"[storage] DuckDB walk_forward_windows insert failed: {e}")
+
+
+def query_oos_ranking(run_id: str, top_n: int = 10) -> list[dict]:
+    """
+    Return symbols ranked by average OOS Sharpe for a given universe run.
+
+    Only windows with a non-NULL oos_sharpe are included in the average.
+    Symbols with no valid OOS windows are excluded from the ranking.
+
+    Returns a list of dicts with keys: symbol, avg_oos_sharpe, avg_oos_return,
+    avg_is_sharpe, oos_windows.
+    """
+    try:
+        con = get_db()
+        rows = con.execute("""
+            SELECT
+                symbol,
+                AVG(oos_sharpe)         AS avg_oos_sharpe,
+                AVG(oos_total_return)   AS avg_oos_return,
+                AVG(is_sharpe)          AS avg_is_sharpe,
+                COUNT(oos_sharpe)       AS oos_windows
+            FROM walk_forward_windows
+            WHERE run_id = ?
+              AND oos_sharpe IS NOT NULL
+            GROUP BY symbol
+            ORDER BY avg_oos_sharpe DESC
+            LIMIT ?
+        """, [run_id, top_n]).fetchall()
+        con.close()
+        return [
+            {
+                "symbol": r[0],
+                "avg_oos_sharpe": r[1],
+                "avg_oos_return": r[2],
+                "avg_is_sharpe": r[3],
+                "oos_windows": int(r[4]),
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[storage] DuckDB query failed: {e}")
+        return []
 
 
 def append_trades_to_db(

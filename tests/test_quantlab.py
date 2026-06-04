@@ -25,6 +25,8 @@ from quantlab.backtest import (
     sensitivity_sweep, DEFAULT_LOOKBACKS,
     walk_forward, WalkForwardWindow,
     print_sensitivity_table, print_walk_forward_summary,
+    run_universe_backtest, UniverseBacktestResult,
+    print_universe_ranking,
 )
 
 
@@ -637,3 +639,101 @@ class TestDuckDBStorage:
             count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
             con.close()
             assert count == len(completed)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 4: Universe backtest + walk-forward storage
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUniverseBacktest:
+
+    def test_run_universe_returns_result_per_symbol(self):
+        provider = MockMarketDataProvider(seed=42)
+        symbols = load_universe("small")  # 7 symbols — fast
+        results = run_universe_backtest(
+            provider, symbols,
+            date(2024, 1, 2), date(2025, 12, 31),
+            lookback=5, is_bars=252, oos_bars=63, verbose=False,
+        )
+        assert len(results) == len(symbols)
+        assert all(isinstance(r, UniverseBacktestResult) for r in results)
+
+    def test_results_sorted_by_oos_sharpe_desc(self):
+        provider = MockMarketDataProvider(seed=42)
+        symbols = load_universe("small")
+        results = run_universe_backtest(
+            provider, symbols,
+            date(2024, 1, 2), date(2025, 12, 31),
+            lookback=5, is_bars=252, oos_bars=63, verbose=False,
+        )
+        valid = [r for r in results if r.avg_oos_sharpe is not None]
+        for i in range(1, len(valid)):
+            assert valid[i - 1].avg_oos_sharpe >= valid[i].avg_oos_sharpe
+
+    def test_each_result_has_windows_and_baseline(self):
+        provider = MockMarketDataProvider(seed=42)
+        results = run_universe_backtest(
+            provider, ["AAPL", "MSFT"],
+            date(2024, 1, 2), date(2025, 12, 31),
+            lookback=5, is_bars=252, oos_bars=63, verbose=False,
+        )
+        for r in results:
+            assert len(r.windows) > 0
+            assert isinstance(r.baseline, BacktestOutput)
+            assert r.bar_count > 0
+
+    def test_print_universe_ranking_runs(self, capsys):
+        provider = MockMarketDataProvider(seed=42)
+        results = run_universe_backtest(
+            provider, load_universe("small"),
+            date(2024, 1, 2), date(2025, 12, 31),
+            lookback=5, is_bars=252, oos_bars=63, verbose=False,
+        )
+        print_universe_ranking(results, top_n=5)
+        captured = capsys.readouterr()
+        assert "Ranking" in captured.out
+
+
+class TestWalkForwardStorage:
+
+    def test_append_walk_forward_windows_row_count(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "wfw.duckdb")
+        from quantlab.storage import append_walk_forward_windows
+        bars = make_bars(400, trend=0.001)
+        windows = walk_forward(bars, "AAPL", lookback=5, is_bars=150, oos_bars=50)
+        append_walk_forward_windows("run_x", "AAPL", "breakout", 5, windows)
+        import duckdb
+        con = duckdb.connect(str(tmp_path / "wfw.duckdb"))
+        count = con.execute("SELECT COUNT(*) FROM walk_forward_windows").fetchone()[0]
+        con.close()
+        assert count == len(windows)
+
+    def test_query_oos_ranking_returns_sorted_rows(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "rank.duckdb")
+        from quantlab.storage import append_walk_forward_windows, query_oos_ranking
+        # sma_signal fires on make_bars uptrend data; breakout requires higher spread
+        for sym in ["AAPL", "MSFT"]:
+            bars = make_bars(400, trend=0.002)
+            windows = walk_forward(bars, sym, signal_type="sma", lookback=5, is_bars=150, oos_bars=50)
+            append_walk_forward_windows("run_y", sym, "sma", 5, windows)
+        ranking = query_oos_ranking("run_y", top_n=10)
+        assert len(ranking) >= 1
+        assert "symbol" in ranking[0]
+        assert "avg_oos_sharpe" in ranking[0]
+        for i in range(1, len(ranking)):
+            assert ranking[i - 1]["avg_oos_sharpe"] >= ranking[i]["avg_oos_sharpe"]
+
+    def test_query_oos_ranking_filters_by_run_id(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "filter.duckdb")
+        from quantlab.storage import append_walk_forward_windows, query_oos_ranking
+        bars = make_bars(400, trend=0.002)
+        windows = walk_forward(bars, "AAPL", signal_type="sma", lookback=5, is_bars=150, oos_bars=50)
+        append_walk_forward_windows("run_alpha", "AAPL", "sma", 5, windows)
+        append_walk_forward_windows("run_beta", "AAPL", "sma", 5, windows)
+        alpha = query_oos_ranking("run_alpha")
+        beta = query_oos_ranking("run_beta")
+        assert len(alpha) == 1
+        assert len(beta) == 1
