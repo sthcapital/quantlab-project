@@ -192,6 +192,11 @@ if [[ "$SLEEP_EOD" -gt 0 ]]; then
             --port "$IBKR_PORT" \
             >> "$LOG_FILE" 2>&1
         echo "── [16:30] EOD tracker complete — $(ts)" >> "$LOG_FILE"
+
+        # Breadth update — runs after forward returns (market close data ready)
+        echo "══ [16:35] Breadth update — $(ts) ════════════════════════" >> "$LOG_FILE"
+        python scripts/update_breadth.py >> "$LOG_FILE" 2>&1 || true
+        echo "── [16:35] Breadth update complete — $(ts)" >> "$LOG_FILE"
     ) &
     disown $!
 fi

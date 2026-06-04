@@ -3203,3 +3203,249 @@ class TestRSConvictionLayer:
         result = scan_symbol("AAPL", bars, signal_type="breakout", lookback=5)
         assert result is not None
         assert result.rs_score == 0.0  # no regime_bars → default
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Polygon provider — unit tests using mock HTTP responses
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPolygonProvider:
+
+    def _make_provider(self):
+        from quantlab.providers.polygon import PolygonProvider
+        return PolygonProvider(api_key="test-key", request_sleep=0.0)
+
+    def test_bar_from_agg_parses_fields(self):
+        from quantlab.providers.polygon import PolygonProvider
+        from datetime import date
+        item = {"o": 150.0, "h": 155.0, "l": 149.0, "c": 153.0, "v": 5e6}
+        bar = PolygonProvider._bar_from_agg(item, date(2026, 6, 4))
+        assert bar.open   == 150.0
+        assert bar.high   == 155.0
+        assert bar.close  == 153.0
+        assert bar.volume == 5e6
+
+    def test_breadth_cache_roundtrip(self, tmp_path, monkeypatch):
+        import quantlab.storage as _st
+        monkeypatch.setattr(_st, "DATA_PROCESSED", tmp_path)
+        from datetime import date
+        from quantlab.providers.base import Bar
+        from quantlab.providers.polygon import PolygonProvider
+        p = PolygonProvider(api_key="test", request_sleep=0.0)
+        data = {
+            "AAPL": Bar(date(2026,6,4), 150.0, 155.0, 149.0, 153.0, 5e6),
+            "MSFT": Bar(date(2026,6,4), 400.0, 405.0, 398.0, 402.0, 2e6),
+        }
+        p._save_breadth_cache(date(2026, 6, 4), data)
+        loaded = p._load_breadth_cache(date(2026, 6, 4))
+        assert loaded is not None
+        assert "AAPL" in loaded
+        assert loaded["AAPL"].close == pytest.approx(153.0)
+
+    def test_breadth_cache_miss_returns_none(self, tmp_path, monkeypatch):
+        import quantlab.storage as _st
+        monkeypatch.setattr(_st, "DATA_PROCESSED", tmp_path)
+        from datetime import date
+        from quantlab.providers.polygon import PolygonProvider
+        p = PolygonProvider(api_key="test", request_sleep=0.0)
+        assert p._load_breadth_cache(date(2099, 1, 1)) is None
+
+    def test_factory_creates_polygon(self):
+        from quantlab.providers import create_market_data_provider
+        from quantlab.providers.polygon import PolygonProvider
+        p = create_market_data_provider("polygon", api_key="test-key")
+        assert isinstance(p, PolygonProvider)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Breadth computation — all tests use synthetic data, no Polygon API needed
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBreadthComputation:
+
+    @staticmethod
+    def _bar(sym, close, open_=None, volume=1_000_000.0):
+        from datetime import date
+        from quantlab.providers.base import Bar
+        o = open_ if open_ is not None else close * 0.99
+        return Bar(date(2026, 6, 4), o, close*1.005, close*0.995, close, volume)
+
+    def _grouped(self, specs):
+        """specs: list of (symbol, close, open_) tuples"""
+        return {sym: self._bar(sym, c, o) for sym, c, o in specs}
+
+    # ── compute_market_breadth ────────────────────────────────────────────────
+
+    def test_advances_declines_counted(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        today = self._grouped([
+            ("AAPL", 102.0, 100.0),   # up 2%
+            ("MSFT", 98.0,  100.0),   # down 2%
+            ("GOOGL", 100.0, 100.0),  # flat
+        ])
+        snap = compute_market_breadth("2026-06-04", today)
+        assert snap.advances == 1
+        assert snap.declines == 1
+        assert snap.unchanged == 1
+
+    def test_up_4pct_counted(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        today = self._grouped([
+            ("AAPL", 105.0, 100.0),   # +5%
+            ("MSFT", 103.0, 100.0),   # +3% (below threshold)
+            ("XOM",  96.0,  100.0),   # -4%
+        ])
+        snap = compute_market_breadth("2026-06-04", today)
+        assert snap.up_4pct_count   == 1
+        assert snap.down_4pct_count == 1
+
+    def test_low_volume_excluded(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        from datetime import date
+        from quantlab.providers.base import Bar
+        today = {
+            "AAPL": Bar(date(2026,6,4), 100.0, 105.0, 99.0, 105.0, 5_000.0),  # low vol
+        }
+        snap = compute_market_breadth("2026-06-04", today, min_volume=100_000)
+        assert snap.advances == 0  # excluded
+
+    def test_prev_data_used_for_close_to_close(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        from datetime import date
+        from quantlab.providers.base import Bar
+        prev  = {"AAPL": Bar(date(2026,6,3), 100.0,102.0,99.0,100.0,1e6)}
+        today = {"AAPL": Bar(date(2026,6,4), 103.0,106.0,102.0,105.0,1e6)}
+        snap = compute_market_breadth("2026-06-04", today, prev_data=prev)
+        # close-to-close = 105/100 - 1 = +5% → up_4pct
+        assert snap.up_4pct_count == 1
+
+    def test_ad_ratio_computed(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        today = self._grouped([
+            ("A", 105.0, 100.0), ("B", 103.0, 100.0),  # 2 advances
+            ("C", 97.0,  100.0),                         # 1 decline
+        ])
+        snap = compute_market_breadth("2026-06-04", today)
+        assert snap.advance_decline_ratio == pytest.approx(2.0, abs=0.01)
+
+    # ── rolling_breadth ───────────────────────────────────────────────────────
+
+    def _make_snapshots(self, ad_pairs):
+        """Create BreadthSnapshot list from (advances, declines, up4, dn4) tuples."""
+        from quantlab.signals.breadth import BreadthSnapshot
+        snaps = []
+        for i, (a, d, u4, d4) in enumerate(ad_pairs):
+            snaps.append(BreadthSnapshot(
+                date=f"2026-01-{i+2:02d}",
+                advances=a, declines=d,
+                up_4pct_count=u4, down_4pct_count=d4,
+            ))
+        return snaps
+
+    def test_rolling_adds_ratio_10d(self):
+        from quantlab.signals.breadth import rolling_breadth
+        snaps = self._make_snapshots([(100,50,20,10)] * 12)
+        rolling_breadth(snaps, window=10)
+        assert snaps[-1].ratio_10d is not None
+        assert snaps[-1].ratio_10d == pytest.approx(2.0, abs=0.01)
+
+    def test_mcclellan_oscillator_computed(self):
+        from quantlab.signals.breadth import rolling_breadth
+        snaps = self._make_snapshots([(200, 100, 20, 10)] * 50)
+        rolling_breadth(snaps)
+        # After enough data, EMA19 and EMA39 should both converge to A-D = 100
+        # → oscillator should be near 0
+        last = snaps[-1]
+        assert last.mcclellan_oscillator is not None
+        assert abs(last.mcclellan_oscillator) < 10  # converged near 0
+
+    def test_tape_bull_on_high_ratio(self):
+        from quantlab.signals.breadth import rolling_breadth
+        snaps = self._make_snapshots([(300, 100, 40, 10)] * 15)
+        rolling_breadth(snaps, window=10)
+        assert snaps[-1].tape == "BULL"
+
+    def test_tape_bear_on_low_ratio(self):
+        from quantlab.signals.breadth import rolling_breadth
+        snaps = self._make_snapshots([(100, 300, 10, 40)] * 15)
+        rolling_breadth(snaps, window=10)
+        assert snaps[-1].tape == "BEAR"
+
+    def test_tape_bear_on_mcclellan_below_minus100(self):
+        from quantlab.signals.breadth import rolling_breadth, BreadthSnapshot
+        # Large sustained negative A-D → McClellan will go below -100
+        snaps = self._make_snapshots([(100, 900, 5, 30)] * 60)
+        rolling_breadth(snaps, window=10)
+        assert snaps[-1].tape == "BEAR"
+
+    # ── breadth_regime_adjustment ────────────────────────────────────────────
+
+    def test_bull_tape_no_penalty(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=2.5, mcclellan_oscillator=50.0,
+                               up_25pct_quarter=350, tape="BULL")
+        adj, override = breadth_regime_adjustment(snap)
+        assert adj == 0.0
+        assert override is False
+
+    def test_neutral_tape_small_penalty(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=1.5, mcclellan_oscillator=0.0,
+                               up_25pct_quarter=300, tape="NEUTRAL")
+        adj, override = breadth_regime_adjustment(snap)
+        assert adj == pytest.approx(-0.03, abs=1e-6)
+        assert override is False
+
+    def test_bear_tape_large_penalty(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=0.4, mcclellan_oscillator=-20.0,
+                               up_25pct_quarter=300, tape="BEAR")
+        adj, override = breadth_regime_adjustment(snap)
+        assert adj == pytest.approx(-0.12, abs=1e-6)
+
+    def test_mcclellan_below_minus100_triggers_override(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=1.0, mcclellan_oscillator=-150.0,
+                               up_25pct_quarter=400, tape="BEAR")
+        _, override = breadth_regime_adjustment(snap)
+        assert override is True
+
+    def test_up25q_below_200_triggers_override(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=1.5, mcclellan_oscillator=50.0,
+                               up_25pct_quarter=150, tape="BEAR")
+        _, override = breadth_regime_adjustment(snap)
+        assert override is True
+
+    def test_none_snapshot_neutral(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment
+        adj, override = breadth_regime_adjustment(None)
+        assert adj == 0.0
+        assert override is False
+
+    def test_nhl_below_half_adds_extra_penalty(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=1.8, mcclellan_oscillator=20.0,
+                               up_25pct_quarter=400, new_high_low_ratio=0.3, tape="NEUTRAL")
+        adj, _ = breadth_regime_adjustment(snap)
+        assert adj == pytest.approx(-0.03 - 0.05, abs=1e-6)
+
+    # ── conviction scorer with breadth ────────────────────────────────────────
+
+    def test_breadth_adj_applied_in_scorer(self):
+        r = ScanResult("ABT","2026-06-04","breakout",True,90.0,None,5,
+                       regime_bullish=False)
+        r.breadth_regime_adj = -0.07
+        base = score_conviction(r)
+        assert base == pytest.approx(0.30 - 0.07, abs=1e-9)
+
+    def test_breadth_override_vetoes_signal(self):
+        r = ScanResult("ABT","2026-06-04","breakout",True,90.0,None,5,
+                       regime_bullish=True, earnings_acceleration=0.85)
+        r.breadth_override = True
+        assert score_conviction(r) == 0.0
+
+    def test_breadth_fields_default_to_neutral(self):
+        r = ScanResult("ABT","2026-06-04","breakout",True,90.0,None,5)
+        assert r.breadth_regime_adj == 0.0
+        assert r.breadth_override   is False

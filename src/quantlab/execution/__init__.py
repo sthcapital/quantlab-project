@@ -116,6 +116,10 @@ class ScanResult:
     sector: str = ""               # GICS sector (e.g. "Health Care", "Technology")
     sector_cluster: bool = False   # True when ≥3 same-sector signals on same day
 
+    # Breadth regime adjustment (populated from latest DuckDB breadth_history)
+    breadth_regime_adj: float = 0.0  # -0.12 to 0.0 depending on tape
+    breadth_override: bool = False   # True → hard veto (McClellan<-100 or bear)
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -151,6 +155,8 @@ def score_conviction(result: ScanResult) -> float:
         Options conviction ≥ 0.8       : 0.15  (replaces the 0.10 — strong signal)
         RS score ≥ 0.6 (outperforming) : 0.08
         RS score ≥ 0.8 (leader)        : 0.12  (replaces the 0.08)
+        Breadth regime adjustment       : 0.00 to -0.12 (from 10-day ratio)
+        Breadth override                : returns 0.0 immediately (bear market veto)
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -162,6 +168,10 @@ def score_conviction(result: ScanResult) -> float:
     Downgrade news reduces conviction; result is clamped to [0.0, 1.0].
     """
     if not result.signal:
+        return 0.0
+
+    # Hard bear-market veto (McClellan < -100 or up_25pct_quarter < 200)
+    if result.breadth_override:
         return 0.0
 
     score = 0.30  # base: signal fired
@@ -211,6 +221,9 @@ def score_conviction(result: ScanResult) -> float:
         score += 0.12
     elif result.rs_score >= 0.6:
         score += 0.08
+
+    # Breadth regime adjustment (0.0 in bull, negative in weak/bear tape)
+    score += result.breadth_regime_adj
 
     return max(0.0, min(score, 1.0))
 
@@ -622,6 +635,19 @@ def run_universe_scan(
     results = []
     total = len(symbols)
 
+    # Load latest breadth snapshot for regime adjustment and override flag.
+    # Non-fatal — scan proceeds with neutral breadth (adj=0, override=False).
+    from quantlab.signals.breadth import get_latest_snapshot, breadth_regime_adjustment
+    _breadth_snap = get_latest_snapshot()
+    _breadth_adj, _breadth_override = breadth_regime_adjustment(_breadth_snap)
+    if _breadth_snap:
+        logger.info(
+            "Breadth: %s  tape=%s  10d-ratio=%s  McClellan=%s",
+            _breadth_snap.date, _breadth_snap.tape,
+            f"{_breadth_snap.ratio_10d:.2f}" if _breadth_snap.ratio_10d else "--",
+            f"{_breadth_snap.mcclellan_oscillator:+.0f}" if _breadth_snap.mcclellan_oscillator else "--",
+        )
+
     # Fetch SPY bars once for regime filter and RS calculation.
     # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
     spy_bars = None
@@ -668,6 +694,10 @@ def run_universe_scan(
             )
 
             if result is not None:
+                # Apply breadth regime adjustment and re-score
+                result.breadth_regime_adj = _breadth_adj
+                result.breadth_override   = _breadth_override
+                result.conviction_score   = score_conviction(result)
                 results.append(result)
 
         except Exception as e:

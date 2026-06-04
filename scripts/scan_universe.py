@@ -116,6 +116,14 @@ def main() -> None:
         print("No actionable setups found today.\n")
         return
 
+    # ── Breadth tape summary ───────────────────────────────────────────────────
+    from quantlab.signals.breadth import get_latest_snapshot
+    _snap = get_latest_snapshot()
+    if _snap:
+        print(f"\n  {_snap.summary_line()}")
+    else:
+        print("\n  Breadth: no data (run update_breadth.py after market close)")
+
     # ── Multi-lookback confirmation ────────────────────────────────────────────
     # Run a fast secondary scan (bars already cached) to find symbols that also
     # fire a breakout signal at the secondary lookback.  Symbols confirmed on

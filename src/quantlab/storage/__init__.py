@@ -321,6 +321,34 @@ def _ensure_schema(con) -> None:
     """)
 
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS breadth_history (
+            date                    DATE PRIMARY KEY,
+            advances                INTEGER,
+            declines                INTEGER,
+            unchanged               INTEGER,
+            total_stocks            INTEGER,
+            up_4pct_count           INTEGER,
+            down_4pct_count         INTEGER,
+            up_25pct_quarter        INTEGER,
+            down_25pct_quarter      INTEGER,
+            new_highs_52w           INTEGER,
+            new_lows_52w            INTEGER,
+            pct_above_20sma         DOUBLE,
+            pct_above_50sma         DOUBLE,
+            pct_above_200sma        DOUBLE,
+            advance_decline_ratio   DOUBLE,
+            new_high_low_ratio      DOUBLE,
+            ratio_10d               DOUBLE,
+            mcclellan_oscillator    DOUBLE,
+            mcclellan_summation     DOUBLE,
+            ad_line                 INTEGER,
+            tape                    VARCHAR DEFAULT 'NEUTRAL',
+            created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+
 def save_equity_curve_chart(
     equity_curve: list[float],
     bars: Sequence,

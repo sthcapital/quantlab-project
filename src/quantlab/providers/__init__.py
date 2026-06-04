@@ -42,6 +42,10 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
     if normalized == "mock":
         return MockMarketDataProvider(**kwargs)
 
+    if normalized == "polygon":
+        from quantlab.providers.polygon import PolygonProvider
+        return PolygonProvider(**kwargs)
+
     raise ValueError(
         f"Unknown market data provider: '{name}'. "
         f"Valid choices: ibkr, alpha_vantage, mock"
