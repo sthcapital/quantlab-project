@@ -213,18 +213,47 @@ def _ensure_schema(con) -> None:
         )
     """)
 
+    # scan_results: migrate to enriched schema if scan_id column is absent
+    try:
+        existing = {
+            row[1]
+            for row in con.execute("PRAGMA table_info(scan_results)").fetchall()
+        }
+        if "scan_id" not in existing:
+            con.execute("DROP TABLE IF EXISTS scan_results")
+    except Exception:
+        pass
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS scan_results (
-            scan_date       DATE,
-            symbol          VARCHAR,
-            signal_type     VARCHAR,
-            entry_close     DOUBLE,
-            indicator_value DOUBLE,
-            news_category   VARCHAR,
-            news_count      INTEGER,
-            conviction_score DOUBLE,
-            regime_bullish  BOOLEAN,
-            created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            scan_id              VARCHAR,
+            scan_date            DATE,
+            symbol               VARCHAR,
+            signal_type          VARCHAR,
+            lookback             INTEGER,
+            entry_close          DOUBLE,
+            indicator_value      DOUBLE,
+            conviction_score     DOUBLE,
+            regime_bullish       BOOLEAN,
+            -- news
+            news_category        VARCHAR,
+            news_count           INTEGER,
+            news_c_score         DOUBLE,
+            -- market
+            rel_volume           DOUBLE,
+            atr_stop             DOUBLE,
+            -- wyckoff
+            base_quality         DOUBLE,
+            absorption           DOUBLE,
+            volume_character     DOUBLE,
+            wyckoff_spring       BOOLEAN,
+            -- earnings acceleration
+            earnings_acceleration DOUBLE,
+            -- volume profile
+            accumulation_ratio   DOUBLE,
+            volume_trend         DOUBLE,
+            climactic_volume     DOUBLE,
+            created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -492,3 +521,52 @@ def append_trades_to_db(
     except Exception as e:
         # Storage errors never crash research — log and continue
         print(f"[storage] DuckDB append failed: {e}")
+
+
+def append_scan_results(scan_id: str, results: list) -> None:
+    """
+    Persist a list of ScanResult objects to the scan_results DuckDB table.
+
+    Each row captures every conviction layer so historical scans can be
+    replayed and analysed: which layers were firing, at what scores, and
+    how conviction evolved across daily runs.
+
+    Storage errors are caught and printed — they never crash the scan.
+
+    Args:
+        scan_id: Unique run identifier (e.g. from make_run_id()).
+        results: List of ScanResult dataclass instances.
+    """
+    try:
+        con = get_db()
+        for r in results:
+            con.execute("""
+                INSERT INTO scan_results (
+                    scan_id, scan_date, symbol, signal_type, lookback,
+                    entry_close, indicator_value, conviction_score, regime_bullish,
+                    news_category, news_count, news_c_score,
+                    rel_volume, atr_stop,
+                    base_quality, absorption, volume_character, wyckoff_spring,
+                    earnings_acceleration,
+                    accumulation_ratio, volume_trend, climactic_volume
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?,
+                    ?, ?, ?, ?,
+                    ?,
+                    ?, ?, ?
+                )
+            """, [
+                scan_id, r.scan_date, r.symbol, r.signal_type, r.lookback,
+                r.entry_close, r.indicator_value, r.conviction_score, r.regime_bullish,
+                r.news_category, r.news_count, r.news_c_score,
+                r.rel_volume, r.atr_stop,
+                r.base_quality, r.absorption, r.volume_character, r.wyckoff_spring,
+                r.earnings_acceleration,
+                r.accumulation_ratio, r.volume_trend, r.climactic_volume,
+            ])
+        con.close()
+    except Exception as e:
+        print(f"[storage] scan_results insert failed: {e}")

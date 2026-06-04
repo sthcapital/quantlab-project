@@ -16,7 +16,7 @@ from datetime import date
 from quantlab.execution import run_universe_scan, load_universe
 from quantlab.providers import create_market_data_provider
 from quantlab.risk import fmt_pct, fmt_float
-from quantlab.storage import append_trades_to_db, ensure_dirs
+from quantlab.storage import append_scan_results, ensure_dirs
 from quantlab.utils import setup_logging, parse_date, n_days_ago, make_run_id, get_config
 
 
@@ -44,6 +44,8 @@ def main() -> None:
     parser.add_argument("--client-id", type=int, default=ibkr_cfg["client_id"])
     parser.add_argument("--no-news", action="store_true",
                         help="Skip news fetching (faster, price-only scan)")
+    parser.add_argument("--save-db", action="store_true",
+                        help="Persist all scan results (not just actionable) to DuckDB")
     args = parser.parse_args()
 
     ensure_dirs()
@@ -131,6 +133,13 @@ def main() -> None:
         )
 
     print(f"\n{'='*60}\n")
+
+    # ── Persist to DuckDB ─────────────────────────────────────────────────────
+    if args.save_db:
+        scan_id = make_run_id(args.universe.upper() if not args.symbols else "CUSTOM",
+                              args.signal)
+        append_scan_results(scan_id, results)
+        print(f"db  → {len(results)} scan result(s) stored (scan_id={scan_id})")
 
 
 if __name__ == "__main__":
