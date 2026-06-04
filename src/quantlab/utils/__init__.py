@@ -5,6 +5,7 @@ Shared utilities — logging setup, config loading, date helpers.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import date, timedelta
 from pathlib import Path
@@ -89,11 +90,50 @@ DEFAULT_CONFIG = {
 }
 
 
+def _providers_config() -> dict:
+    """
+    Build the external data-provider config from environment variables.
+
+    Evaluated at call time (not at import time) so tests can set env vars
+    after importing without needing to reload the module.
+
+    Environment variables:
+        POLYGON_API_KEY    — Polygon.io REST API key
+        FACTSET_USERNAME   — FactSet serial / username  (e.g. S123456@company)
+        FACTSET_API_KEY    — FactSet API key
+        FACTSET_HOST       — FactSet API base URL
+                             (default: https://api.factset.com/content)
+    """
+    return {
+        "polygon": {
+            "api_key": os.environ.get("POLYGON_API_KEY", ""),
+        },
+        "factset": {
+            "username": os.environ.get("FACTSET_USERNAME", ""),
+            "api_key":  os.environ.get("FACTSET_API_KEY",  ""),
+            "host":     os.environ.get(
+                "FACTSET_HOST", "https://api.factset.com/content"
+            ),
+        },
+    }
+
+
 def get_config(section: str | None = None) -> dict:
     """
-    Return config values. Reads from DEFAULT_CONFIG for now.
-    Will support config.toml overrides in Phase 3.
+    Return config values merged from DEFAULT_CONFIG and live env vars.
+
+    Provider credentials (Polygon, FactSet) are read from environment
+    variables at call time so they are always current.
+
+    Args:
+        section: If given, return only that top-level section dict.
+                 Supported sections: ibkr, backtest, scanner, news, providers.
+
+    Returns:
+        Full config dict, or the requested section dict (empty dict if absent).
     """
+    cfg = dict(DEFAULT_CONFIG)
+    cfg["providers"] = _providers_config()
     if section:
-        return DEFAULT_CONFIG.get(section, {})
-    return DEFAULT_CONFIG
+        return cfg.get(section, {})
+    return cfg

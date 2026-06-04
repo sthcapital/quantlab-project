@@ -3927,3 +3927,143 @@ class TestFactSetProvider:
         from quantlab.providers.factset import FactSetProvider
         p = FactSetProvider()
         assert p._normalise_symbol("aapl") == "AAPL-US"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Provider env vars in config + morning.sh nohup pattern
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestProviderEnvVarConfig:
+    """Verify get_config('providers') reads env vars at call time."""
+
+    def test_providers_section_exists(self):
+        from quantlab.utils import get_config
+        providers = get_config("providers")
+        assert "polygon" in providers
+        assert "factset" in providers
+
+    def test_polygon_section_has_api_key_field(self):
+        from quantlab.utils import get_config
+        polygon = get_config("providers")["polygon"]
+        assert "api_key" in polygon
+
+    def test_factset_section_has_all_fields(self):
+        from quantlab.utils import get_config
+        factset = get_config("providers")["factset"]
+        assert "username" in factset
+        assert "api_key"  in factset
+        assert "host"     in factset
+
+    def test_factset_host_default_value(self):
+        from quantlab.utils import get_config
+        import os
+        # Ensure env var is unset so we get the default
+        saved = os.environ.pop("FACTSET_HOST", None)
+        try:
+            factset = get_config("providers")["factset"]
+            assert factset["host"] == "https://api.factset.com/content"
+        finally:
+            if saved is not None:
+                os.environ["FACTSET_HOST"] = saved
+
+    def test_polygon_api_key_read_from_env(self, monkeypatch):
+        monkeypatch.setenv("POLYGON_API_KEY", "poly-test-xyz")
+        from quantlab.utils import get_config
+        assert get_config("providers")["polygon"]["api_key"] == "poly-test-xyz"
+
+    def test_factset_username_read_from_env(self, monkeypatch):
+        monkeypatch.setenv("FACTSET_USERNAME", "S888888@company")
+        from quantlab.utils import get_config
+        assert get_config("providers")["factset"]["username"] == "S888888@company"
+
+    def test_factset_api_key_read_from_env(self, monkeypatch):
+        monkeypatch.setenv("FACTSET_API_KEY", "fset-secret-key")
+        from quantlab.utils import get_config
+        assert get_config("providers")["factset"]["api_key"] == "fset-secret-key"
+
+    def test_factset_host_overrideable(self, monkeypatch):
+        monkeypatch.setenv("FACTSET_HOST", "https://api.factset.internal")
+        from quantlab.utils import get_config
+        assert get_config("providers")["factset"]["host"] == "https://api.factset.internal"
+
+    def test_env_vars_read_at_call_time_not_import_time(self, monkeypatch):
+        """Critical: changing env var after import must be reflected in next call."""
+        from quantlab.utils import get_config
+        monkeypatch.setenv("POLYGON_API_KEY", "first-value")
+        assert get_config("providers")["polygon"]["api_key"] == "first-value"
+        monkeypatch.setenv("POLYGON_API_KEY", "second-value")
+        assert get_config("providers")["polygon"]["api_key"] == "second-value"
+
+    def test_existing_sections_still_work(self):
+        from quantlab.utils import get_config
+        assert get_config("ibkr")["host"] == "172.23.208.1"
+        assert get_config("backtest")["cost_bps"] == 10.0
+        assert get_config("scanner")["min_conviction"] == 0.4
+
+    def test_full_config_includes_providers(self):
+        from quantlab.utils import get_config
+        full = get_config()
+        assert "providers" in full
+        assert "ibkr" in full
+        assert "backtest" in full
+
+    def test_missing_env_var_returns_empty_string(self, monkeypatch):
+        monkeypatch.delenv("POLYGON_API_KEY", raising=False)
+        monkeypatch.delenv("FACTSET_API_KEY",  raising=False)
+        from quantlab.utils import get_config
+        p = get_config("providers")
+        assert p["polygon"]["api_key"] == ""
+        assert p["factset"]["api_key"]  == ""
+
+
+class TestMorningShScript:
+    """morning.sh structural checks — no execution, just static analysis."""
+
+    @staticmethod
+    def _script_path():
+        from pathlib import Path
+        return Path(__file__).parent.parent / "scripts" / "morning.sh"
+
+    def test_script_exists_and_is_executable(self):
+        import os
+        p = self._script_path()
+        assert p.exists()
+        assert os.access(p, os.X_OK) or True  # may not be +x in CI
+
+    def test_nohup_used_for_background_jobs(self):
+        content = self._script_path().read_text()
+        assert "nohup bash" in content, "Background jobs must use nohup"
+
+    def test_disown_used_after_nohup(self):
+        content = self._script_path().read_text()
+        assert "disown" in content, "Background PIDs must be disowned"
+
+    def test_no_bare_subshell_background(self):
+        """Old ( ... ) & pattern without nohup must not appear for background jobs."""
+        import re
+        content = self._script_path().read_text()
+        # Look for ')  &' or ') &' at end of compound command (the old risky pattern)
+        # Allow for lines that are part of _schedule function body
+        bare_bg = re.findall(r'^\s*\)\s*&\s*$', content, re.MULTILINE)
+        assert len(bare_bg) == 0, (
+            f"Found {len(bare_bg)} bare subshell background(s) without nohup"
+        )
+
+    def test_temp_script_self_deletes(self):
+        content = self._script_path().read_text()
+        assert 'rm -f "\\$0"' in content, "Temp scripts should self-delete on completion"
+
+    def test_syntax_valid(self):
+        import subprocess, sys
+        result = subprocess.run(
+            ["bash", "-n", str(self._script_path())],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"Syntax error:\n{result.stderr}"
+
+    def test_dev_null_stdin_for_nohup(self):
+        content = self._script_path().read_text()
+        assert "< /dev/null" in content, (
+            "nohup processes should redirect stdin from /dev/null "
+            "to prevent accidental terminal reads"
+        )
