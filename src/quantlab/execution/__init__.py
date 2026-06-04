@@ -80,7 +80,7 @@ class ScanResult:
     indicator_value: float | None
     lookback: int
 
-    # Conviction layers
+    # Conviction layers — market / news
     regime_bullish: bool = True
     news_count: int = 0
     news_category: str = "none"
@@ -88,6 +88,12 @@ class ScanResult:
     news_c_score: float | None = None
     rel_volume: float | None = None
     atr_stop: float | None = None
+
+    # Wyckoff structural layers (computed from bar history at scan time)
+    base_quality: float = 0.0     # base_quality_score()    ≥ 0.6 → +0.15
+    absorption: float = 0.0       # absorption_score()      ≥ 0.6 → +0.10
+    volume_character: float = 0.0 # volume_character_score() ≥ 0.6 → +0.10
+    wyckoff_spring: bool = False   # is_wyckoff_spring()         True → +0.10
 
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
@@ -98,22 +104,25 @@ class ScanResult:
 
 def score_conviction(result: ScanResult) -> float:
     """
-    Score 0.0–1.0 based on confirmation layers with category-weighted news.
+    Score 0.0–1.0 based on all confirmation layers.
 
-    Layer weights:
-        Signal fired          : 0.30  (mandatory — returns 0 if no signal)
-        Regime bullish        : 0.20
-        News (category-based) : see NEWS_CATEGORY_WEIGHTS
-                                  earnings/management → +0.20
-                                  upgrade             → +0.08
-                                  analyst_action      → +0.05
-                                  downgrade           → −0.15 (veto)
-                                  other               →  0.00
-        Rel volume ≥ 1.5×     : 0.10
-        Strong news c_score   : 0.10  (IBKR C: score ≥ 0.7)
+    Layer weights (max 1.0, clamped):
+        Signal fired               : 0.30  (mandatory — returns 0 if no signal)
+        Regime bullish             : 0.20
+        News (category-weighted)   : see NEWS_CATEGORY_WEIGHTS
+                                       earnings/management → +0.20
+                                       upgrade             → +0.08
+                                       analyst_action      → +0.05
+                                       downgrade           → −0.15 (veto)
+                                       other               →  0.00
+        Rel volume ≥ 1.5×          : 0.10
+        Strong news c_score ≥ 0.7  : 0.10
+        Wyckoff base quality ≥ 0.6 : 0.15
+        Wyckoff absorption ≥ 0.6   : 0.10
+        Wyckoff vol character ≥ 0.6: 0.10
+        Wyckoff spring detected    : 0.10
 
-    Downgrade news can push the score below the signal-only level; the result
-    is clamped to [0.0, 1.0].
+    Downgrade news reduces conviction; the result is clamped to [0.0, 1.0].
     """
     if not result.signal:
         return 0.0
@@ -130,6 +139,16 @@ def score_conviction(result: ScanResult) -> float:
         score += 0.10
 
     if result.news_c_score is not None and result.news_c_score >= 0.7:
+        score += 0.10
+
+    # Wyckoff structural confirmation
+    if result.base_quality >= 0.6:
+        score += 0.15
+    if result.absorption >= 0.6:
+        score += 0.10
+    if result.volume_character >= 0.6:
+        score += 0.10
+    if result.wyckoff_spring:
         score += 0.10
 
     return max(0.0, min(score, 1.0))
@@ -245,6 +264,12 @@ def scan_symbol(
         ScanResult with conviction_score, or None if not enough bars.
     """
     from quantlab.signals import relative_volume as _rel_vol
+    from quantlab.signals.wyckoff import (
+        absorption_score as _absorption,
+        base_quality_score as _base_quality,
+        volume_character_score as _vol_char,
+        is_wyckoff_spring as _spring,
+    )
 
     if len(bars) <= lookback:
         logger.debug(f"{symbol}: not enough bars ({len(bars)} <= {lookback})")
@@ -274,6 +299,12 @@ def scan_symbol(
     # ATR stop
     stop = atr_stop_price(bars, signal_result.entry_close)
 
+    # Wyckoff structural scores
+    bq     = _base_quality(bars)
+    ab     = _absorption(bars)
+    vc     = _vol_char(bars)
+    spring = _spring(bars)
+
     # News features
     n_count = 0
     n_cat = "none"
@@ -300,6 +331,10 @@ def scan_symbol(
         news_c_score=c_score,
         rel_volume=rv,
         atr_stop=stop,
+        base_quality=bq,
+        absorption=ab,
+        volume_character=vc,
+        wyckoff_spring=spring,
     )
 
     result.conviction_score = score_conviction(result)

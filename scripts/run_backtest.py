@@ -76,6 +76,93 @@ def _tag_trades_with_news(
             ib.disconnect()
 
 
+def _wyckoff_analysis(bars: list, trade_records: list, signal_type: str, lookback: int) -> None:
+    """
+    For each trade entry in trade_records, compute Wyckoff scores on the bar
+    slice available at that point and print a per-layer pass/fail breakdown.
+
+    This shows how many of the raw breakout signals also had a structurally
+    confirmed Wyckoff base, vs signals that fired on thinner setups.
+    """
+    from quantlab.signals.wyckoff import (
+        absorption_score,
+        base_quality_score,
+        volume_character_score,
+        is_wyckoff_spring,
+    )
+    from quantlab.execution import score_conviction, ScanResult
+
+    total = len(trade_records)
+    if total == 0:
+        print("\nWyckoff analysis: no trades to evaluate.")
+        return
+
+    # Build a date → bar-index map for O(1) lookup
+    date_to_idx = {b.as_of.isoformat(): i for i, b in enumerate(bars)}
+
+    counts = dict(base=0, absorption=0, vol_char=0, spring=0, any_wyckoff=0, high_conv=0)
+    per_trade = []
+
+    for trade in trade_records:
+        idx = date_to_idx.get(trade.entry_date)
+        if idx is None:
+            continue
+        slice_ = bars[: idx + 1]
+
+        bq  = base_quality_score(slice_)
+        ab  = absorption_score(slice_)
+        vc  = volume_character_score(slice_)
+        spr = is_wyckoff_spring(slice_)
+
+        r = ScanResult(
+            symbol=trade.symbol, scan_date=trade.entry_date,
+            signal_type=signal_type, signal=True,
+            entry_close=trade.entry_price, indicator_value=None,
+            lookback=lookback,
+            base_quality=bq, absorption=ab, volume_character=vc,
+            wyckoff_spring=spr,
+        )
+        conv = score_conviction(r)
+
+        if bq  >= 0.6: counts["base"] += 1
+        if ab  >= 0.6: counts["absorption"] += 1
+        if vc  >= 0.6: counts["vol_char"] += 1
+        if spr:        counts["spring"] += 1
+        if bq >= 0.6 or ab >= 0.6 or vc >= 0.6 or spr:
+            counts["any_wyckoff"] += 1
+        if conv >= 0.45:   # signal(0.30) + at least one Wyckoff layer
+            counts["high_conv"] += 1
+
+        per_trade.append((trade.entry_date, bq, ab, vc, spr, conv,
+                          trade.trade_return))
+
+    pct = lambda n: f"{n:>3}/{total}  ({n/total*100:4.1f}%)"
+
+    print(f"\n{'='*62}")
+    print(f"  Wyckoff Filter Analysis  ({total} breakout signals)")
+    print(f"{'='*62}")
+    print(f"  Base quality ≥ 0.6   : {pct(counts['base'])}")
+    print(f"  Absorption ≥ 0.6     : {pct(counts['absorption'])}")
+    print(f"  Vol character ≥ 0.6  : {pct(counts['vol_char'])}")
+    print(f"  Spring detected      : {pct(counts['spring'])}")
+    print(f"  Any Wyckoff layer    : {pct(counts['any_wyckoff'])}")
+    print(f"  Conviction ≥ 0.45    : {pct(counts['high_conv'])}")
+    print(f"{'='*62}")
+
+    # Compare avg trade return: Wyckoff confirmed vs unconfirmed
+    wyckoff_rets = [t[6] for t in per_trade
+                    if t[6] is not None and (t[1] >= 0.6 or t[2] >= 0.6 or t[3] >= 0.6 or t[4])]
+    plain_rets   = [t[6] for t in per_trade
+                    if t[6] is not None and not (t[1] >= 0.6 or t[2] >= 0.6 or t[3] >= 0.6 or t[4])]
+
+    def _avg_ret(rets):
+        return f"{sum(rets)/len(rets)*100:+.3f}%  (n={len(rets)})" if rets else "  N/A"
+
+    print(f"  Avg return — Wyckoff confirmed : {_avg_ret(wyckoff_rets)}")
+    print(f"  Avg return — plain signal only : {_avg_ret(plain_rets)}")
+    print(f"{'='*62}")
+
+
 def main() -> None:
     setup_logging()
     ensure_dirs()
@@ -208,6 +295,9 @@ def main() -> None:
 
     print_metrics(metrics)
     print_grouped_summaries(trade_records)
+
+    # ── Wyckoff filter analysis ───────────────────────────────────────────────
+    _wyckoff_analysis(bars, trade_records, args.signal, args.lookback)
 
     # ── Export ────────────────────────────────────────────────────────────────
     run_id = make_run_id(args.symbol, args.signal)

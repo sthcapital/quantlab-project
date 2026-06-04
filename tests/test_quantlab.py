@@ -5,6 +5,7 @@ Run with:  pytest -q
 All tests use mock/stub data — no IBKR connection required.
 """
 
+import pytest
 from datetime import date
 from pathlib import Path
 import sys, os
@@ -1416,3 +1417,102 @@ class TestWyckoffSignals:
             ))
         assert is_wyckoff_spring(base, lookback=60, undercut_pct=0.015,
                                  recovery_bars=3) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Wyckoff layers wired into score_conviction()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWyckoffConvictionIntegration:
+    """Verify Wyckoff fields on ScanResult are used by score_conviction()."""
+
+    def _base_result(self, **kwargs) -> ScanResult:
+        defaults = dict(
+            symbol="AAPL", scan_date="2026-01-10",
+            signal_type="breakout", signal=True,
+            entry_close=180.0, indicator_value=179.0, lookback=5,
+            regime_bullish=False,   # keep other layers off for isolation
+            news_count=0,
+            base_quality=0.0, absorption=0.0,
+            volume_character=0.0, wyckoff_spring=False,
+        )
+        defaults.update(kwargs)
+        return ScanResult(**defaults)
+
+    def test_base_quality_above_threshold_boosts(self):
+        low  = score_conviction(self._base_result(base_quality=0.4))
+        high = score_conviction(self._base_result(base_quality=0.7))
+        assert high - low == pytest.approx(0.15, abs=1e-9)
+
+    def test_base_quality_below_threshold_no_boost(self):
+        r = self._base_result(base_quality=0.59)
+        # signal(0.30) + nothing else = 0.30
+        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+
+    def test_absorption_above_threshold_boosts(self):
+        low  = score_conviction(self._base_result(absorption=0.4))
+        high = score_conviction(self._base_result(absorption=0.7))
+        assert high - low == pytest.approx(0.10, abs=1e-9)
+
+    def test_volume_character_above_threshold_boosts(self):
+        low  = score_conviction(self._base_result(volume_character=0.4))
+        high = score_conviction(self._base_result(volume_character=0.7))
+        assert high - low == pytest.approx(0.10, abs=1e-9)
+
+    def test_wyckoff_spring_boosts(self):
+        no_spring  = score_conviction(self._base_result(wyckoff_spring=False))
+        with_spring = score_conviction(self._base_result(wyckoff_spring=True))
+        assert with_spring - no_spring == pytest.approx(0.10, abs=1e-9)
+
+    def test_all_wyckoff_layers_stack(self):
+        no_wyckoff = score_conviction(self._base_result())
+        all_wyckoff = score_conviction(self._base_result(
+            base_quality=0.8, absorption=0.8,
+            volume_character=0.8, wyckoff_spring=True,
+        ))
+        # +0.15 + 0.10 + 0.10 + 0.10 = +0.45
+        assert all_wyckoff - no_wyckoff == pytest.approx(0.45, abs=1e-9)
+
+    def test_fully_confirmed_wyckoff_plus_regime_plus_earnings_clamped(self):
+        r = self._base_result(
+            regime_bullish=True, news_count=1, news_category="earnings",
+            rel_volume=2.0, news_c_score=0.9,
+            base_quality=0.8, absorption=0.8,
+            volume_character=0.8, wyckoff_spring=True,
+        )
+        # Would be 0.30+0.20+0.20+0.10+0.10+0.15+0.10+0.10+0.10 = 1.35 → clamped
+        assert score_conviction(r) == pytest.approx(1.0, abs=1e-9)
+
+    def test_downgrade_with_wyckoff_base_still_vetoed(self):
+        # Good Wyckoff base but downgrade news — net conviction should be reduced
+        with_downgrade = score_conviction(self._base_result(
+            news_count=1, news_category="downgrade",
+            base_quality=0.8,
+        ))
+        no_news_no_wyckoff = score_conviction(self._base_result())
+        # downgrade(-0.15) + base_quality(+0.15) cancel, net = signal only
+        assert with_downgrade == pytest.approx(no_news_no_wyckoff, abs=1e-9)
+
+    def test_scan_result_wyckoff_fields_default_to_zero(self):
+        r = ScanResult(
+            symbol="AAPL", scan_date="2026-01-10",
+            signal_type="breakout", signal=True,
+            entry_close=180.0, indicator_value=None, lookback=5,
+        )
+        assert r.base_quality == 0.0
+        assert r.absorption == 0.0
+        assert r.volume_character == 0.0
+        assert r.wyckoff_spring is False
+
+    def test_scan_symbol_populates_wyckoff_fields(self):
+        """scan_symbol() must compute and return non-None Wyckoff scores."""
+        bars = make_bars(100, trend=0.002)
+        result = scan_symbol("AAPL", bars, signal_type="breakout", lookback=5)
+        assert result is not None
+        assert isinstance(result.base_quality, float)
+        assert isinstance(result.absorption, float)
+        assert isinstance(result.volume_character, float)
+        assert isinstance(result.wyckoff_spring, bool)
+        assert 0.0 <= result.base_quality <= 1.0
+        assert 0.0 <= result.absorption <= 1.0
+        assert 0.0 <= result.volume_character <= 1.0
