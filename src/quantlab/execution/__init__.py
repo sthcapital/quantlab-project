@@ -109,6 +109,9 @@ class ScanResult:
     # Multi-lookback confirmation (set post-scan when signal fires at ≥2 lookbacks)
     multi_lookback_confirmed: bool = False  # True → +0.05 structural confirmation bonus
 
+    # Relative strength vs market benchmark (SPY)
+    rs_score: float = 0.0   # rs_score() ≥ 0.6 → +0.08; ≥ 0.8 → +0.12 (replaces lower)
+
     # Sector metadata (from SECTOR_MAP; used by sector_filter)
     sector: str = ""               # GICS sector (e.g. "Health Care", "Technology")
     sector_cluster: bool = False   # True when ≥3 same-sector signals on same day
@@ -146,6 +149,8 @@ def score_conviction(result: ScanResult) -> float:
         Multi-lookback confirmed        : 0.05  (signal fires at ≥2 lookback values)
         Options conviction ≥ 0.6       : 0.10  (bullish PCR/unusual calls/IV skew)
         Options conviction ≥ 0.8       : 0.15  (replaces the 0.10 — strong signal)
+        RS score ≥ 0.6 (outperforming) : 0.08
+        RS score ≥ 0.8 (leader)        : 0.12  (replaces the 0.08)
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -200,6 +205,12 @@ def score_conviction(result: ScanResult) -> float:
         score += 0.15
     elif result.options_conviction >= 0.6:
         score += 0.10
+
+    # Relative strength vs market benchmark (SPY)
+    if result.rs_score >= 0.8:
+        score += 0.12
+    elif result.rs_score >= 0.6:
+        score += 0.08
 
     return max(0.0, min(score, 1.0))
 
@@ -426,6 +437,7 @@ def scan_symbol(
         volume_trend_score as _vol_trend,
         climactic_volume_score as _climax,
     )
+    from quantlab.signals.relative_strength import rs_score as _rs_score
 
     if len(bars) <= lookback:
         logger.debug(f"{symbol}: not enough bars ({len(bars)} <= {lookback})")
@@ -464,6 +476,9 @@ def scan_symbol(
     # Earnings acceleration (pure bar-based, no fundamental data required)
     earn_profile = _earn_profile(symbol, bars)
     ea           = _earn_score(earn_profile)
+
+    # Relative strength vs benchmark (SPY via regime_bars; 0.0 when not available)
+    rs = _rs_score(bars, regime_bars) if regime_bars and len(regime_bars) > 126 else 0.0
 
     # Institutional volume signature
     accum_ratio = _accum_ratio(bars)
@@ -505,6 +520,7 @@ def scan_symbol(
         volume_trend=vol_trend,
         climactic_volume=climax,
         sector=SECTOR_MAP.get(symbol, ""),
+        rs_score=rs,
     )
 
     result.conviction_score = score_conviction(result)
@@ -606,6 +622,16 @@ def run_universe_scan(
     results = []
     total = len(symbols)
 
+    # Fetch SPY bars once for regime filter and RS calculation.
+    # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
+    spy_bars = None
+    try:
+        spy_bars = list(provider.get_daily_bars("SPY", start_date, end_date))
+        if spy_bars:
+            logger.info("SPY bars: %d bars loaded (regime filter + RS reference)", len(spy_bars))
+    except Exception as _spy_err:
+        logger.debug("SPY bars unavailable (%s) — regime=bullish, RS scores=0", _spy_err)
+
     for i, symbol in enumerate(symbols, 1):
         try:
             logger.info(f"[{i}/{total}] Scanning {symbol}...")
@@ -637,6 +663,7 @@ def run_universe_scan(
                 bars=bars,
                 signal_type=signal_type,
                 lookback=lookback,
+                regime_bars=spy_bars,   # enables regime filter + RS scoring
                 news_features=news_feat,
             )
 

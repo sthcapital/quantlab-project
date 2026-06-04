@@ -162,6 +162,7 @@ def main() -> None:
         opt_str     = f"  opt={r.options_conviction:.2f}" if r.options_conviction > 0 else ""
         sector_abbr = _SECTOR_ABBREV.get(r.sector, r.sector[:6]) if r.sector else "?"
         sector_str  = f"  [{sector_abbr}{'⚑' if r.sector_cluster else ''}]"
+        rs_str      = f"  rs={r.rs_score:.2f}" if r.rs_score > 0 else "  rs=--"
         print(
             f"  {i:2d}. {r.symbol:<8} "
             f"conviction={r.conviction_score:.2f}{multi_str}  "
@@ -169,7 +170,7 @@ def main() -> None:
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
-            f"{ea_str}{opt_str}{sector_str}{vol_str}{rv_str}{stop_str}"
+            f"{ea_str}{rs_str}{opt_str}{sector_str}{vol_str}{rv_str}{stop_str}"
         )
 
     print(f"\n{'='*60}\n")

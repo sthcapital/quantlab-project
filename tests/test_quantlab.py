@@ -3031,3 +3031,175 @@ class TestSectorFilter:
         result = scan_symbol("AAPL", bars, signal_type="breakout", lookback=5)
         assert result is not None
         assert result.sector == "Technology"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Relative strength signals (quantlab.signals.relative_strength)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestRelativeStrength:
+    """Synthetic bars — no market data or IBKR needed."""
+
+    @staticmethod
+    def _bars(n: int, start_price: float = 100.0, trend: float = 0.0) -> list[Bar]:
+        from datetime import timedelta
+        bars, price = [], start_price
+        start = date(2025, 1, 2)
+        for i in range(n):
+            price *= (1 + trend)
+            bars.append(Bar(start + timedelta(days=i),
+                            price*0.999, price*1.005, price*0.995, price, 1e6))
+        return bars
+
+    # ── rs_score ─────────────────────────────────────────────────────────────
+
+    def test_rs_score_neutral_when_matched(self):
+        from quantlab.signals.relative_strength import rs_score
+        # Both growing at the same rate → excess = 0 → score ≈ 0.5
+        sym = self._bars(200, trend=0.002)
+        mkt = self._bars(200, trend=0.002)
+        assert abs(rs_score(sym, mkt) - 0.5) < 0.01
+
+    def test_rs_score_above_half_when_outperforming(self):
+        from quantlab.signals.relative_strength import rs_score
+        sym = self._bars(200, trend=0.003)   # faster growth
+        mkt = self._bars(200, trend=0.001)
+        assert rs_score(sym, mkt) > 0.5
+
+    def test_rs_score_exceeds_0_6_threshold_on_strong_outperformance(self):
+        from quantlab.signals.relative_strength import rs_score
+        sym = self._bars(200, start_price=100, trend=0.003)   # +3% per bar
+        mkt = self._bars(200, start_price=100, trend=0.001)   # +1% per bar
+        score = rs_score(sym, mkt, periods=[63])
+        assert score > 0.6, f"Expected >0.6, got {score}"
+
+    def test_rs_score_below_half_when_underperforming(self):
+        from quantlab.signals.relative_strength import rs_score
+        sym = self._bars(200, trend=0.001)
+        mkt = self._bars(200, trend=0.003)
+        assert rs_score(sym, mkt) < 0.5
+
+    def test_rs_score_neutral_on_too_few_bars(self):
+        from quantlab.signals.relative_strength import rs_score
+        sym = self._bars(30)   # fewer than 63 lookback
+        mkt = self._bars(30)
+        assert rs_score(sym, mkt, periods=[63]) == pytest.approx(0.5, abs=0.01)
+
+    def test_rs_score_averages_across_periods(self):
+        from quantlab.signals.relative_strength import rs_score
+        sym = self._bars(200, trend=0.003)
+        mkt = self._bars(200, trend=0.001)
+        s1 = rs_score(sym, mkt, periods=[63])
+        s2 = rs_score(sym, mkt, periods=[126])
+        s_avg = rs_score(sym, mkt, periods=[63, 126])
+        assert abs(s_avg - (s1 + s2) / 2) < 0.001
+
+    def test_rs_score_in_range(self):
+        from quantlab.signals.relative_strength import rs_score
+        sym = self._bars(200, trend=0.005)
+        mkt = self._bars(200, trend=0.001)
+        assert 0.0 <= rs_score(sym, mkt) <= 1.0
+
+    def test_rs_score_strong_outperformance_exceeds_0_8(self):
+        from quantlab.signals.relative_strength import rs_score
+        # +0.5% daily vs flat = ~+10% excess over 63 days
+        sym = self._bars(200, start_price=100, trend=0.005)
+        mkt = self._bars(200, start_price=100, trend=0.0)
+        score = rs_score(sym, mkt, periods=[63])
+        assert score > 0.7, f"Strong leader should score >0.7, got {score}"
+
+    # ── rs_rank ───────────────────────────────────────────────────────────────
+
+    def test_rs_rank_top_symbol_scores_100(self):
+        from quantlab.signals.relative_strength import rs_rank
+        mkt  = self._bars(200, trend=0.001)
+        syms = {
+            "AAPL": self._bars(200, trend=0.005),   # best
+            "MSFT": self._bars(200, trend=0.002),
+            "XOM":  self._bars(200, trend=0.000),   # worst
+        }
+        ranks = rs_rank(syms, mkt, periods=[63])
+        assert ranks["AAPL"] == 100.0
+        assert ranks["XOM"]  == 0.0
+
+    def test_rs_rank_middle_is_50_for_three_symbols(self):
+        from quantlab.signals.relative_strength import rs_rank
+        mkt  = self._bars(200, trend=0.001)
+        syms = {
+            "A": self._bars(200, trend=0.003),
+            "B": self._bars(200, trend=0.002),
+            "C": self._bars(200, trend=0.001),
+        }
+        ranks = rs_rank(syms, mkt, periods=[63])
+        assert ranks["B"] == pytest.approx(50.0, abs=0.1)
+
+    def test_rs_rank_empty_input(self):
+        from quantlab.signals.relative_strength import rs_rank
+        mkt = self._bars(200)
+        assert rs_rank({}, mkt) == {}
+
+    def test_rs_rank_single_symbol_is_50(self):
+        from quantlab.signals.relative_strength import rs_rank
+        mkt  = self._bars(200)
+        syms = {"AAPL": self._bars(200, trend=0.003)}
+        ranks = rs_rank(syms, mkt, periods=[63])
+        assert ranks["AAPL"] == 50.0
+
+    def test_rs_rank_preserves_order(self):
+        from quantlab.signals.relative_strength import rs_rank
+        mkt  = self._bars(200, trend=0.001)
+        syms = {
+            "FAST": self._bars(200, trend=0.004),
+            "SLOW": self._bars(200, trend=0.001),
+            "FLAT": self._bars(200, trend=0.0),
+        }
+        ranks = rs_rank(syms, mkt, periods=[63])
+        assert ranks["FAST"] > ranks["SLOW"] > ranks["FLAT"]
+
+
+# ── RS conviction layer ────────────────────────────────────────────────────────
+
+class TestRSConvictionLayer:
+
+    def _r(self, rs: float) -> ScanResult:
+        r = ScanResult("AAPL","2026-06-04","breakout",True,180.0,None,5,
+                       regime_bullish=False)
+        r.rs_score = rs
+        return r
+
+    def test_rs_below_threshold_no_boost(self):
+        r = self._r(0.59)
+        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+
+    def test_rs_ge_0_6_adds_0_08(self):
+        low  = score_conviction(self._r(0.59))
+        high = score_conviction(self._r(0.60))
+        assert high - low == pytest.approx(0.08, abs=1e-9)
+
+    def test_rs_ge_0_8_adds_0_12(self):
+        low  = score_conviction(self._r(0.59))
+        high = score_conviction(self._r(0.80))
+        assert high - low == pytest.approx(0.12, abs=1e-9)
+
+    def test_rs_0_8_replaces_not_stacks(self):
+        mid    = score_conviction(self._r(0.70))   # +0.08
+        strong = score_conviction(self._r(0.85))   # +0.12
+        assert strong - mid == pytest.approx(0.04, abs=1e-9)  # 0.12 - 0.08 = 0.04
+
+    def test_rs_field_defaults_zero(self):
+        r = ScanResult("AAPL","2026-06-04","breakout",True,180.0,None,5)
+        assert r.rs_score == 0.0
+
+    def test_scan_symbol_populates_rs_when_regime_bars_provided(self):
+        sym_bars = make_bars(200, trend=0.003)
+        mkt_bars = make_bars(200, trend=0.001)
+        result = scan_symbol("AAPL", sym_bars, signal_type="breakout",
+                             lookback=5, regime_bars=mkt_bars)
+        assert result is not None
+        assert result.rs_score > 0.0   # market bars provided → RS computed
+
+    def test_scan_symbol_rs_zero_without_regime_bars(self):
+        bars = make_bars(200, trend=0.003)
+        result = scan_symbol("AAPL", bars, signal_type="breakout", lookback=5)
+        assert result is not None
+        assert result.rs_score == 0.0  # no regime_bars → default

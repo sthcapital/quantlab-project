@@ -155,7 +155,7 @@ def print_active(entries: list[dict], prices: dict[str, float]) -> None:
         print("  (no active entries)")
         return
 
-    hdr = (f"  {'#':>2}  {'symbol':<8}  {'sector':<7}  {'added':>10}  {'entry':>7}  "
+    hdr = (f"  {'#':>2}  {'symbol':<8}  {'sector':<7}  {'rs':>5}  {'added':>10}  {'entry':>7}  "
            f"{'current':>8}  {'return':>9}  {'days':>4}  "
            f"{'stop':>7}  {'dist':>6}  layers")
     print(hdr)
@@ -187,8 +187,33 @@ def print_active(entries: list[dict], prices: dict[str, float]) -> None:
         raw_sector  = SECTOR_MAP.get(sym, "")
         sector_disp = _SECTOR_ABBREV.get(raw_sector, raw_sector[:7])
 
+        # Compute live RS from parquet cache if available
+        try:
+            import pyarrow.parquet as _pq
+            from quantlab.signals.relative_strength import rs_score as _rs
+            from quantlab.storage import DATA_PROCESSED
+            from quantlab.providers.base import Bar as _Bar
+            from datetime import date as _date
+
+            spy_path = DATA_PROCESSED / "SPY_bars.parquet"
+            sym_path = DATA_PROCESSED / f"{sym}_bars.parquet"
+            if spy_path.exists() and sym_path.exists():
+                def _load(path):
+                    rows = _pq.read_table(path).to_pydict()
+                    return [_Bar(as_of=_date.fromisoformat(rows["date"][i]),
+                                 open=rows["open"][i], high=rows["high"][i],
+                                 low=rows["low"][i], close=rows["close"][i],
+                                 volume=rows["volume"][i])
+                            for i in range(len(rows["date"]))]
+                rs_val  = _rs(_load(sym_path), _load(spy_path))
+                rs_disp = f"{rs_val:.2f}"
+            else:
+                rs_disp = " -- "
+        except Exception:
+            rs_disp = " -- "
+
         print(
-            f"  {i:>2}.  {sym:<8}  {sector_disp:<7}  {str(da):>10}  {entry_p:>7.2f}  "
+            f"  {i:>2}.  {sym:<8}  {sector_disp:<7}  {rs_disp:>5}  {str(da):>10}  {entry_p:>7.2f}  "
             f"{cur_s}  {ret_s}  {days:>4}  "
             f"{atr_stop:>7.2f}  {dist_s:>6}{alarm}  {layers}"
         )
