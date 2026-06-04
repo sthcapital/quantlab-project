@@ -1439,15 +1439,18 @@ class TestWyckoffConvictionIntegration:
         defaults.update(kwargs)
         return ScanResult(**defaults)
 
-    def test_base_quality_above_threshold_boosts(self):
+    def test_base_quality_removed_from_scorer(self):
+        # base_quality is anti-predictive on large-caps (AAPL analysis).
+        # It must no longer contribute to the conviction score.
         low  = score_conviction(self._base_result(base_quality=0.4))
         high = score_conviction(self._base_result(base_quality=0.7))
-        assert high - low == pytest.approx(0.15, abs=1e-9)
+        assert high == low  # BQ field on ScanResult is still stored, just not scored
 
-    def test_base_quality_below_threshold_no_boost(self):
-        r = self._base_result(base_quality=0.59)
-        # signal(0.30) + nothing else = 0.30
-        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+    def test_base_quality_field_exists_but_ignored(self):
+        # BQ value stored on ScanResult, score unchanged regardless of value
+        r_low = self._base_result(base_quality=0.0)
+        r_high = self._base_result(base_quality=1.0)
+        assert score_conviction(r_low) == score_conviction(r_high)
 
     def test_absorption_above_threshold_boosts(self):
         low  = score_conviction(self._base_result(absorption=0.4))
@@ -1464,34 +1467,32 @@ class TestWyckoffConvictionIntegration:
         with_spring = score_conviction(self._base_result(wyckoff_spring=True))
         assert with_spring - no_spring == pytest.approx(0.10, abs=1e-9)
 
-    def test_all_wyckoff_layers_stack(self):
-        no_wyckoff = score_conviction(self._base_result())
+    def test_three_wyckoff_layers_stack(self):
+        # base_quality removed; only absorption + vol_character + spring remain
+        no_wyckoff  = score_conviction(self._base_result())
         all_wyckoff = score_conviction(self._base_result(
-            base_quality=0.8, absorption=0.8,
-            volume_character=0.8, wyckoff_spring=True,
+            absorption=0.8, volume_character=0.8, wyckoff_spring=True,
         ))
-        # +0.15 + 0.10 + 0.10 + 0.10 = +0.45
-        assert all_wyckoff - no_wyckoff == pytest.approx(0.45, abs=1e-9)
+        # +0.10 + 0.10 + 0.10 = +0.30
+        assert all_wyckoff - no_wyckoff == pytest.approx(0.30, abs=1e-9)
 
     def test_fully_confirmed_wyckoff_plus_regime_plus_earnings_clamped(self):
         r = self._base_result(
             regime_bullish=True, news_count=1, news_category="earnings",
             rel_volume=2.0, news_c_score=0.9,
-            base_quality=0.8, absorption=0.8,
+            base_quality=0.8, absorption=0.8,   # base_quality ignored
             volume_character=0.8, wyckoff_spring=True,
         )
-        # Would be 0.30+0.20+0.20+0.10+0.10+0.15+0.10+0.10+0.10 = 1.35 → clamped
+        # 0.30+0.20+0.20+0.10+0.10+0.10+0.10+0.10 = 1.20 → clamped to 1.0
         assert score_conviction(r) == pytest.approx(1.0, abs=1e-9)
 
-    def test_downgrade_with_wyckoff_base_still_vetoed(self):
-        # Good Wyckoff base but downgrade news — net conviction should be reduced
+    def test_downgrade_reduces_below_signal_only(self):
+        # Downgrade veto still works; base_quality no longer cancels it
         with_downgrade = score_conviction(self._base_result(
             news_count=1, news_category="downgrade",
-            base_quality=0.8,
         ))
-        no_news_no_wyckoff = score_conviction(self._base_result())
-        # downgrade(-0.15) + base_quality(+0.15) cancel, net = signal only
-        assert with_downgrade == pytest.approx(no_news_no_wyckoff, abs=1e-9)
+        signal_only = score_conviction(self._base_result())
+        assert with_downgrade < signal_only  # -0.15 from downgrade
 
     def test_scan_result_wyckoff_fields_default_to_zero(self):
         r = ScanResult(
@@ -1516,3 +1517,42 @@ class TestWyckoffConvictionIntegration:
         assert 0.0 <= result.base_quality <= 1.0
         assert 0.0 <= result.absorption <= 1.0
         assert 0.0 <= result.volume_character <= 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# stock_profile() classification
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStockProfile:
+
+    def test_mega_cap_symbols_classified_correctly(self):
+        from quantlab.execution import stock_profile
+        for sym in ("AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META"):
+            assert stock_profile(sym) == "mega_cap_liquid", sym
+
+    def test_sp500_non_mega_classified_as_large_cap(self):
+        from quantlab.execution import stock_profile
+        for sym in ("CAT", "LLY", "JPM", "XOM", "CSCO", "GS"):
+            assert stock_profile(sym) == "large_cap_growth", sym
+
+    def test_unknown_symbol_classified_as_mid_cap(self):
+        from quantlab.execution import stock_profile
+        assert stock_profile("HYPOTHETICAL") == "mid_cap_growth"
+        assert stock_profile("XYZ") == "mid_cap_growth"
+
+    def test_mega_cap_set_is_frozenset(self):
+        from quantlab.execution import MEGA_CAP_LIQUID
+        assert isinstance(MEGA_CAP_LIQUID, frozenset)
+        assert len(MEGA_CAP_LIQUID) == 6
+
+    def test_tsla_classified_large_cap_not_mega(self):
+        # TSLA is in SP500_SAMPLE but not MEGA_CAP_LIQUID
+        from quantlab.execution import stock_profile
+        assert stock_profile("TSLA") == "large_cap_growth"
+
+    def test_watchlist_small_symbols_are_large_cap(self):
+        from quantlab.execution import stock_profile, WATCHLIST_SMALL
+        for sym in WATCHLIST_SMALL:
+            profile = stock_profile(sym)
+            # All WATCHLIST_SMALL are either mega or large cap
+            assert profile in ("mega_cap_liquid", "large_cap_growth"), sym

@@ -104,7 +104,7 @@ class ScanResult:
 
 def score_conviction(result: ScanResult) -> float:
     """
-    Score 0.0–1.0 based on all confirmation layers.
+    Score 0.0–1.0 based on all active confirmation layers.
 
     Layer weights (max 1.0, clamped):
         Signal fired               : 0.30  (mandatory — returns 0 if no signal)
@@ -117,12 +117,18 @@ def score_conviction(result: ScanResult) -> float:
                                        other               →  0.00
         Rel volume ≥ 1.5×          : 0.10
         Strong news c_score ≥ 0.7  : 0.10
-        Wyckoff base quality ≥ 0.6 : 0.15
         Wyckoff absorption ≥ 0.6   : 0.10
         Wyckoff vol character ≥ 0.6: 0.10
         Wyckoff spring detected    : 0.10
 
-    Downgrade news reduces conviction; the result is clamped to [0.0, 1.0].
+    Note: base_quality_score() is intentionally excluded from this scorer.
+    Live AAPL analysis (82 signals, 2023–2025) showed base quality is
+    anti-predictive for mega-cap large-caps: BQ≥0.6 win rate 26.9% vs
+    62.5% for plain signals. Use base_quality_score() as a standalone
+    diagnostic tool via analyse_wyckoff_filter.py, not as a scorer input,
+    until validated on mid-cap growth names.
+
+    Downgrade news reduces conviction; result is clamped to [0.0, 1.0].
     """
     if not result.signal:
         return 0.0
@@ -141,9 +147,7 @@ def score_conviction(result: ScanResult) -> float:
     if result.news_c_score is not None and result.news_c_score >= 0.7:
         score += 0.10
 
-    # Wyckoff structural confirmation
-    if result.base_quality >= 0.6:
-        score += 0.15
+    # Wyckoff structural confirmation (absorption + character + spring only)
     if result.absorption >= 0.6:
         score += 0.10
     if result.volume_character >= 0.6:
@@ -219,6 +223,49 @@ SP500_SAMPLE = [
 ]
 
 WATCHLIST_SMALL = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "GOOGL", "META"]
+
+# ── Stock profile classification ───────────────────────────────────────────────
+
+MEGA_CAP_LIQUID: frozenset[str] = frozenset({
+    # >$500B market cap as of 2024–2025. Continuous analyst coverage, intraday
+    # liquidity so high that daily-bar Wyckoff patterns are less reliable.
+    # base_quality_score is ANTI-predictive here (see docs/STRATEGY.md).
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META",
+})
+
+
+def stock_profile(symbol: str) -> str:
+    """
+    Classify a symbol into a conviction-scoring tier.
+
+    Three tiers:
+
+        "mega_cap_liquid"  — >$500B market cap.  Constant analyst coverage
+                             makes price action noisy on daily bars.  The
+                             base_quality Wyckoff filter is anti-predictive
+                             here; use absorption + news scoring only.
+
+        "large_cap_growth" — $50B–$500B.  Full Wyckoff suite applicable once
+                             validated across more symbols.  Currently covers
+                             all SP500_SAMPLE names outside MEGA_CAP_LIQUID.
+
+        "mid_cap_growth"   — <$50B.  Highest potential conviction lift from
+                             the full Wyckoff suite; not yet in SP500_SAMPLE.
+
+    Polygon.io will provide real-time market cap data in Phase 5.  Until then,
+    classification is symbol-name based using the SP500_SAMPLE universe.
+
+    Args:
+        symbol: Ticker symbol, e.g. "AAPL" or "CAT".
+
+    Returns:
+        One of: "mega_cap_liquid", "large_cap_growth", "mid_cap_growth".
+    """
+    if symbol in MEGA_CAP_LIQUID:
+        return "mega_cap_liquid"
+    if symbol in SP500_SAMPLE or symbol in WATCHLIST_SMALL:
+        return "large_cap_growth"
+    return "mid_cap_growth"
 
 
 def load_universe(name: str = "small") -> list[str]:
