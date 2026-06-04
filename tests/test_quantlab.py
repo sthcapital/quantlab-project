@@ -1189,3 +1189,230 @@ class TestLowEdgeSymbols:
     def test_is_frozenset(self):
         from quantlab.execution import LOW_EDGE_SYMBOLS
         assert isinstance(LOW_EDGE_SYMBOLS, frozenset)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Wyckoff signals (quantlab.signals.wyckoff)
+# All tests use synthetic Bar sequences — no market data required.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWyckoffSignals:
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _bars(n: int, start_price: float = 100.0,
+              trend: float = 0.0, vol_base: float = 1_000_000.0,
+              vol_scale: float = 1.0) -> list[Bar]:
+        """Generate simple bars with configurable trend and uniform volume."""
+        from datetime import timedelta
+        bars = []
+        price = start_price
+        d = date(2025, 1, 6)
+        for i in range(n):
+            price = price * (1 + trend)
+            bars.append(Bar(
+                as_of=d + timedelta(days=i),
+                open=price * 0.999,
+                high=price * 1.005,
+                low=price  * 0.995,
+                close=price,
+                volume=vol_base * vol_scale,
+            ))
+        return bars
+
+    # ── absorption_score ──────────────────────────────────────────────────────
+
+    def test_absorption_neutral_on_uniform_bars(self):
+        from quantlab.signals.wyckoff import absorption_score
+        bars = self._bars(80)
+        # Flat price, uniform volume → no heavy-volume bars → neutral 0.5
+        assert absorption_score(bars) == 0.5
+
+    def test_absorption_high_when_volume_spikes_without_new_lows(self):
+        from quantlab.signals.wyckoff import absorption_score
+        from datetime import timedelta
+        # Build a stable base at price ~100, then inject high-volume bars
+        # that do NOT make new lows (classic absorption)
+        base = self._bars(40, start_price=100.0, trend=0.0)
+        # Add 20 bars: high volume, close around 100, low stays >= 98 (base low)
+        d = base[-1].as_of
+        for i in range(20):
+            base.append(Bar(
+                as_of=d + timedelta(days=i + 1),
+                open=100.0, high=101.0, low=99.0, close=100.0,
+                volume=3_000_000.0,   # 3× average → heavy
+            ))
+        score = absorption_score(base, volume_threshold=1.3, lookback=60)
+        assert score > 0.5   # heavy volume, no new lows → absorption dominant
+
+    def test_absorption_low_when_volume_spikes_with_new_lows(self):
+        from quantlab.signals.wyckoff import absorption_score
+        from datetime import timedelta
+        # Base at 100, then heavy-volume bars that make progressively lower lows
+        base = self._bars(40, start_price=100.0, trend=0.0)
+        d = base[-1].as_of
+        price = 100.0
+        for i in range(20):
+            price -= 2.5   # aggressive decline: lows drop well below support
+            base.append(Bar(
+                as_of=d + timedelta(days=i + 1),
+                open=price + 0.2, high=price + 0.5,
+                low=price - 0.5,
+                close=price,
+                volume=3_000_000.0,
+            ))
+        # base_support ≈ 99.5; bars quickly go below 99.5 * 0.985 = 98.0
+        score = absorption_score(base, volume_threshold=1.3, lookback=60)
+        assert score < 0.5   # heavy volume + lows breaking through support
+
+    def test_absorption_returns_neutral_on_too_few_bars(self):
+        from quantlab.signals.wyckoff import absorption_score
+        bars = self._bars(10)
+        assert absorption_score(bars) == 0.5
+
+    # ── base_quality_score ────────────────────────────────────────────────────
+
+    def test_base_quality_low_on_few_bars(self):
+        from quantlab.signals.wyckoff import base_quality_score
+        bars = self._bars(20)   # too short for a 12-week base
+        assert base_quality_score(bars, min_weeks=12) == 0.0
+
+    def test_base_quality_higher_on_tight_long_base(self):
+        from quantlab.signals.wyckoff import base_quality_score
+        # 100 bars in a 3% range — tight base, good duration
+        tight = self._bars(100, start_price=100.0, trend=0.0)
+        score = base_quality_score(tight, min_weeks=8)
+        assert score > 0.5
+
+    def test_base_quality_lower_on_wide_volatile_bars(self):
+        from quantlab.signals.wyckoff import base_quality_score
+        from datetime import timedelta
+        # Wide-ranging bars: 30% swings — no base forming
+        bars = []
+        d = date(2025, 1, 6)
+        price = 100.0
+        for i in range(80):
+            swing = 1.15 if i % 2 == 0 else 0.85   # alternating 15% up/down
+            price *= swing
+            bars.append(Bar(
+                as_of=d + timedelta(days=i),
+                open=price * 0.99, high=price * 1.02,
+                low=price * 0.98, close=price,
+                volume=1_000_000.0,
+            ))
+        score = base_quality_score(bars, min_weeks=8)
+        assert score < 0.5
+
+    def test_base_quality_returns_float_in_range(self):
+        from quantlab.signals.wyckoff import base_quality_score
+        bars = self._bars(80)
+        score = base_quality_score(bars, min_weeks=8)
+        assert 0.0 <= score <= 1.0
+
+    # ── volume_character_score ────────────────────────────────────────────────
+
+    def test_volume_character_neutral_on_uniform_volume(self):
+        from quantlab.signals.wyckoff import volume_character_score
+        # Same volume every bar → no above-average bars → neutral 0.5
+        bars = self._bars(80, trend=0.001)
+        score = volume_character_score(bars)
+        assert score == 0.5
+
+    def test_volume_character_above_half_on_accumulation_pattern(self):
+        from quantlab.signals.wyckoff import volume_character_score
+        from datetime import timedelta
+        # Up-days on 3× volume, down-days on 0.5× volume — pure accumulation
+        bars = []
+        d = date(2025, 1, 6)
+        price = 100.0
+        for i in range(80):
+            is_up = (i % 2 == 0)
+            price *= (1.002 if is_up else 0.999)
+            vol = 3_000_000.0 if is_up else 500_000.0
+            bars.append(Bar(
+                as_of=d + timedelta(days=i),
+                open=price * (0.999 if is_up else 1.001),
+                high=price * 1.003, low=price * 0.997,
+                close=price, volume=vol,
+            ))
+        score = volume_character_score(bars, lookback=60)
+        assert score > 0.55
+
+    def test_volume_character_below_half_on_distribution_pattern(self):
+        from quantlab.signals.wyckoff import volume_character_score
+        from datetime import timedelta
+        # Down-days on 3× volume, up-days on 0.5× volume — distribution
+        bars = []
+        d = date(2025, 1, 6)
+        price = 100.0
+        for i in range(80):
+            is_up = (i % 2 == 0)
+            price *= (1.001 if is_up else 0.998)
+            vol = 500_000.0 if is_up else 3_000_000.0   # reversed
+            bars.append(Bar(
+                as_of=d + timedelta(days=i),
+                open=price * (0.999 if is_up else 1.001),
+                high=price * 1.002, low=price * 0.998,
+                close=price, volume=vol,
+            ))
+        score = volume_character_score(bars, lookback=60)
+        assert score < 0.45
+
+    def test_volume_character_returns_float_in_range(self):
+        from quantlab.signals.wyckoff import volume_character_score
+        bars = self._bars(80, trend=0.001)
+        score = volume_character_score(bars)
+        assert 0.0 <= score <= 1.0
+
+    # ── is_wyckoff_spring ─────────────────────────────────────────────────────
+
+    def test_spring_detected_when_undercut_and_recovery(self):
+        from quantlab.signals.wyckoff import is_wyckoff_spring
+        from datetime import timedelta
+        # 70-bar base at 100, then one bar dips to 97.5 (2.5% undercut) and
+        # recovers, followed by a close back above 100
+        base = self._bars(70, start_price=100.0, trend=0.0)
+        d = base[-1].as_of
+        support = min(b.low for b in base)  # ≈ 99.5
+        # Spring bar: dip below support, high volume
+        base.append(Bar(
+            as_of=d + timedelta(days=1),
+            open=99.8, high=100.5,
+            low=support * 0.97,   # undercuts by ~3%
+            close=100.2,          # closes above support → recovery
+            volume=2_500_000.0,   # elevated volume
+        ))
+        assert is_wyckoff_spring(base, lookback=60, undercut_pct=0.015,
+                                 recovery_bars=3, volume_confirmation=True,
+                                 volume_threshold=1.2) is True
+
+    def test_spring_not_detected_on_flat_bars(self):
+        from quantlab.signals.wyckoff import is_wyckoff_spring
+        bars = self._bars(80, start_price=100.0, trend=0.0)
+        # No undercut at all → no spring
+        assert is_wyckoff_spring(bars, lookback=60, undercut_pct=0.015) is False
+
+    def test_spring_not_detected_on_too_few_bars(self):
+        from quantlab.signals.wyckoff import is_wyckoff_spring
+        bars = self._bars(10)
+        assert is_wyckoff_spring(bars) is False
+
+    def test_spring_not_detected_when_no_recovery(self):
+        from quantlab.signals.wyckoff import is_wyckoff_spring
+        from datetime import timedelta
+        # Price undercuts support but keeps falling — no recovery
+        base = self._bars(70, start_price=100.0, trend=0.0)
+        d = base[-1].as_of
+        support = min(b.low for b in base)
+        # Three bars all staying below support
+        for i in range(3):
+            base.append(Bar(
+                as_of=d + timedelta(days=i + 1),
+                open=96.0, high=97.0,
+                low=95.0,           # stays well below support
+                close=96.0,         # closes below support → no recovery
+                volume=2_500_000.0,
+            ))
+        assert is_wyckoff_spring(base, lookback=60, undercut_pct=0.015,
+                                 recovery_bars=3) is False
