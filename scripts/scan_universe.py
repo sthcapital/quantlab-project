@@ -46,6 +46,10 @@ def main() -> None:
                         help="Skip news fetching (faster, price-only scan)")
     parser.add_argument("--save-db", action="store_true",
                         help="Persist all scan results (not just actionable) to DuckDB")
+    parser.add_argument("--multi-lookback", action="store_true",
+                        help="Run a secondary scan to confirm signals across two lookbacks")
+    parser.add_argument("--secondary-lookback", type=int, default=20,
+                        help="Secondary lookback for multi-lookback confirmation (default 20)")
     args = parser.parse_args()
 
     ensure_dirs()
@@ -108,6 +112,33 @@ def main() -> None:
         print("No actionable setups found today.\n")
         return
 
+    # ── Multi-lookback confirmation ────────────────────────────────────────────
+    # Run a fast secondary scan (bars already cached) to find symbols that also
+    # fire a breakout signal at the secondary lookback.  Symbols confirmed on
+    # both lookbacks earn a +0.05 structural-confirmation bonus and get a ✓ marker.
+    if args.multi_lookback:
+        from quantlab.execution import scan_symbol, score_conviction
+        secondary_fired: set[str] = set()
+        for symbol in symbols:
+            try:
+                bars2 = list(provider.get_daily_bars(symbol, start_date, end_date))
+                r2 = scan_symbol(symbol, bars2, signal_type=args.signal,
+                                 lookback=args.secondary_lookback)
+                if r2 and r2.signal:
+                    secondary_fired.add(symbol)
+            except Exception:
+                pass
+
+        for r in results:
+            if r.symbol in secondary_fired:
+                r.multi_lookback_confirmed = True
+                r.conviction_score = score_conviction(r)
+
+        results.sort(key=lambda r: r.conviction_score, reverse=True)
+        n_confirmed = sum(1 for r in results if r.multi_lookback_confirmed)
+        print(f"  Multi-lookback (lb={args.lookback}+{args.secondary_lookback}): "
+              f"{n_confirmed}/{len(results)} confirmed  ✓")
+
     print(f"\n{'─'*60}")
     print(f"  {len(results)} actionable setup(s) — ranked by conviction")
     print(f"{'─'*60}")
@@ -122,9 +153,10 @@ def main() -> None:
             f"  vt={r.volume_trend:.2f}"
             f"  cv={r.climactic_volume:.2f}"
         )
+        multi_str = " ✓" if r.multi_lookback_confirmed else "  "
         print(
             f"  {i:2d}. {r.symbol:<8} "
-            f"conviction={r.conviction_score:.2f}  "
+            f"conviction={r.conviction_score:.2f}{multi_str}  "
             f"close={r.entry_close:.2f}  "
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "

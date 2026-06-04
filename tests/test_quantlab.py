@@ -1453,9 +1453,10 @@ class TestWyckoffConvictionIntegration:
         assert score_conviction(r_low) == score_conviction(r_high)
 
     def test_absorption_above_threshold_boosts(self):
+        # Reduced from 0.10 to 0.05: absorption fires on 100% of daily-bar signals
         low  = score_conviction(self._base_result(absorption=0.4))
         high = score_conviction(self._base_result(absorption=0.7))
-        assert high - low == pytest.approx(0.10, abs=1e-9)
+        assert high - low == pytest.approx(0.05, abs=1e-9)
 
     def test_volume_character_above_threshold_boosts(self):
         low  = score_conviction(self._base_result(volume_character=0.4))
@@ -1468,13 +1469,13 @@ class TestWyckoffConvictionIntegration:
         assert with_spring - no_spring == pytest.approx(0.10, abs=1e-9)
 
     def test_three_wyckoff_layers_stack(self):
-        # base_quality removed; only absorption + vol_character + spring remain
+        # absorption reduced to 0.05; vol_character=0.10; spring=0.10
         no_wyckoff  = score_conviction(self._base_result())
         all_wyckoff = score_conviction(self._base_result(
             absorption=0.8, volume_character=0.8, wyckoff_spring=True,
         ))
-        # +0.10 + 0.10 + 0.10 = +0.30
-        assert all_wyckoff - no_wyckoff == pytest.approx(0.30, abs=1e-9)
+        # +0.05 + 0.10 + 0.10 = +0.25
+        assert all_wyckoff - no_wyckoff == pytest.approx(0.25, abs=1e-9)
 
     def test_fully_confirmed_wyckoff_plus_regime_plus_earnings_clamped(self):
         r = self._base_result(
@@ -1946,3 +1947,56 @@ class TestVolumeProfileConviction:
         assert r.accumulation_ratio == 0.0
         assert r.volume_trend       == 0.0
         assert r.climactic_volume   == 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Multi-lookback confirmation layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMultiLookbackConfirmation:
+
+    def _r(self, **kw) -> ScanResult:
+        defaults = dict(symbol="ABT", scan_date="2026-06-04",
+                        signal_type="breakout", signal=True,
+                        entry_close=91.0, indicator_value=None, lookback=5,
+                        regime_bullish=False)
+        defaults.update(kw)
+        return ScanResult(**defaults)
+
+    def test_multi_lookback_field_defaults_false(self):
+        r = ScanResult("ABT","2026-06-04","breakout",True,91.0,None,5)
+        assert r.multi_lookback_confirmed is False
+
+    def test_multi_lookback_adds_five_bps(self):
+        base = score_conviction(self._r(multi_lookback_confirmed=False))
+        confirmed = score_conviction(self._r(multi_lookback_confirmed=True))
+        assert confirmed - base == pytest.approx(0.05, abs=1e-9)
+
+    def test_multi_lookback_stacks_with_earnings(self):
+        # signal(0.30) + ea(0.10) + multi(0.05) = 0.45
+        r = self._r(earnings_acceleration=0.6, multi_lookback_confirmed=True)
+        assert score_conviction(r) == pytest.approx(0.45, abs=1e-9)
+
+    def test_multi_lookback_does_not_fire_when_false(self):
+        r = self._r(multi_lookback_confirmed=False)
+        # signal(0.30) only (regime_bullish=False, no other layers)
+        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+
+    def test_absorption_now_contributes_half_of_old_weight(self):
+        """Regression: absorption ≥ 0.6 should now give +0.05, not +0.10."""
+        no_abs = score_conviction(self._r(absorption=0.0))
+        with_abs = score_conviction(self._r(absorption=0.8))
+        assert with_abs - no_abs == pytest.approx(0.05, abs=1e-9)
+
+    def test_full_scoring_with_all_layers_clamped(self):
+        r = self._r(
+            regime_bullish=True,
+            news_count=1, news_category="earnings",
+            rel_volume=2.0, news_c_score=0.9,
+            absorption=0.8, volume_character=0.8, wyckoff_spring=True,
+            earnings_acceleration=0.8,
+            accumulation_ratio=0.7, climactic_volume=0.8,
+            multi_lookback_confirmed=True,
+        )
+        # 0.30+0.20+0.20+0.10+0.10+0.05+0.10+0.10+0.10+0.08+0.07+0.05 = 1.45 → 1.0
+        assert score_conviction(r) == pytest.approx(1.0, abs=1e-9)

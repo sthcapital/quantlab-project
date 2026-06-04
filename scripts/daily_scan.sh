@@ -30,6 +30,7 @@ IBKR_PORT="7497"
 UNIVERSE="sp500_sample"
 SIGNAL="breakout"
 LOOKBACK="5"
+SECONDARY_LOOKBACK="20"         # secondary lookback for multi-confirmation (lb=5 + lb=20)
 MIN_CONVICTION="0.4"
 HIGH_CONV_THRESHOLD="0.70"      # symbols above this trigger a backtest run
 
@@ -61,8 +62,8 @@ cd "$PROJECT_DIR"
     echo "  QuantLab Daily Pre-Market Scan"
     echo "  $(ts)"
     echo "  Universe  : $UNIVERSE"
-    echo "  Signal    : $SIGNAL  lookback=$LOOKBACK  min_conviction=$MIN_CONVICTION"
-    echo "  High-conv : >${HIGH_CONV_THRESHOLD} conviction → full backtest triggered"
+    echo "  Signal    : $SIGNAL  lookback=$LOOKBACK+$SECONDARY_LOOKBACK (multi-confirmed)  min_conviction=$MIN_CONVICTION"
+    echo "  High-conv : >${HIGH_CONV_THRESHOLD} conviction → full backtest triggered  (✓ = multi-confirmed)"
     echo "  IBKR      : $IBKR_HOST:$IBKR_PORT"
     if [[ -n "$WITH_NEWS" ]]; then
         echo "  News      : enabled"
@@ -94,13 +95,16 @@ log "TWS reachable — proceeding."
 log "Starting universe scan ..."
 
 SCAN_ARGS=(
-    --universe       "$UNIVERSE"
-    --signal         "$SIGNAL"
-    --lookback       "$LOOKBACK"
-    --min-conviction "$MIN_CONVICTION"
-    --provider       ibkr
-    --host           "$IBKR_HOST"
-    --port           "$IBKR_PORT"
+    --universe          "$UNIVERSE"
+    --signal            "$SIGNAL"
+    --lookback          "$LOOKBACK"
+    --min-conviction    "$MIN_CONVICTION"
+    --provider          ibkr
+    --host              "$IBKR_HOST"
+    --port              "$IBKR_PORT"
+    --multi-lookback
+    --secondary-lookback "$SECONDARY_LOOKBACK"
+    --save-db
 )
 [[ -z "$WITH_NEWS" ]] && SCAN_ARGS+=(--no-news)
 
@@ -119,6 +123,7 @@ _PARSE_SCRIPT='
 import sys, re
 threshold = float(sys.argv[1])
 for line in sys.stdin:
+    # conviction=X.XX optionally followed by " ✓" for multi-confirmed symbols
     m = re.search(r"^\s+\d+\.\s+(.+?)\s{2,}conviction=([0-9.]+)", line)
     if m:
         sym  = m.group(1).strip()
