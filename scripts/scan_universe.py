@@ -112,7 +112,9 @@ def main() -> None:
 
     for i, r in enumerate(results, 1):
         stop_str = f"  stop={r.atr_stop:.2f}" if r.atr_stop else ""
-        rv_str = f"  rel_vol={r.rel_volume:.2f}x" if r.rel_volume else ""
+        rv_str   = f"  rel_vol={r.rel_volume:.2f}x" if r.rel_volume else ""
+        ea_str   = f"  ea={r.earnings_acceleration:.2f}" \
+                   if r.earnings_acceleration > 0 else "  ea=0.00"
         print(
             f"  {i:2d}. {r.symbol:<8} "
             f"conviction={r.conviction_score:.2f}  "
@@ -120,7 +122,7 @@ def main() -> None:
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
-            f"{rv_str}{stop_str}"
+            f"{ea_str}{rv_str}{stop_str}"
         )
 
     print(f"\n{'='*60}\n")

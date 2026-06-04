@@ -90,10 +90,13 @@ class ScanResult:
     atr_stop: float | None = None
 
     # Wyckoff structural layers (computed from bar history at scan time)
-    base_quality: float = 0.0     # base_quality_score()    ≥ 0.6 → +0.15
+    base_quality: float = 0.0     # base_quality_score()    ≥ 0.6 → +0.15 (disabled)
     absorption: float = 0.0       # absorption_score()      ≥ 0.6 → +0.10
     volume_character: float = 0.0 # volume_character_score() ≥ 0.6 → +0.10
     wyckoff_spring: bool = False   # is_wyckoff_spring()         True → +0.10
+
+    # Earnings acceleration layer (detected from price/volume anomalies)
+    earnings_acceleration: float = 0.0  # earnings_acceleration_score() ≥ 0.5 → +0.10
 
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
@@ -117,9 +120,10 @@ def score_conviction(result: ScanResult) -> float:
                                        other               →  0.00
         Rel volume ≥ 1.5×          : 0.10
         Strong news c_score ≥ 0.7  : 0.10
-        Wyckoff absorption ≥ 0.6   : 0.10
-        Wyckoff vol character ≥ 0.6: 0.10
-        Wyckoff spring detected    : 0.10
+        Wyckoff absorption ≥ 0.6        : 0.10
+        Wyckoff vol character ≥ 0.6     : 0.10
+        Wyckoff spring detected         : 0.10
+        Earnings acceleration ≥ 0.5     : 0.10
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -153,6 +157,10 @@ def score_conviction(result: ScanResult) -> float:
     if result.volume_character >= 0.6:
         score += 0.10
     if result.wyckoff_spring:
+        score += 0.10
+
+    # Earnings acceleration (detected from price/volume anomalies in bar history)
+    if result.earnings_acceleration >= 0.5:
         score += 0.10
 
     return max(0.0, min(score, 1.0))
@@ -317,6 +325,10 @@ def scan_symbol(
         volume_character_score as _vol_char,
         is_wyckoff_spring as _spring,
     )
+    from quantlab.signals.earnings import (
+        compute_earnings_profile as _earn_profile,
+        earnings_acceleration_score as _earn_score,
+    )
 
     if len(bars) <= lookback:
         logger.debug(f"{symbol}: not enough bars ({len(bars)} <= {lookback})")
@@ -352,6 +364,10 @@ def scan_symbol(
     vc     = _vol_char(bars)
     spring = _spring(bars)
 
+    # Earnings acceleration (pure bar-based, no fundamental data required)
+    earn_profile = _earn_profile(symbol, bars)
+    ea           = _earn_score(earn_profile)
+
     # News features
     n_count = 0
     n_cat = "none"
@@ -382,6 +398,7 @@ def scan_symbol(
         absorption=ab,
         volume_character=vc,
         wyckoff_spring=spring,
+        earnings_acceleration=ea,
     )
 
     result.conviction_score = score_conviction(result)

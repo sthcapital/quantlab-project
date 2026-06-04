@@ -1556,3 +1556,222 @@ class TestStockProfile:
             profile = stock_profile(sym)
             # All WATCHLIST_SMALL are either mega or large cap
             assert profile in ("mega_cap_liquid", "large_cap_growth"), sym
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Earnings acceleration detection (quantlab.signals.earnings)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEarningsDetection:
+    """All tests use synthetic Bar sequences — no IBKR connection needed."""
+
+    @staticmethod
+    def _flat_bars(n: int, vol: float = 1_000_000.0) -> list[Bar]:
+        from datetime import timedelta
+        start = date(2024, 1, 2)
+        return [
+            Bar(start + timedelta(days=i), 100.0, 101.0, 99.0, 100.0, vol)
+            for i in range(n)
+        ]
+
+    @staticmethod
+    def _insert_earnings_event(
+        bars: list[Bar],
+        idx: int,
+        gap_pct: float = 0.05,
+        vol_multiplier: float = 3.0,
+    ) -> list[Bar]:
+        """Replace bar at idx with a large-gap, high-volume earnings bar."""
+        from datetime import timedelta
+        prev_close = bars[idx - 1].close if idx > 0 else 100.0
+        new_open   = prev_close * (1 + gap_pct)
+        avg_vol    = 1_000_000.0
+        new_bar    = Bar(
+            as_of=bars[idx].as_of,
+            open=new_open,
+            high=new_open * 1.02,
+            low=new_open  * 0.98,
+            close=new_open * 1.01,
+            volume=avg_vol * vol_multiplier,
+        )
+        result = bars[:]
+        result[idx] = new_bar
+        return result
+
+    # ── detect_earnings_dates ─────────────────────────────────────────────────
+
+    def test_flat_bars_produce_no_events(self):
+        from quantlab.signals.earnings import detect_earnings_dates
+        bars = self._flat_bars(200)
+        assert detect_earnings_dates(bars) == []
+
+    def test_single_gap_event_detected(self):
+        from quantlab.signals.earnings import detect_earnings_dates
+        bars = self._flat_bars(200)
+        bars = self._insert_earnings_event(bars, 60, gap_pct=0.05)
+        dates = detect_earnings_dates(bars, gap_threshold=0.025, vol_threshold=1.5)
+        assert len(dates) == 1
+        assert dates[0] == bars[60].as_of.isoformat()
+
+    def test_four_quarterly_events_detected(self):
+        from quantlab.signals.earnings import detect_earnings_dates
+        bars = self._flat_bars(300)
+        for idx in (40, 103, 166, 229):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.04)
+        dates = detect_earnings_dates(bars, gap_threshold=0.025, vol_threshold=1.5,
+                                      min_event_spacing=30)
+        assert len(dates) == 4
+
+    def test_events_within_spacing_window_deduped(self):
+        from quantlab.signals.earnings import detect_earnings_dates
+        bars = self._flat_bars(200)
+        # Insert two events only 5 bars apart — should only keep first
+        bars = self._insert_earnings_event(bars, 60, gap_pct=0.05)
+        bars = self._insert_earnings_event(bars, 65, gap_pct=0.04)
+        dates = detect_earnings_dates(bars, min_event_spacing=30)
+        assert len(dates) == 1
+
+    def test_large_gap_above_max_gap_excluded(self):
+        from quantlab.signals.earnings import detect_earnings_dates
+        bars = self._flat_bars(200)
+        bars = self._insert_earnings_event(bars, 60, gap_pct=0.25)  # 25% > max_gap
+        dates = detect_earnings_dates(bars, gap_threshold=0.025, max_gap=0.20)
+        assert len(dates) == 0
+
+    def test_returns_empty_on_too_few_bars(self):
+        from quantlab.signals.earnings import detect_earnings_dates
+        assert detect_earnings_dates(self._flat_bars(10)) == []
+
+    # ── compute_earnings_profile ──────────────────────────────────────────────
+
+    def test_profile_empty_on_flat_bars(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        p = compute_earnings_profile("TEST", self._flat_bars(200))
+        assert p.earnings_count == 0
+        assert p.acceleration_trend == 0.0
+
+    def test_profile_detects_frequency(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        bars = self._flat_bars(300)
+        for idx in (40, 103, 166, 229):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.04)
+        p = compute_earnings_profile("TEST", bars)
+        assert p.earnings_count == 4
+        assert p.earnings_frequency > 3.0   # ~4 per year
+
+    def test_positive_surprise_rate_on_all_positive_gaps(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        bars = self._flat_bars(300)
+        for idx in (40, 103, 166, 229):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=+0.05)
+        p = compute_earnings_profile("TEST", bars)
+        assert p.positive_surprise_rate == pytest.approx(1.0, abs=0.01)
+
+    def test_negative_surprise_rate_on_all_negative_gaps(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        bars = self._flat_bars(300)
+        for idx in (40, 103, 166, 229):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=-0.05)
+        p = compute_earnings_profile("TEST", bars)
+        assert p.positive_surprise_rate == pytest.approx(0.0, abs=0.01)
+
+    def test_acceleration_trend_positive_when_recent_larger(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        bars = self._flat_bars(600)
+        # Early events: small but above threshold; recent events: large
+        for idx in (40, 103):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.03, vol_multiplier=2.0)
+        for idx in (300, 363):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.08, vol_multiplier=3.0)
+        p = compute_earnings_profile("TEST", bars)
+        assert p.earnings_count == 4
+        assert p.acceleration_trend > 0.0
+
+    def test_acceleration_trend_negative_when_recent_smaller(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        bars = self._flat_bars(600)
+        for idx in (40, 103):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.08, vol_multiplier=3.0)
+        for idx in (300, 363):
+            # Use 0.03 — above detection threshold but smaller than early events
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.03, vol_multiplier=2.0)
+        p = compute_earnings_profile("TEST", bars)
+        assert p.acceleration_trend < 0.0
+
+    # ── earnings_acceleration_score ───────────────────────────────────────────
+
+    def test_score_zero_below_4_events(self):
+        from quantlab.signals.earnings import compute_earnings_profile, earnings_acceleration_score
+        bars = self._flat_bars(200)
+        bars = self._insert_earnings_event(bars, 60, gap_pct=0.05)
+        bars = self._insert_earnings_event(bars, 120, gap_pct=0.05)
+        p = compute_earnings_profile("TEST", bars)
+        assert p.earnings_count < 4
+        assert earnings_acceleration_score(p) == 0.0
+
+    def test_score_high_on_strong_profile(self):
+        from quantlab.signals.earnings import compute_earnings_profile, earnings_acceleration_score
+        bars = self._flat_bars(600)
+        for idx in (40, 103):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.04, vol_multiplier=2.0)
+        for idx in (300, 363):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.07, vol_multiplier=3.0)
+        p = compute_earnings_profile("TEST", bars)
+        score = earnings_acceleration_score(p)
+        assert 0.0 <= score <= 1.0
+        assert score > 0.3   # positive surprises + acceleration + magnitude
+
+    def test_score_in_range(self):
+        from quantlab.signals.earnings import compute_earnings_profile, earnings_acceleration_score
+        bars = self._flat_bars(300)
+        for idx in (40, 103, 166, 229):
+            bars = self._insert_earnings_event(bars, idx, gap_pct=0.06)
+        p = compute_earnings_profile("TEST", bars)
+        assert 0.0 <= earnings_acceleration_score(p) <= 1.0
+
+
+# ── earnings_acceleration wired into conviction scorer ────────────────────────
+
+class TestEarningsConvictionLayer:
+
+    def test_ea_above_threshold_boosts_conviction(self):
+        low  = score_conviction(ScanResult(
+            "AAPL", "2026-01-01", "breakout", True, 180.0, None, 5,
+            regime_bullish=False, earnings_acceleration=0.4,
+        ))
+        high = score_conviction(ScanResult(
+            "AAPL", "2026-01-01", "breakout", True, 180.0, None, 5,
+            regime_bullish=False, earnings_acceleration=0.6,
+        ))
+        assert high - low == pytest.approx(0.10, abs=1e-9)
+
+    def test_ea_below_threshold_no_boost(self):
+        r = ScanResult(
+            "AAPL", "2026-01-01", "breakout", True, 180.0, None, 5,
+            regime_bullish=False, earnings_acceleration=0.49,
+        )
+        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+
+    def test_ea_threshold_is_0_5(self):
+        at    = score_conviction(ScanResult(
+            "AAPL", "2026-01-01", "breakout", True, 180.0, None, 5,
+            regime_bullish=False, earnings_acceleration=0.50,
+        ))
+        below = score_conviction(ScanResult(
+            "AAPL", "2026-01-01", "breakout", True, 180.0, None, 5,
+            regime_bullish=False, earnings_acceleration=0.49,
+        ))
+        assert at - below == pytest.approx(0.10, abs=1e-9)
+
+    def test_scan_result_ea_defaults_zero(self):
+        r = ScanResult(
+            "AAPL", "2026-01-01", "breakout", True, 180.0, None, 5,
+        )
+        assert r.earnings_acceleration == 0.0
+
+    def test_scan_symbol_populates_ea_field(self):
+        bars = make_bars(250, trend=0.001)
+        result = scan_symbol("AAPL", bars, signal_type="breakout", lookback=5)
+        assert result is not None
+        assert isinstance(result.earnings_acceleration, float)
+        assert 0.0 <= result.earnings_acceleration <= 1.0
