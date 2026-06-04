@@ -2749,3 +2749,148 @@ class TestNYSEHolidayCalendar:
         )
         assert callable(is_market_open)
         assert isinstance(US_MARKET_HOLIDAYS, frozenset)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# watchlist_status.py — formatting helpers (pure functions, fully offline)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWatchlistStatusFormatters:
+    """Tests for the pure formatting helpers in watchlist_status.py."""
+
+    def _import(self):
+        import sys, importlib
+        from pathlib import Path
+        scripts = Path(__file__).parent.parent / "scripts"
+        if str(scripts) not in sys.path:
+            sys.path.insert(0, str(scripts))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "watchlist_status", scripts / "watchlist_status.py"
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    # ── fmt_pct ───────────────────────────────────────────────────────────────
+
+    def test_fmt_pct_positive(self):
+        ws = self._import()
+        assert ws.fmt_pct(0.05) == "+5.00%"
+
+    def test_fmt_pct_negative(self):
+        ws = self._import()
+        assert ws.fmt_pct(-0.02) == "-2.00%"
+
+    def test_fmt_pct_none(self):
+        ws = self._import()
+        assert ws.fmt_pct(None) == "    --"
+
+    def test_fmt_pct_zero(self):
+        ws = self._import()
+        assert ws.fmt_pct(0.0) == "+0.00%"
+
+    # ── fmt_return ────────────────────────────────────────────────────────────
+
+    def test_fmt_return_positive_has_checkmark(self):
+        ws = self._import()
+        result = ws.fmt_return(0.05)
+        assert "✓" in result
+        assert "+5.00%" in result
+
+    def test_fmt_return_negative_no_checkmark(self):
+        ws = self._import()
+        result = ws.fmt_return(-0.02)
+        assert "✓" not in result
+        assert "-2.00%" in result
+
+    def test_fmt_return_none(self):
+        ws = self._import()
+        assert ws.fmt_return(None) == "      --"
+
+    # ── stop_distance ─────────────────────────────────────────────────────────
+
+    def test_stop_distance_above_stop(self):
+        ws = self._import()
+        dist = ws.stop_distance(100.0, 95.0)
+        assert dist == pytest.approx(5.0, abs=0.01)   # 5% above stop
+
+    def test_stop_distance_below_stop(self):
+        ws = self._import()
+        dist = ws.stop_distance(90.0, 95.0)
+        assert dist == pytest.approx(-5.56, abs=0.1)  # below stop
+
+    def test_stop_distance_none_when_no_current(self):
+        ws = self._import()
+        assert ws.stop_distance(None, 95.0) is None
+
+    def test_stop_distance_none_when_no_stop(self):
+        ws = self._import()
+        assert ws.stop_distance(100.0, None) is None
+
+    def test_stop_distance_none_when_stop_zero(self):
+        ws = self._import()
+        assert ws.stop_distance(100.0, 0.0) is None
+
+    # ── near_stop ─────────────────────────────────────────────────────────────
+
+    def test_near_stop_true_when_close(self):
+        ws = self._import()
+        assert ws.near_stop(96.5, 95.0, threshold_pct=2.0) is True   # ~1.55%
+
+    def test_near_stop_false_when_far(self):
+        ws = self._import()
+        assert ws.near_stop(100.0, 95.0, threshold_pct=2.0) is False  # 5%
+
+    def test_near_stop_false_on_none_price(self):
+        ws = self._import()
+        assert ws.near_stop(None, 95.0) is False
+
+    # ── fmt_layers ────────────────────────────────────────────────────────────
+
+    def test_fmt_layers_abbreviates_multi_lb(self):
+        ws = self._import()
+        assert "MLB" in ws.fmt_layers("REGIME,EARN,MULTI_LB")
+
+    def test_fmt_layers_none_returns_dash(self):
+        ws = self._import()
+        assert ws.fmt_layers(None) == "—"
+
+    def test_fmt_layers_empty_returns_dash(self):
+        ws = self._import()
+        assert ws.fmt_layers("") == "—"
+
+    def test_fmt_layers_truncates_long_string(self):
+        ws = self._import()
+        long = "A" * 50
+        assert len(ws.fmt_layers(long)) <= 30
+
+    # ── prices_from_cache ─────────────────────────────────────────────────────
+
+    def test_prices_from_cache_returns_dict(self):
+        ws = self._import()
+        # AAPL has a parquet cache from our backtest runs
+        prices = ws._prices_from_cache(["AAPL", "____NOSYM____"])
+        assert isinstance(prices, dict)
+        assert "____NOSYM____" not in prices
+
+    def test_prices_from_cache_aapl_positive(self):
+        ws = self._import()
+        prices = ws._prices_from_cache(["AAPL"])
+        if "AAPL" in prices:
+            assert prices["AAPL"] > 0
+
+    # ── run_dashboard (offline smoke test) ────────────────────────────────────
+
+    def test_run_dashboard_offline_no_crash(self, capsys):
+        ws = self._import()
+        ws.run_dashboard(use_ibkr=False)   # uses cached prices only
+        out = capsys.readouterr().out
+        assert "Watchlist Dashboard" in out
+        assert "Active Watchlist" in out
+        assert "Running Statistics" in out
+
+    def test_main_importable(self):
+        ws = self._import()
+        assert callable(ws.main)
+        assert callable(ws.run_dashboard)

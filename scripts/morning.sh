@@ -140,50 +140,10 @@ else
 fi
 sep
 
-# ── Watchlist status ───────────────────────────────────────────────────────────
-python3 - <<'PYEOF'
-from datetime import date
-from quantlab.watchlist import get_active_watchlist, get_watchlist_summary, _trading_days_elapsed
-
-active  = get_active_watchlist()
-summary = get_watchlist_summary()
-by_status = summary.get("by_status", {})
-
-print(f"\n  Watchlist  "
-      f"watching={by_status.get('watching',0)}  "
-      f"stopped_out={by_status.get('stopped_out',0)}  "
-      f"expired={by_status.get('expired',0)}  "
-      f"total={summary.get('total',0)}")
-
-if active:
-    print(f"\n  {'symbol':<8}  {'added':>12}  {'entry':>8}  {'stop':>8}  "
-          f"{'conv':>5}  {'days':>5}  {'unreal':>8}")
-    print(f"  {'─'*68}")
-    for e in active:
-        da     = date.fromisoformat(str(e["date_added"]))
-        days   = _trading_days_elapsed(da)
-        unreal = e.get("unrealized_ret")
-        ur_str = f"{unreal*100:+.2f}%" if unreal is not None else "    --"
-        near   = (unreal is not None and e["atr_stop"] and e["current_price"]
-                  and e["current_price"] < (e["atr_stop"] or 0) * 1.02)
-        print(f"  {e['symbol']:<8}  {str(e['date_added']):>12}  "
-              f"{e['entry_price']:>8.2f}  {e['atr_stop'] or 0:>8.2f}  "
-              f"{e['conviction_score']:>5.2f}  {days:>5}  {ur_str:>8}"
-              + ("  ⚠ NEAR STOP" if near else ""))
-
-has_data = False
-for label, key in [("1D","ret_1d"), ("3D","ret_3d"), ("5D","ret_5d")]:
-    agg = summary.get(key, {})
-    avg, hit = agg.get("avg"), agg.get("hit_rate")
-    if avg is not None:
-        if not has_data:
-            print("\n  Cumulative realized returns:")
-            has_data = True
-        stars = "★" * (1 + int(hit >= 0.6) + int(hit >= 0.75))
-        print(f"    {label}  avg={avg*100:+.2f}%  hit={hit*100:.0f}%  {stars}")
-if not has_data:
-    print("\n  No realized returns yet — data accumulates after market close")
-PYEOF
+# ── Step 3: Watchlist dashboard ───────────────────────────────────────────────
+echo ""
+echo "── [$(et)] Step 3: Watchlist dashboard ──────────────────────"
+python scripts/watchlist_status.py --no-ibkr || true
 
 echo ""
 
