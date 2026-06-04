@@ -4,16 +4,116 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "quantlab"
-version = "0.1.0"
-description = "Quant research workspace for data pipelines, notebooks, and backtests."
+version = "0.2.0"
+description = "Institutional-grade quant research and trading system."
 readme = "README.md"
 requires-python = ">=3.11"
-authors = [
-  { name = "hadda" }
+authors = [{ name = "sthcapital" }]
+
+# ── Layer 1: Market data ──────────────────────────────────────────────────────
+# ib_insync: IBKR TWS connection — bars, news, options, quotes
+# requests:  HTTP provider (Alpha Vantage fallback)
+# aiohttp:   async HTTP for future streaming providers
+
+# ── Layer 2: News ────────────────────────────────────────────────────────────
+# html, re (stdlib) — headline cleaning already in use
+
+# ── Layer 3: Options ─────────────────────────────────────────────────────────
+# ib_insync covers IBKR options
+# thetadata-sdk added later for professional options history
+
+# ── Layer 4: Signal research and backtesting ─────────────────────────────────
+# numpy, pandas: core data structures
+# scipy, statsmodels: return distributions, significance tests, time-series
+# scikit-learn: regime detection (RandomForest), feature normalization
+
+# ── Layer 5: Storage and infrastructure ──────────────────────────────────────
+# duckdb: local analytical database — queries CSV and Parquet directly
+# pyarrow: Parquet read/write, columnar storage for bar data
+# sqlalchemy: ORM layer for trade records (optional, evaluate at Phase 3)
+
+# ── Layer 6: Risk and performance ────────────────────────────────────────────
+# scipy already covers statistical tests for performance metrics
+
+# ── Layer 7: Execution and scheduling ────────────────────────────────────────
+# pyzmq: ZeroMQ pub/sub bus — scanner publishes, execution subscribes
+# schedule: simple Python scheduler for daily pre/post-market runs
+
+# ── Dev tools ─────────────────────────────────────────────────────────────────
+# pytest, pytest-cov: test runner with coverage
+# ruff: linter + formatter (replaces black + flake8 in one tool)
+# mypy: static type checking
+# pydantic: schema validation for bar records, signals, trade objects
+
+# ── Visualization ─────────────────────────────────────────────────────────────
+# plotly: interactive charts for research notebooks
+# matplotlib: static equity curve exports to output/
+
+dependencies = [
+    # Layer 1 — Market data
+    "ib_insync>=0.9.86",
+    "requests>=2.31",
+    "aiohttp>=3.9",
+
+    # Layer 4 — Research core
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "scipy>=1.11",
+    "statsmodels>=0.14",
+    "scikit-learn>=1.4",
+
+    # Layer 5 — Storage
+    "duckdb>=0.10",
+    "pyarrow>=14.0",
+    "sqlalchemy>=2.0",
+
+    # Layer 7 — Execution infrastructure
+    "pyzmq>=25.1",
+    "schedule>=1.2",
+
+    # Validation
+    "pydantic>=2.5",
+
+    # Visualization
+    "plotly>=5.18",
+    "matplotlib>=3.8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.2",
+    "mypy>=1.8",
+    "jupyterlab>=4.0",
+    "ipykernel>=6.27",
 ]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# ── Ruff: linter + formatter ──────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ── mypy ──────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+
+# ── pytest ────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"

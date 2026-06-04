@@ -1,102 +1,148 @@
-\# quantlab
+# QuantLab
 
+Institutional-grade quant research and trading system built on Python 3.13 + IBKR TWS.
 
+---
 
-Quant research workspace for experiments, notebooks, backtests, and market data pipelines.
+## Architecture — 7 layers
 
+```
+quantlab.providers   Layer 1  Market data (IBKR, HTTP, mock)
+quantlab.news        Layer 2  Headline fetch, clean, classify, K:/C: scores
+quantlab.options     Layer 3  Option chain, quotes, Greeks, IV features
+quantlab.signals     Layer 4  SMA, breakout, regime, ATR stop
+quantlab.research    Layer 4  Backtest engine — Sharpe, Sortino, Calmar, MFE/MAE
+quantlab.storage     Layer 5  DuckDB + Parquet + CSV
+quantlab.risk        Layer 6  Transaction costs, metrics reporting
+quantlab.execution   Layer 7  Universe scanner, conviction scoring, ZMQ bus
+quantlab.utils               Logging, config, date helpers
+```
 
+---
 
-\## Setup
+## Project layout
 
+```
+quantlab-project/
+├── src/
+│   └── quantlab/
+│       ├── providers/          Layer 1: IBKR, HTTP, mock, factory
+│       ├── news/               Layer 2: fetch, clean, classify, score
+│       ├── options/            Layer 3: chain discovery, Greeks, IV (stub)
+│       ├── signals/            Layer 4: SMA, breakout, regime, ATR
+│       ├── research/           Layer 4: backtest engine, forward returns
+│       ├── storage/            Layer 5: DuckDB, Parquet, CSV
+│       ├── risk/               Layer 6: costs, Sharpe/Sortino/Calmar
+│       ├── execution/          Layer 7: scanner, conviction, ZMQ stub
+│       └── utils/              shared: logging, config, dates
+├── scripts/
+│   ├── scan_universe.py        Daily scanner — the top-level entry point
+│   ├── run_backtest.py         Full backtest with all metrics
+│   ├── run_backtest_with_news.py  News-conditioned event study
+│   ├── fetch_bars.py
+│   ├── fetch_ibkr_news.py
+│   ├── fetch_ibkr_option_chain.py
+│   ├── fetch_ibkr_option_quotes.py
+│   ├── tag_ibkr_news.py
+│   ├── test_ibkr_connection.py
+│   └── test_ibkr_history.py
+├── tests/
+│   └── test_quantlab.py        Full suite — all 7 layers, no IBKR needed
+├── notebooks/                  JupyterLab research notebooks
+├── data/
+│   ├── raw/                    Untouched source files (gitignored)
+│   ├── processed/              Cleaned Parquet bar files (gitignored)
+│   └── external/               Third-party datasets (gitignored)
+├── output/                     Backtest results, trade CSVs, charts (gitignored)
+├── quantlab.duckdb             Local research DB (gitignored)
+├── pyproject.toml              All dependencies declared
+├── WSL2_SETUP.sh               Step-by-step WSL2 setup guide
+└── .gitignore
+```
 
+---
 
-Create and activate the conda environment:
+## Setup (Windows + WSL2)
 
+**Recommended path: develop in WSL2, connect to IBKR TWS on Windows.**
 
+```bash
+# 1. Install WSL2 (PowerShell as Administrator)
+wsl --install -d Ubuntu-22.04
 
-```powershell
+# 2. Inside WSL2 — install Miniconda
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
+bash ~/miniconda.sh -b -p ~/miniconda3 && source ~/.bashrc
 
+# 3. Clone and install
+mkdir -p ~/projects && cd ~/projects
+git clone https://github.com/sthcapital/quantlab-project.git
+cd quantlab-project
+conda create -n quantlab python=3.13 -y
+conda activate quantlab
+pip install -e ".[dev]"
+
+# 4. Verify
+pytest -q
+```
+
+See `WSL2_SETUP.sh` for the complete step-by-step guide including IBKR TWS
+connection from WSL2 and cron scheduling.
+
+---
+
+## Quick start
+
+```bash
 conda activate quantlab
 
+# Scan the market (price-only, no IBKR needed for mock testing)
+python scripts/scan_universe.py --provider mock --universe small --signal breakout
+
+# Full backtest with all metrics
+python scripts/run_backtest.py --provider mock --symbol AAPL \
+    --start 2025-01-01 --end 2026-06-03 \
+    --signal breakout --lookback 20 --save-db
+
+# With live IBKR (find WSL2→Windows IP first: cat /etc/resolv.conf)
+WINDOWS_HOST=172.20.0.1
+python scripts/scan_universe.py \
+    --universe small --signal breakout --host $WINDOWS_HOST
+
+python scripts/run_backtest.py --provider ibkr --symbol AAPL \
+    --start 2025-01-01 --end 2026-06-03 \
+    --signal breakout --lookback 20 \
+    --host $WINDOWS_HOST --save-db --save-parquet
 ```
 
+---
 
+## Data sources
 
-Install the package stack if needed:
+| Source | Status | Purpose |
+|--------|--------|---------|
+| IBKR TWS (ib_insync) | Active | Daily bars, news, option chains |
+| Alpha Vantage | Fallback | HTTP bars when TWS offline |
+| Mock provider | Testing | Deterministic synthetic bars |
+| Theta Data | Phase 4+ | Professional historical options |
 
+---
 
+## Performance metrics computed
 
-```powershell
+Total return · Annualised return · Max drawdown · Calmar · Sharpe · Sortino ·
+Win rate · Avg win · Avg loss · Win/loss ratio · Profit factor · Expectancy ·
+Avg trade return · Exposure % · MFE · MAE · ATR stop
 
-pip install numpy pandas scipy statsmodels scikit-learn pyarrow polars duckdb jupyterlab plotly sqlalchemy pydantic
+All results flag `*** BELOW MIN SAMPLE ***` when trade count < 30.
 
-```
+---
 
+## Build sequence
 
-
-\## Project structure
-
-
-
-```text
-
-quantlab-project/
-
-|- src/
-
-|  \\- quantlab/
-
-|- tests/
-
-|- data/
-
-|  |- raw/
-
-|  |- processed/
-
-|  \\- external/
-
-|- notebooks/
-
-|- scripts/
-
-|- output/
-
-|- README.md
-
-|- pyproject.toml
-
-\\- .gitignore
-
-```
-
-
-
-\## Quick check
-
-
-
-Run the environment validation script:
-
-
-
-```powershell
-
-python verify\_env.py
-
-```
-
-
-
-\## Notes
-
-
-
-\- `data/raw/` is for untouched source data.
-
-\- `data/processed/` is for cleaned or transformed datasets.
-
-\- `output/` is for generated results, charts, and exports.
-
-\- Keep reusable Python code in `src/quantlab/`.
-
+| Phase | Focus |
+|-------|-------|
+| 3 (now) | Scanner, full metrics, transaction costs, DuckDB, Parquet |
+| 4 | Walk-forward validation, regime filter, ATR stops, parameter sweep |
+| 5 | Paper trading, position sizing, ZMQ bus, Theta Data |
+| 6+ | Live execution, risk kill switches, full IV surface |

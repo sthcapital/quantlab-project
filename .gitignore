@@ -1,13 +1,67 @@
+# ── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
 .venv/
+.venv313/
+venv/
+env/
+.conda/
+
+# ── Environment and secrets ───────────────────────────────────────────────────
 .env
-.ipynb_checkpoints/
-output/
+.env.*
+secrets.toml
+config/local.toml
+*.key
+
+# ── Data — never commit raw or processed market data ─────────────────────────
 data/raw/
 data/processed/
 data/external/
-*.egg-info/
-build/
-dist/
+*.parquet
+*.feather
+*.arrow
+
+# ── Output — generated results, charts, exports ───────────────────────────────
+output/
+*.csv
+!tests/fixtures/*.csv
+
+# ── DuckDB — local research database ─────────────────────────────────────────
+*.duckdb
+*.duckdb.wal
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.iml
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Testing and coverage ──────────────────────────────────────────────────────
 .pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# ── IBKR logs ─────────────────────────────────────────────────────────────────
+*.log
+twslaunch.log

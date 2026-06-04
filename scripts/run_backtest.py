@@ -1,126 +1,148 @@
+"""
+scripts/run_backtest.py — Full backtest with all metrics and DuckDB storage.
+
+Migrated from the flat script to call quantlab modules.
+Adds: Sharpe, Sortino, Calmar, profit factor, expectancy, transaction costs,
+      min-sample enforcement, DuckDB persistence, Parquet bar storage.
+
+Usage:
+    python scripts/run_backtest.py --provider ibkr --symbol AAPL \
+        --start 2025-01-01 --end 2026-06-03 --signal breakout --lookback 20
+"""
+
 from argparse import ArgumentParser
-from datetime import datetime
 
 from quantlab.providers import create_market_data_provider
-
-
-def parse_date(value: str):
-    return datetime.strptime(value, "%Y-%m-%d").date()
-
-
-def max_drawdown(equity_curve: list[float]) -> float:
-    peak = equity_curve[0]
-    max_dd = 0.0
-
-    for equity in equity_curve:
-        if equity > peak:
-            peak = equity
-        drawdown = (equity / peak) - 1.0
-        if drawdown < max_dd:
-            max_dd = drawdown
-
-    return max_dd
+from quantlab.signals import breakout_signal, sma_signal, atr_stop_price
+from quantlab.research import forward_returns, TradeRecord, compute_metrics, MIN_TRADES
+from quantlab.risk import (
+    apply_transaction_cost, print_metrics, print_grouped_summaries, fmt_pct,
+)
+from quantlab.storage import export_trades_csv, save_bars_parquet, append_trades_to_db, ensure_dirs
+from quantlab.utils import setup_logging, parse_date, make_run_id, get_config
 
 
 def main() -> None:
-    parser = ArgumentParser(description="Run a simple daily-bar backtest.")
+    setup_logging()
+    ensure_dirs()
+    cfg = get_config("backtest")
+
+    parser = ArgumentParser(description="Run a full backtest with institutional metrics.")
     parser.add_argument("--provider", required=True)
     parser.add_argument("--symbol", required=True)
     parser.add_argument("--start", required=True, type=parse_date)
     parser.add_argument("--end", required=True, type=parse_date)
-    parser.add_argument("--lookback", type=int, default=5)
-    parser.add_argument("--initial-capital", type=float, default=10000.0)
+    parser.add_argument("--signal", choices=["sma", "breakout"], default="breakout")
+    parser.add_argument("--lookback", type=int, default=cfg["lookback"])
+    parser.add_argument("--initial-capital", type=float, default=cfg["initial_capital"])
+    parser.add_argument("--cost-bps", type=float, default=cfg["cost_bps"])
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7497)
     parser.add_argument("--client-id", type=int, default=1)
-    parser.add_argument("--base-url", default="https://www.alphavantage.co")
-    parser.add_argument("--api-key", default=None)
-
+    parser.add_argument("--save-parquet", action="store_true", help="Save bars to Parquet")
+    parser.add_argument("--save-db", action="store_true", help="Append trades to DuckDB")
     args = parser.parse_args()
 
+    # ── Fetch bars ────────────────────────────────────────────────────────────
     provider_kwargs = {}
     if args.provider.lower() == "ibkr":
-        provider_kwargs = {
-            "host": args.host,
-            "port": args.port,
-            "client_id": args.client_id,
-        }
+        provider_kwargs = {"host": args.host, "port": args.port, "client_id": args.client_id}
     else:
-        provider_kwargs = {
-            "base_url": args.base_url,
-            "api_key": args.api_key,
-        }
+        provider_kwargs = {}
 
     provider = create_market_data_provider(args.provider, **provider_kwargs)
-    bars = provider.get_daily_bars(
-        symbol=args.symbol,
-        start_date=args.start,
-        end_date=args.end,
-    )
+    bars = list(provider.get_daily_bars(args.symbol, args.start, args.end))
 
     if len(bars) <= args.lookback:
-        raise SystemExit(
-            f"Need more than {args.lookback} bars, received {len(bars)}."
-        )
+        raise SystemExit(f"Need more than {args.lookback} bars, received {len(bars)}.")
 
-    dates = [bar.as_of for bar in bars]
-    closes = [bar.close for bar in bars]
+    if args.save_parquet:
+        p = save_bars_parquet(args.symbol, bars)
+        print(f"bars saved → {p}")
 
-    sma_values: list[float | None] = []
-    for i in range(len(closes)):
-        if i + 1 < args.lookback:
-            sma_values.append(None)
-        else:
-            sma = sum(closes[i - args.lookback + 1:i + 1]) / args.lookback
-            sma_values.append(sma)
+    print(f"\nsymbol={args.symbol}  bars={len(bars)}  signal={args.signal}  lookback={args.lookback}")
 
-    raw_signals: list[int] = []
-    for close, sma in zip(closes, sma_values):
-        if sma is None:
-            raw_signals.append(0)
-        else:
-            raw_signals.append(1 if close > sma else 0)
-
+    # ── Generate signals and simulate ─────────────────────────────────────────
+    trade_records: list[TradeRecord] = []
     positions = [0]
-    for i in range(1, len(raw_signals)):
-        positions.append(raw_signals[i - 1])
-
-    daily_returns = [0.0]
-    strategy_returns = [0.0]
     equity_curve = [args.initial_capital]
+    strategy_returns = [0.0]
 
-    for i in range(1, len(closes)):
-        daily_return = (closes[i] / closes[i - 1]) - 1.0
-        strategy_return = positions[i] * daily_return
-        next_equity = equity_curve[-1] * (1.0 + strategy_return)
+    for i in range(1, len(bars)):
+        bar_slice = bars[: i + 1]
 
-        daily_returns.append(daily_return)
-        strategy_returns.append(strategy_return)
+        if args.signal == "breakout":
+            result = breakout_signal(bar_slice, args.symbol, args.lookback)
+        else:
+            result = sma_signal(bar_slice, args.symbol, args.lookback)
+
+        sig = result.signal if result else False
+
+        # Next-bar execution — position today = yesterday's signal
+        pos = positions[-1]
+        positions.append(1 if sig else 0)
+
+        daily_ret = (bars[i].close / bars[i - 1].close) - 1.0
+        strat_ret = pos * daily_ret
+        next_equity = equity_curve[-1] * (1.0 + strat_ret)
         equity_curve.append(next_equity)
+        strategy_returns.append(strat_ret)
 
-    total_return = (equity_curve[-1] / args.initial_capital) - 1.0
-    max_dd = max_drawdown(equity_curve)
+        # Record trade transitions
+        if positions[-2] == 0 and positions[-1] == 1:
+            # Entry
+            fwd = forward_returns(bars, i, bars[i].close)
+            stop = atr_stop_price(bars[: i + 1], bars[i].close)
+            net_ret = apply_transaction_cost(fwd.get("ret_5d") or 0.0, args.cost_bps)
+            trade_records.append(
+                TradeRecord(
+                    symbol=args.symbol,
+                    signal_date=bars[i].as_of.isoformat(),
+                    entry_date=bars[i].as_of.isoformat(),
+                    entry_price=bars[i].close,
+                    exit_date=None,
+                    exit_price=None,
+                    trade_return=None,  # filled on exit
+                    ret_1d=fwd.get("ret_1d"),
+                    ret_3d=fwd.get("ret_3d"),
+                    ret_5d=fwd.get("ret_5d"),
+                    mfe_5d=fwd.get("mfe_5d"),
+                    mae_5d=fwd.get("mae_5d"),
+                    atr_stop=stop,
+                    cost_bps=args.cost_bps,
+                )
+            )
+        elif positions[-2] == 1 and positions[-1] == 0 and trade_records:
+            # Exit — fill the open trade
+            last = trade_records[-1]
+            raw_ret = (bars[i].close / last.entry_price) - 1.0
+            trade_records[-1].exit_date = bars[i].as_of.isoformat()
+            trade_records[-1].exit_price = bars[i].close
+            trade_records[-1].trade_return = apply_transaction_cost(raw_ret, args.cost_bps)
 
-    print(f"provider={args.provider}")
-    print(f"symbol={args.symbol}")
-    print(f"bars={len(bars)}")
-    print(f"lookback={args.lookback}")
-    print(f"start={dates[0]}")
-    print(f"end={dates[-1]}")
-    print(f"final_position={positions[-1]}")
-    print(f"initial_capital={args.initial_capital:.2f}")
-    print(f"ending_equity={equity_curve[-1]:.2f}")
-    print(f"total_return={total_return:.4%}")
-    print(f"max_drawdown={max_dd:.4%}")
+    # ── Compute and print full metrics ────────────────────────────────────────
+    metrics = compute_metrics(
+        symbol=args.symbol,
+        signal_type=args.signal,
+        lookback=args.lookback,
+        bars=bars,
+        trades=trade_records,
+        equity_curve=equity_curve,
+        strategy_returns=strategy_returns,
+        positions=positions,
+    )
 
-    print("last_rows=")
-    for i in range(max(0, len(dates) - 5), len(dates)):
-        sma_text = "None" if sma_values[i] is None else f"{sma_values[i]:.2f}"
-        print(
-            f"{dates[i]} close={closes[i]:.2f} sma={sma_text} "
-            f"signal={raw_signals[i]} position={positions[i]} "
-            f"equity={equity_curve[i]:.2f}"
-        )
+    print_metrics(metrics)
+    print_grouped_summaries(trade_records)
+
+    # ── Export ────────────────────────────────────────────────────────────────
+    run_id = make_run_id(args.symbol, args.signal)
+    csv_path = export_trades_csv(args.symbol, args.signal, trade_records, run_tag=run_id)
+    print(f"\ncsv → {csv_path}")
+
+    if args.save_db:
+        append_trades_to_db(run_id, args.signal, args.lookback, trade_records)
+        print(f"db  → appended {len(trade_records)} trades (run_id={run_id})")
 
 
 if __name__ == "__main__":
