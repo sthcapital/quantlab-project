@@ -98,6 +98,11 @@ class ScanResult:
     # Earnings acceleration layer (detected from price/volume anomalies)
     earnings_acceleration: float = 0.0  # earnings_acceleration_score() ≥ 0.5 → +0.10
 
+    # Institutional volume signature layers
+    accumulation_ratio: float = 0.0    # accumulation_days_ratio()  ≥ 0.6 → +0.08
+    volume_trend: float = 0.0          # volume_trend_score()       (informational)
+    climactic_volume: float = 0.0      # climactic_volume_score()   ≥ 0.7 → +0.07
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -124,6 +129,8 @@ def score_conviction(result: ScanResult) -> float:
         Wyckoff vol character ≥ 0.6     : 0.10
         Wyckoff spring detected         : 0.10
         Earnings acceleration ≥ 0.5     : 0.10
+        Accumulation days ratio ≥ 0.6   : 0.08
+        Climactic volume ≥ 0.7          : 0.07
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -162,6 +169,12 @@ def score_conviction(result: ScanResult) -> float:
     # Earnings acceleration (detected from price/volume anomalies in bar history)
     if result.earnings_acceleration >= 0.5:
         score += 0.10
+
+    # Institutional volume signature
+    if result.accumulation_ratio >= 0.6:
+        score += 0.08
+    if result.climactic_volume >= 0.7:
+        score += 0.07
 
     return max(0.0, min(score, 1.0))
 
@@ -329,6 +342,11 @@ def scan_symbol(
         compute_earnings_profile as _earn_profile,
         earnings_acceleration_score as _earn_score,
     )
+    from quantlab.signals.volume_profile import (
+        accumulation_days_ratio as _accum_ratio,
+        volume_trend_score as _vol_trend,
+        climactic_volume_score as _climax,
+    )
 
     if len(bars) <= lookback:
         logger.debug(f"{symbol}: not enough bars ({len(bars)} <= {lookback})")
@@ -368,6 +386,11 @@ def scan_symbol(
     earn_profile = _earn_profile(symbol, bars)
     ea           = _earn_score(earn_profile)
 
+    # Institutional volume signature
+    accum_ratio = _accum_ratio(bars)
+    vol_trend   = _vol_trend(bars)
+    climax      = _climax(bars)
+
     # News features
     n_count = 0
     n_cat = "none"
@@ -399,6 +422,9 @@ def scan_symbol(
         volume_character=vc,
         wyckoff_spring=spring,
         earnings_acceleration=ea,
+        accumulation_ratio=accum_ratio,
+        volume_trend=vol_trend,
+        climactic_volume=climax,
     )
 
     result.conviction_score = score_conviction(result)

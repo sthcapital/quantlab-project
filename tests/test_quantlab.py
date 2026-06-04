@@ -1775,3 +1775,174 @@ class TestEarningsConvictionLayer:
         assert result is not None
         assert isinstance(result.earnings_acceleration, float)
         assert 0.0 <= result.earnings_acceleration <= 1.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Volume profile signals (quantlab.signals.volume_profile)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestVolumeProfile:
+    """Synthetic bar fixtures with directional movement and volume variation."""
+
+    @staticmethod
+    def _make_directional_bars(n: int, up_vol: float, down_vol: float,
+                                base_price: float = 100.0) -> list[Bar]:
+        """Alternating up/down bars with distinct up/down volumes."""
+        from datetime import timedelta
+        bars = []
+        price = base_price
+        start = date(2025, 1, 6)
+        for i in range(n):
+            is_up = (i % 2 == 0)
+            price *= (1.003 if is_up else 0.998)
+            vol = up_vol if is_up else down_vol
+            bars.append(Bar(
+                as_of=start + timedelta(days=i),
+                open=price * (0.999 if is_up else 1.001),
+                high=price * 1.004,
+                low=price  * 0.996,
+                close=price,
+                volume=vol,
+            ))
+        return bars
+
+    # ── accumulation_days_ratio ───────────────────────────────────────────────
+
+    def test_accumulation_ratio_high_on_buying_pattern(self):
+        from quantlab.signals.volume_profile import accumulation_days_ratio
+        # Up days 3× average volume, down days 0.3× — classic accumulation
+        bars = self._make_directional_bars(80, up_vol=3_000_000., down_vol=300_000.)
+        score = accumulation_days_ratio(bars, window=60, vol_period=20)
+        assert score > 0.6
+
+    def test_accumulation_ratio_low_on_distribution_pattern(self):
+        from quantlab.signals.volume_profile import accumulation_days_ratio
+        # Down days 3× average, up days 0.3× — distribution fingerprint
+        bars = self._make_directional_bars(80, up_vol=300_000., down_vol=3_000_000.)
+        score = accumulation_days_ratio(bars, window=60, vol_period=20)
+        assert score < 0.4
+
+    def test_accumulation_ratio_neutral_when_no_heavy_days(self):
+        from quantlab.signals.volume_profile import accumulation_days_ratio
+        # All bars at same volume — no above-average days → neutral 0.5
+        bars = self._make_directional_bars(80, up_vol=1_000_000., down_vol=1_000_000.)
+        score = accumulation_days_ratio(bars, window=60, vol_period=20)
+        assert score == 0.5
+
+    def test_accumulation_ratio_returns_float_in_range(self):
+        from quantlab.signals.volume_profile import accumulation_days_ratio
+        bars = self._make_directional_bars(80, up_vol=2_000_000., down_vol=500_000.)
+        score = accumulation_days_ratio(bars)
+        assert 0.0 <= score <= 1.0
+
+    def test_accumulation_ratio_neutral_on_too_few_bars(self):
+        from quantlab.signals.volume_profile import accumulation_days_ratio
+        bars = self._make_directional_bars(10, 2_000_000., 500_000.)
+        assert accumulation_days_ratio(bars) == 0.5
+
+    # ── volume_trend_score ────────────────────────────────────────────────────
+
+    def test_volume_trend_high_on_ideal_accumulation(self):
+        from quantlab.signals.volume_profile import volume_trend_score
+        # Up days heavy, down days light — both conditions fire every bar
+        bars = self._make_directional_bars(60, up_vol=3_000_000., down_vol=300_000.)
+        score = volume_trend_score(bars, window=20)
+        assert score > 0.6
+
+    def test_volume_trend_low_on_distribution_pattern(self):
+        from quantlab.signals.volume_profile import volume_trend_score
+        # Up days light, down days heavy — neither ideal condition fires
+        bars = self._make_directional_bars(60, up_vol=300_000., down_vol=3_000_000.)
+        score = volume_trend_score(bars, window=20)
+        assert score < 0.4
+
+    def test_volume_trend_in_range(self):
+        from quantlab.signals.volume_profile import volume_trend_score
+        bars = self._make_directional_bars(60, up_vol=2_000_000., down_vol=800_000.)
+        assert 0.0 <= volume_trend_score(bars) <= 1.0
+
+    # ── climactic_volume_score ────────────────────────────────────────────────
+
+    def test_climactic_zero_when_last_bar_not_highest(self):
+        from quantlab.signals.volume_profile import climactic_volume_score
+        from datetime import timedelta
+        bars = [Bar(date(2025,1,6)+timedelta(days=i), 100,101,99,100, 1_000_000.)
+                for i in range(30)]
+        # Last bar has the same volume as all others
+        assert climactic_volume_score(bars, lookback=20) == 0.0
+
+    def test_climactic_high_when_last_bar_is_spike(self):
+        from quantlab.signals.volume_profile import climactic_volume_score
+        from datetime import timedelta
+        bars = [Bar(date(2025,1,6)+timedelta(days=i), 100,101,99,100, 1_000_000.)
+                for i in range(30)]
+        # Replace last bar: 4× prior max (prior max = 1M, last = 4M)
+        bars[-1] = Bar(bars[-1].as_of, 100,103,99,102, 4_000_000.)
+        score = climactic_volume_score(bars, lookback=20)
+        # ratio = 4.0, score = min(1.0, (4.0-1.0)/1.5) = 1.0
+        assert score == pytest.approx(1.0, abs=1e-9)
+
+    def test_climactic_graduated_scoring(self):
+        from quantlab.signals.volume_profile import climactic_volume_score
+        from datetime import timedelta
+        bars = [Bar(date(2025,1,6)+timedelta(days=i), 100,101,99,100, 1_000_000.)
+                for i in range(30)]
+        # 2.5× prior max → score = (2.5-1)/1.5 = 1.0
+        bars[-1] = Bar(bars[-1].as_of, 100,103,99,102, 2_500_000.)
+        assert climactic_volume_score(bars) == pytest.approx(1.0, abs=1e-4)
+        # 1.75× prior max → score = (1.75-1)/1.5 = 0.5
+        bars[-1] = Bar(bars[-1].as_of, 100,103,99,102, 1_750_000.)
+        assert climactic_volume_score(bars) == pytest.approx(0.5, abs=1e-4)
+
+    def test_climactic_zero_on_too_few_bars(self):
+        from quantlab.signals.volume_profile import climactic_volume_score
+        from datetime import timedelta
+        bars = [Bar(date(2025,1,6)+timedelta(days=i),100,101,99,100,1_000_000.)
+                for i in range(5)]
+        assert climactic_volume_score(bars) == 0.0
+
+
+# ── volume profile wired into conviction scorer ────────────────────────────────
+
+class TestVolumeProfileConviction:
+
+    def _r(self, **kw) -> ScanResult:
+        defaults = dict(symbol="UNH", scan_date="2026-06-04",
+                        signal_type="breakout", signal=True,
+                        entry_close=399.0, indicator_value=None, lookback=5,
+                        regime_bullish=False)
+        defaults.update(kw)
+        return ScanResult(**defaults)
+
+    def test_accumulation_ratio_boost_fires(self):
+        low  = score_conviction(self._r(accumulation_ratio=0.59))
+        high = score_conviction(self._r(accumulation_ratio=0.61))
+        assert high - low == pytest.approx(0.08, abs=1e-9)
+
+    def test_climactic_volume_boost_fires(self):
+        low  = score_conviction(self._r(climactic_volume=0.69))
+        high = score_conviction(self._r(climactic_volume=0.71))
+        assert high - low == pytest.approx(0.07, abs=1e-9)
+
+    def test_both_layers_stack(self):
+        none_ = score_conviction(self._r(accumulation_ratio=0.0, climactic_volume=0.0))
+        both  = score_conviction(self._r(accumulation_ratio=0.7, climactic_volume=0.8))
+        assert both - none_ == pytest.approx(0.15, abs=1e-9)
+
+    def test_volume_trend_not_wired_to_conviction(self):
+        # volume_trend is informational only — changing it must not affect score
+        low  = score_conviction(self._r(volume_trend=0.0))
+        high = score_conviction(self._r(volume_trend=1.0))
+        assert low == high
+
+    def test_full_signal_with_all_vol_layers(self):
+        r = self._r(regime_bullish=True, earnings_acceleration=0.85,
+                    accumulation_ratio=0.70, climactic_volume=0.80)
+        # 0.30 + 0.20 + 0.10 + 0.08 + 0.07 = 0.75
+        assert score_conviction(r) == pytest.approx(0.75, abs=1e-9)
+
+    def test_scan_result_vol_fields_default_zero(self):
+        r = ScanResult("UNH","2026-06-04","breakout",True,399.0,None,5)
+        assert r.accumulation_ratio == 0.0
+        assert r.volume_trend       == 0.0
+        assert r.climactic_volume   == 0.0

@@ -115,6 +115,11 @@ def main() -> None:
         rv_str   = f"  rel_vol={r.rel_volume:.2f}x" if r.rel_volume else ""
         ea_str   = f"  ea={r.earnings_acceleration:.2f}" \
                    if r.earnings_acceleration > 0 else "  ea=0.00"
+        vol_str  = (
+            f"  ar={r.accumulation_ratio:.2f}"
+            f"  vt={r.volume_trend:.2f}"
+            f"  cv={r.climactic_volume:.2f}"
+        )
         print(
             f"  {i:2d}. {r.symbol:<8} "
             f"conviction={r.conviction_score:.2f}  "
@@ -122,7 +127,7 @@ def main() -> None:
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
-            f"{ea_str}{rv_str}{stop_str}"
+            f"{ea_str}{vol_str}{rv_str}{stop_str}"
         )
 
     print(f"\n{'='*60}\n")
