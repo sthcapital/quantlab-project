@@ -989,3 +989,203 @@ class TestTagTradesWithNews:
         # second call with empty news — trade already tagged, won't be touched
         tag_trades_with_news([trade], [])
         assert trade.news_category == "downgrade"  # unchanged
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Execution improvements: category-weighted news, edge score, LOW_EDGE_SYMBOLS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCategoryWeightedConviction:
+    """Verify the updated score_conviction() uses NEWS_CATEGORY_WEIGHTS."""
+
+    def _result(self, news_category: str = "none", news_count: int = 0,
+                regime: bool = True, rel_vol: float | None = None,
+                c_score: float | None = None) -> ScanResult:
+        return ScanResult(
+            symbol="AAPL", scan_date="2026-01-10",
+            signal_type="breakout", signal=True,
+            entry_close=180.0, indicator_value=179.0, lookback=5,
+            regime_bullish=regime, news_count=news_count,
+            news_category=news_category, news_c_score=c_score,
+            rel_volume=rel_vol,
+        )
+
+    def test_no_signal_always_zero(self):
+        r = self._result()
+        r.signal = False
+        assert score_conviction(r) == 0.0
+
+    def test_earnings_gives_highest_news_weight(self):
+        from quantlab.execution import score_conviction, NEWS_CATEGORY_WEIGHTS
+        earnings = score_conviction(self._result("earnings", news_count=1))
+        upgrade  = score_conviction(self._result("upgrade",  news_count=1))
+        analyst  = score_conviction(self._result("analyst_action", news_count=1))
+        assert earnings > upgrade > analyst
+
+    def test_downgrade_reduces_below_no_news(self):
+        from quantlab.execution import score_conviction
+        no_news  = score_conviction(self._result(news_count=0))
+        downgrade = score_conviction(self._result("downgrade", news_count=1))
+        assert downgrade < no_news
+
+    def test_other_category_no_lift(self):
+        from quantlab.execution import score_conviction
+        no_news = score_conviction(self._result(news_count=0))
+        other   = score_conviction(self._result("other", news_count=1))
+        assert other == no_news   # +0.00 weight, no change
+
+    def test_management_equals_earnings_weight(self):
+        from quantlab.execution import score_conviction, NEWS_CATEGORY_WEIGHTS
+        assert NEWS_CATEGORY_WEIGHTS["management"] == NEWS_CATEGORY_WEIGHTS["earnings"]
+        mgmt_score = score_conviction(self._result("management", news_count=1))
+        earn_score = score_conviction(self._result("earnings",   news_count=1))
+        assert mgmt_score == earn_score
+
+    def test_score_clamped_to_zero_on_downgrade_no_regime(self):
+        from quantlab.execution import score_conviction
+        # signal(0.30) + no_regime(0) + downgrade(-0.15) = 0.15 — still positive
+        r = self._result("downgrade", news_count=1, regime=False)
+        assert 0.0 < score_conviction(r) < 0.30
+
+    def test_score_never_exceeds_one(self):
+        from quantlab.execution import score_conviction
+        r = self._result("earnings", news_count=5, regime=True,
+                         rel_vol=2.0, c_score=0.9)
+        assert score_conviction(r) <= 1.0
+
+    def test_existing_layering_still_holds(self):
+        # Regression: s_signal_only < s_signal_regime < s_signal_regime_earnings
+        from quantlab.execution import score_conviction
+        s1 = score_conviction(self._result(regime=False, news_count=0))
+        s2 = score_conviction(self._result(regime=True,  news_count=0))
+        s3 = score_conviction(self._result("earnings", news_count=2,
+                                           regime=True, rel_vol=1.8, c_score=0.85))
+        assert s1 < s2 < s3
+
+
+class TestHistoricalEdgeScore:
+    """historical_edge_score() must be safe with and without a real DB."""
+
+    def test_returns_neutral_when_no_db(self, tmp_path):
+        from quantlab.execution import historical_edge_score
+        # Point at a non-existent DB path
+        score = historical_edge_score("AAPL", db_path=str(tmp_path / "missing.duckdb"))
+        assert score == 0.5
+
+    def test_returns_neutral_for_unknown_symbol(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "edge.duckdb")
+        from quantlab.execution import historical_edge_score
+        # DB exists but has no walk_forward_windows rows for this symbol
+        score = historical_edge_score("____NOSYM____",
+                                      db_path=str(tmp_path / "edge.duckdb"))
+        assert score == 0.5
+
+    def test_positive_oos_sharpe_scores_above_half(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "edge.duckdb")
+        # Seed the DB with a synthetic walk_forward_windows row
+        import duckdb
+        con = duckdb.connect(str(tmp_path / "edge.duckdb"))
+        con.execute("""
+            CREATE TABLE walk_forward_windows (
+                run_id VARCHAR, symbol VARCHAR, signal_type VARCHAR,
+                lookback INTEGER, window_index INTEGER,
+                is_start_bar INTEGER, is_end_bar INTEGER,
+                oos_start_bar INTEGER, oos_end_bar INTEGER,
+                is_sharpe DOUBLE, is_total_return DOUBLE, is_trade_count INTEGER,
+                is_sufficient BOOLEAN,
+                oos_sharpe DOUBLE, oos_total_return DOUBLE,
+                oos_trade_count INTEGER, oos_sufficient BOOLEAN,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute(
+            "INSERT INTO walk_forward_windows VALUES "
+            "('run_x','TEST_SYM','breakout',5,0,0,252,252,315,"
+            " 1.5, 0.05, 10, true, 4.0, 0.03, 8, true, CURRENT_TIMESTAMP)"
+        )
+        con.close()
+        from quantlab.execution import historical_edge_score
+        score = historical_edge_score("TEST_SYM", db_path=str(tmp_path / "edge.duckdb"))
+        assert score > 0.5   # avg_oos=4.0 → (4+10)/20 = 0.70
+
+    def test_negative_oos_sharpe_scores_below_half(self, tmp_path, monkeypatch):
+        import duckdb
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "edge2.duckdb")
+        con = duckdb.connect(str(tmp_path / "edge2.duckdb"))
+        con.execute("""
+            CREATE TABLE walk_forward_windows (
+                run_id VARCHAR, symbol VARCHAR, signal_type VARCHAR,
+                lookback INTEGER, window_index INTEGER,
+                is_start_bar INTEGER, is_end_bar INTEGER,
+                oos_start_bar INTEGER, oos_end_bar INTEGER,
+                is_sharpe DOUBLE, is_total_return DOUBLE, is_trade_count INTEGER,
+                is_sufficient BOOLEAN,
+                oos_sharpe DOUBLE, oos_total_return DOUBLE,
+                oos_trade_count INTEGER, oos_sufficient BOOLEAN,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.execute(
+            "INSERT INTO walk_forward_windows VALUES "
+            "('run_y','BAD_SYM','breakout',5,0,0,252,252,315,"
+            " -2.0, -0.05, 8, false, -5.0, -0.04, 6, false, CURRENT_TIMESTAMP)"
+        )
+        con.close()
+        from quantlab.execution import historical_edge_score
+        score = historical_edge_score("BAD_SYM", db_path=str(tmp_path / "edge2.duckdb"))
+        assert score < 0.5   # avg_oos=-5.0 → (-5+10)/20 = 0.25
+
+    def test_extreme_values_clamped(self, tmp_path, monkeypatch):
+        import duckdb
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "edge3.duckdb")
+        con = duckdb.connect(str(tmp_path / "edge3.duckdb"))
+        con.execute("""
+            CREATE TABLE walk_forward_windows (
+                run_id VARCHAR, symbol VARCHAR, signal_type VARCHAR,
+                lookback INTEGER, window_index INTEGER,
+                is_start_bar INTEGER, is_end_bar INTEGER,
+                oos_start_bar INTEGER, oos_end_bar INTEGER,
+                is_sharpe DOUBLE, is_total_return DOUBLE, is_trade_count INTEGER,
+                is_sufficient BOOLEAN,
+                oos_sharpe DOUBLE, oos_total_return DOUBLE,
+                oos_trade_count INTEGER, oos_sufficient BOOLEAN,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Insert extreme outlier (like CRM mock data: 271)
+        con.execute(
+            "INSERT INTO walk_forward_windows VALUES "
+            "('run_z','OUTLIER','breakout',5,0,0,252,252,315,"
+            " 5.0, 0.10, 15, true, 271.0, 0.08, 12, true, CURRENT_TIMESTAMP)"
+        )
+        con.close()
+        from quantlab.execution import historical_edge_score
+        score = historical_edge_score("OUTLIER", db_path=str(tmp_path / "edge3.duckdb"))
+        assert score == 1.0   # clamped to clip_hi
+
+
+class TestLowEdgeSymbols:
+
+    def test_user_named_symbols_present(self):
+        from quantlab.execution import LOW_EDGE_SYMBOLS
+        for sym in ("BAC", "PG", "NEE"):
+            assert sym in LOW_EDGE_SYMBOLS, f"{sym} should be in LOW_EDGE_SYMBOLS"
+
+    def test_strongly_negative_sharpe_symbols_present(self):
+        from quantlab.execution import LOW_EDGE_SYMBOLS
+        # All had full-period Sharpe < -1.5 in live IBKR run
+        for sym in ("AMGN", "AMZN", "NEE", "PEP", "CVX", "META"):
+            assert sym in LOW_EDGE_SYMBOLS
+
+    def test_top_performers_not_flagged(self):
+        from quantlab.execution import LOW_EDGE_SYMBOLS
+        for sym in ("AAPL", "CAT", "NVDA", "LLY", "CSCO"):
+            assert sym not in LOW_EDGE_SYMBOLS
+
+    def test_is_frozenset(self):
+        from quantlab.execution import LOW_EDGE_SYMBOLS
+        assert isinstance(LOW_EDGE_SYMBOLS, frozenset)

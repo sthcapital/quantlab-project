@@ -29,6 +29,40 @@ from quantlab.signals import (
 logger = logging.getLogger(__name__)
 
 
+# ── Low-edge symbol list ───────────────────────────────────────────────────────
+# Symbols that showed negative full-period Sharpe on real IBKR data
+# (2024-01-02 → 2025-12-31, breakout lookback=5).  Scanner warns when these
+# appear in results so the user can apply extra scrutiny before acting.
+LOW_EDGE_SYMBOLS: frozenset[str] = frozenset({
+    "BAC",   # explicitly flagged; also negative OOS across windows
+    "PG",    # Sharpe -4.27, avg OOS Sharpe -8.99 — worst in universe
+    "AMGN",  # Sharpe -2.85, avg OOS Sharpe -2.70
+    "NEE",   # Sharpe -2.70, avg OOS Sharpe -3.93
+    "AMZN",  # Sharpe -2.39, avg OOS Sharpe -2.49
+    "PEP",   # Sharpe -2.16, avg OOS Sharpe -2.44
+    "CVX",   # Sharpe -1.84, avg OOS Sharpe -4.34
+    "META",  # Sharpe -1.60, avg OOS Sharpe -1.61
+    "KO",    # avg OOS Sharpe -7.28 despite mild full-period Sharpe
+    "MCD",   # avg OOS Sharpe -3.87
+    "MA",    # avg OOS Sharpe -3.35
+})
+
+
+# ── News category weights ──────────────────────────────────────────────────────
+# Derived from DuckDB trade-level analysis (2024–2025 live IBKR run):
+#   earnings avg_ret=+0.32%  management=+0.55%  upgrade=+0.09%
+#   analyst_action=+0.04%   downgrade=-0.17%   other=-0.59%
+NEWS_CATEGORY_WEIGHTS: dict[str, float] = {
+    "earnings":       +0.20,   # strong positive catalyst
+    "management":     +0.20,   # strong positive catalyst
+    "upgrade":        +0.08,   # weak positive
+    "analyst_action": +0.05,   # marginal — don't over-weight generic notes
+    "downgrade":      -0.15,   # veto signal: reduces conviction
+    "other":          +0.00,   # noise: ignore
+    "none":           +0.00,
+}
+
+
 # ── Conviction scoring ─────────────────────────────────────────────────────────
 
 @dataclass
@@ -64,28 +98,33 @@ class ScanResult:
 
 def score_conviction(result: ScanResult) -> float:
     """
-    Score 0.0–1.0 based on how many confirmation layers align.
+    Score 0.0–1.0 based on confirmation layers with category-weighted news.
 
-    Scoring weights (total = 1.0):
-        Signal fired             : 0.30  (mandatory — 0 if no signal)
-        Regime bullish           : 0.20
-        Recent news present      : 0.15
-        News is earnings/upgrade : 0.15  (bonus for high-quality catalyst)
-        Rel volume > 1.5x        : 0.10
-        Strong news confidence   : 0.10  (IBKR C: score > 0.7)
+    Layer weights:
+        Signal fired          : 0.30  (mandatory — returns 0 if no signal)
+        Regime bullish        : 0.20
+        News (category-based) : see NEWS_CATEGORY_WEIGHTS
+                                  earnings/management → +0.20
+                                  upgrade             → +0.08
+                                  analyst_action      → +0.05
+                                  downgrade           → −0.15 (veto)
+                                  other               →  0.00
+        Rel volume ≥ 1.5×     : 0.10
+        Strong news c_score   : 0.10  (IBKR C: score ≥ 0.7)
+
+    Downgrade news can push the score below the signal-only level; the result
+    is clamped to [0.0, 1.0].
     """
     if not result.signal:
         return 0.0
 
-    score = 0.30  # signal fired
+    score = 0.30  # base: signal fired
 
     if result.regime_bullish:
         score += 0.20
 
     if result.news_count > 0:
-        score += 0.15
-        if result.news_category in {"upgrade", "earnings"}:
-            score += 0.15
+        score += NEWS_CATEGORY_WEIGHTS.get(result.news_category, 0.0)
 
     if result.rel_volume is not None and result.rel_volume >= 1.5:
         score += 0.10
@@ -93,7 +132,59 @@ def score_conviction(result: ScanResult) -> float:
     if result.news_c_score is not None and result.news_c_score >= 0.7:
         score += 0.10
 
-    return min(score, 1.0)
+    return max(0.0, min(score, 1.0))
+
+
+def historical_edge_score(
+    symbol: str,
+    db_path: str | None = None,
+    clip_lo: float = -10.0,
+    clip_hi: float = 10.0,
+) -> float:
+    """
+    Return a 0.0–1.0 score reflecting a symbol's proven out-of-sample edge.
+
+    Queries the walk_forward_windows DuckDB table for the symbol's average OOS
+    Sharpe ratio, clips to [clip_lo, clip_hi] to prevent mock-data outliers from
+    distorting the result, then normalises linearly:
+
+        score = (clipped_avg_oos - clip_lo) / (clip_hi - clip_lo)
+
+    Examples with default clip [-10, 10]:
+        avg OOS Sharpe  +4.0  →  score 0.70  (strong proven edge)
+        avg OOS Sharpe   0.0  →  score 0.50  (neutral / breakeven)
+        avg OOS Sharpe  -4.0  →  score 0.30  (penalised)
+        avg OOS Sharpe -72.0  →  score 0.00  (clipped to floor)
+
+    Returns 0.5 (neutral) when the DB is unavailable or the symbol has no data.
+
+    Args:
+        symbol:  Ticker symbol to look up.
+        db_path: Override DB path (defaults to quantlab.duckdb project location).
+        clip_lo: Lower clip bound for OOS Sharpe (default −10).
+        clip_hi: Upper clip bound for OOS Sharpe (default +10).
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        path = db_path or str(DB_PATH)
+        con = duckdb.connect(path)
+        row = con.execute(
+            "SELECT AVG(oos_sharpe) FROM walk_forward_windows "
+            "WHERE symbol = ? AND oos_sharpe IS NOT NULL",
+            [symbol],
+        ).fetchone()
+        con.close()
+
+        if row is None or row[0] is None:
+            return 0.5
+
+        avg_oos = float(row[0])
+        clipped = max(clip_lo, min(clip_hi, avg_oos))
+        return round((clipped - clip_lo) / (clip_hi - clip_lo), 4)
+
+    except Exception:
+        return 0.5  # neutral when DB is absent or query fails
 
 
 # ── Universe management ────────────────────────────────────────────────────────
@@ -212,6 +303,14 @@ def scan_symbol(
     )
 
     result.conviction_score = score_conviction(result)
+
+    if symbol in LOW_EDGE_SYMBOLS and result.signal:
+        logger.warning(
+            "%s: signal fired but symbol is in LOW_EDGE_SYMBOLS "
+            "(negative OOS edge on historical IBKR data) — apply extra scrutiny",
+            symbol,
+        )
+
     return result
 
 
