@@ -23,6 +23,7 @@ from quantlab.utils import setup_logging, parse_date, n_days_ago, make_run_id, g
 def main() -> None:
     setup_logging()
     cfg = get_config("scanner")
+    ibkr_cfg = get_config("ibkr")
 
     parser = ArgumentParser(description="Scan a universe of stocks for high-conviction setups.")
     parser.add_argument("--universe", default=cfg["universe"],
@@ -38,9 +39,9 @@ def main() -> None:
     parser.add_argument("--min-conviction", type=float, default=cfg["min_conviction"])
     parser.add_argument("--cost-bps", type=float, default=10.0)
     parser.add_argument("--provider", default="ibkr")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=7497)
-    parser.add_argument("--client-id", type=int, default=1)
+    parser.add_argument("--host", default=ibkr_cfg["host"])
+    parser.add_argument("--port", type=int, default=ibkr_cfg["port"])
+    parser.add_argument("--client-id", type=int, default=ibkr_cfg["client_id"])
     parser.add_argument("--no-news", action="store_true",
                         help="Skip news fetching (faster, price-only scan)")
     args = parser.parse_args()

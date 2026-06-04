@@ -103,25 +103,34 @@ def parse_news_item(item) -> NewsItem:
     )
 
 
-def fetch_news(ib, contract, days: int = 120, limit: int = 100) -> list[NewsItem]:
+def fetch_news(
+    ib,
+    contract,
+    days: int = 120,
+    limit: int = 100,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+) -> list[NewsItem]:
     """
     Fetch and parse historical IBKR news headlines for a qualified contract.
+
     Requires a live ib_insync IB() connection.
-    """
-    """
-    Fetch and parse historical IBKR news headlines for a qualified contract.
 
     Args:
         ib:       Connected IB() instance.
         contract: Qualified IBKR contract (from qualifyContracts).
-        days:     How many calendar days back to search.
+        days:     Calendar days back from now when start_dt is not provided.
         limit:    Max headlines to return.
+        start_dt: Explicit start datetime (overrides days when provided).
+        end_dt:   Explicit end datetime (overrides now when provided).
 
     Returns:
-        List of NewsItem, sorted by date descending (newest first).
+        List of NewsItem sorted by date descending (newest first).
     """
-    end_dt = datetime.utcnow()
-    start_dt = end_dt - timedelta(days=days)
+    if end_dt is None:
+        end_dt = datetime.utcnow()
+    if start_dt is None:
+        start_dt = end_dt - timedelta(days=days)
 
     raw_headlines = ib.reqHistoricalNews(
         conId=contract.conId,

@@ -2,6 +2,7 @@ from argparse import ArgumentParser
 from datetime import datetime
 
 from quantlab.providers import create_market_data_provider
+from quantlab.utils import get_config
 
 
 def parse_date(value: str):
@@ -9,14 +10,15 @@ def parse_date(value: str):
 
 
 def main() -> None:
+    ibkr_cfg = get_config("ibkr")
     parser = ArgumentParser(description="Fetch daily bars from a configured market data provider.")
     parser.add_argument("--provider", required=True, help="Provider name, e.g. alpha_vantage or ibkr")
     parser.add_argument("--symbol", required=True, help="Ticker symbol, e.g. AAPL")
     parser.add_argument("--start", required=True, type=parse_date, help="Start date in YYYY-MM-DD format")
     parser.add_argument("--end", required=True, type=parse_date, help="End date in YYYY-MM-DD format")
-    parser.add_argument("--host", default="127.0.0.1", help="IBKR host")
-    parser.add_argument("--port", type=int, default=7497, help="IBKR port")
-    parser.add_argument("--client-id", type=int, default=1, help="IBKR client id")
+    parser.add_argument("--host", default=ibkr_cfg["host"], help="IBKR host")
+    parser.add_argument("--port", type=int, default=ibkr_cfg["port"], help="IBKR port")
+    parser.add_argument("--client-id", type=int, default=ibkr_cfg["client_id"], help="IBKR client id")
     parser.add_argument("--base-url", default="https://www.alphavantage.co", help="HTTP provider base URL")
     parser.add_argument("--api-key", default=None, help="HTTP provider API key")
 

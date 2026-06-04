@@ -3,13 +3,15 @@ from argparse import ArgumentParser
 from ib_insync import IB
 
 from quantlab.providers.ibkr import ping_tws
+from quantlab.utils import get_config
 
 
 def main() -> None:
+    ibkr_cfg = get_config("ibkr")
     parser = ArgumentParser(description="Test TWS / IB Gateway connectivity.")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=7497)
-    parser.add_argument("--client-id", type=int, default=1)
+    parser.add_argument("--host", default=ibkr_cfg["host"])
+    parser.add_argument("--port", type=int, default=ibkr_cfg["port"])
+    parser.add_argument("--client-id", type=int, default=ibkr_cfg["client_id"])
     args = parser.parse_args()
 
     print(f"Pinging {args.host}:{args.port} ...", end=" ", flush=True)
