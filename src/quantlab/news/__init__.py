@@ -174,6 +174,38 @@ class NewsFeatures:
         return float(self.downgrade_count)
 
 
+def tag_trades_with_news(
+    trades: list,
+    news_items: list[NewsItem],
+    lookback_days: int = 7,
+) -> int:
+    """
+    Tag TradeRecord objects in-place with rolling news features.
+
+    For each trade, computes news activity in the `lookback_days` window
+    ending on its signal_date and writes news_count, news_category,
+    news_k_score, news_c_score directly onto the record.
+
+    Args:
+        trades:       List of TradeRecord objects (mutable, not frozen).
+        news_items:   Pre-fetched list of NewsItem for the symbol.
+        lookback_days: Rolling window in days (default 7).
+
+    Returns:
+        Number of trades that received at least one news item.
+    """
+    tagged = 0
+    for trade in trades:
+        feat = compute_news_features(news_items, trade.signal_date, lookback_days)
+        if feat.has_news():
+            trade.news_count = feat.total_count
+            trade.news_category = feat.dominant_category
+            trade.news_k_score = feat.avg_k_score
+            trade.news_c_score = feat.avg_c_score
+            tagged += 1
+    return tagged
+
+
 def compute_news_features(
     items: Sequence[NewsItem],
     trade_date: str,

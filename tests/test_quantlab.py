@@ -909,3 +909,81 @@ class TestIbkrScript:
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         assert hasattr(mod, "main")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# tag_trades_with_news (shared pure function)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTagTradesWithNews:
+    """tag_trades_with_news is pure — no IBKR connection needed."""
+
+    def _make_trade(self, signal_date: str) -> TradeRecord:
+        return TradeRecord(
+            symbol="AAPL", signal_date=signal_date,
+            entry_date=signal_date, entry_price=150.0,
+            exit_date=None, exit_price=None, trade_return=0.02,
+            ret_1d=None, ret_3d=None, ret_5d=None,
+            mfe_5d=None, mae_5d=None, atr_stop=None,
+        )
+
+    def _make_news(self, date_str: str, category: str = "upgrade") -> "NewsItem":
+        from datetime import datetime
+        from quantlab.news import NewsItem
+        return NewsItem(
+            time=datetime.strptime(date_str, "%Y-%m-%d"),
+            date=date_str,
+            provider="BRFG",
+            article_id="id1",
+            category=category,
+            headline="Test headline",
+            k_score=0.8,
+            c_score=0.9,
+        )
+
+    def test_tags_trade_with_matching_news(self):
+        from quantlab.news import tag_trades_with_news
+        trade = self._make_trade("2026-01-10")
+        news = [self._make_news("2026-01-08", "upgrade")]
+        tagged = tag_trades_with_news([trade], news, lookback_days=7)
+        assert tagged == 1
+        assert trade.news_count == 1
+        assert trade.news_category == "upgrade"
+
+    def test_does_not_tag_trade_with_old_news(self):
+        from quantlab.news import tag_trades_with_news
+        trade = self._make_trade("2026-01-10")
+        news = [self._make_news("2025-12-01", "earnings")]  # 40 days before signal
+        tagged = tag_trades_with_news([trade], news, lookback_days=7)
+        assert tagged == 0
+        assert trade.news_count == 0
+        assert trade.news_category == "none"
+
+    def test_tags_multiple_trades_independently(self):
+        from quantlab.news import tag_trades_with_news
+        t1 = self._make_trade("2026-01-05")
+        t2 = self._make_trade("2026-01-20")
+        news = [
+            self._make_news("2026-01-04", "upgrade"),    # within t1 window only
+            self._make_news("2026-01-18", "earnings"),   # within t2 window only
+        ]
+        tagged = tag_trades_with_news([t1, t2], news, lookback_days=7)
+        assert tagged == 2
+        assert t1.news_category == "upgrade"
+        assert t2.news_category == "earnings"
+
+    def test_returns_zero_with_empty_news(self):
+        from quantlab.news import tag_trades_with_news
+        trade = self._make_trade("2026-01-10")
+        tagged = tag_trades_with_news([trade], [], lookback_days=7)
+        assert tagged == 0
+
+    def test_does_not_overwrite_existing_tags(self):
+        """Once a trade is tagged, calling again with no matching news leaves it."""
+        from quantlab.news import tag_trades_with_news
+        trade = self._make_trade("2026-01-10")
+        news = [self._make_news("2026-01-08", "downgrade")]
+        tag_trades_with_news([trade], news)
+        # second call with empty news — trade already tagged, won't be touched
+        tag_trades_with_news([trade], [])
+        assert trade.news_category == "downgrade"  # unchanged

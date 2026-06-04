@@ -42,7 +42,7 @@ def _tag_trades_with_news(
     """
     from datetime import datetime
     from ib_insync import IB, Stock
-    from quantlab.news import fetch_news, compute_news_features
+    from quantlab.news import fetch_news
 
     print(f"\nFetching news for {symbol} ({start_date} → {end_date}) ...", flush=True)
     ib = IB()
@@ -65,16 +65,8 @@ def _tag_trades_with_news(
         )
         print(f"  {len(news_items)} headline(s) fetched")
 
-        tagged = 0
-        for trade in trades:
-            feat = compute_news_features(news_items, trade.signal_date, lookback_days=7)
-            if feat.has_news():
-                trade.news_count = feat.total_count
-                trade.news_category = feat.dominant_category
-                trade.news_k_score = feat.avg_k_score
-                trade.news_c_score = feat.avg_c_score
-                tagged += 1
-
+        from quantlab.news import tag_trades_with_news
+        tagged = tag_trades_with_news(trades, news_items, lookback_days=7)
         print(f"  {tagged}/{len(trades)} trade(s) tagged with news")
 
     except Exception as exc:
