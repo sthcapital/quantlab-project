@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
 # =============================================================================
-# scripts/morning.sh — Manual morning routine / catch-up run
+# scripts/morning.sh — Self-scheduling morning routine.
 #
-# Runs the full pre-market cycle in the correct order:
-#   1. track_forward_returns.py  — records any return horizons reached since
-#                                  the last run (catches up missed closes)
-#   2. daily_scan.sh --with-news — full pre-market scan, watchlist update,
-#                                  backtest on any 0.70+ signal
-#   3. Watchlist status summary  — shows open positions, unrealised returns,
-#                                  and cumulative hit rates
+# A single launch covers the full trading day via background sleep jobs:
+#
+#   IMMEDIATE  Step 1: track_forward_returns.py --no-ibkr  (catch-up closes)
+#   IMMEDIATE  Step 2: daily_scan.sh --with-news           (morning scan)
+#   12:30 ET   Step 3: scan_universe.py --no-news          (midday check)
+#   16:30 ET   Step 4: track_forward_returns.py            (record closes)
+#
+# Steps 3 and 4 are fire-and-forget background processes (disowned so they
+# survive terminal closure). If morning.sh is launched after 12:30 ET, the
+# midday step is skipped automatically.
 #
 # Usage:
-#   bash scripts/morning.sh             # standard run
-#   bash scripts/morning.sh --no-news   # faster, price-only scan
+#   bash scripts/morning.sh             # with news (default)
+#   bash scripts/morning.sh --no-news   # faster, price-only morning scan
 # =============================================================================
-
-set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONDA_BASE="${CONDA_BASE:-$HOME/miniconda3}"
 CONDA_ENV="quantlab"
+LOG_FILE="$HOME/quantlab-scan.log"
+IBKR_HOST="172.23.208.1"
+IBKR_PORT="7497"
 
 WITH_NEWS="--with-news"
 [[ "${1:-}" == "--no-news" ]] && WITH_NEWS=""
@@ -30,93 +34,204 @@ source "$CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "$CONDA_ENV"
 cd "$PROJECT_DIR"
 
-sep() { printf '%.0s═' {1..56}; printf '\n'; }
+sep() { printf '%.0s═' {1..62}; printf '\n'; }
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
+# ET wall-clock time (HH:MM) — used for schedule labels
+et()  {
+    python3 -c "
+import pytz
+from datetime import datetime
+print(datetime.now(pytz.timezone('America/New_York')).strftime('%H:%M'))
+"
+}
 
 echo ""
 sep
 echo "  QuantLab Morning Routine  $(ts)"
-echo "  ${WITH_NEWS:-price-only (--no-news)}"
+echo "  news: ${WITH_NEWS:-disabled}"
 sep
 
-# ── Step 1: Catch-up forward returns ──────────────────────────────────────────
+# ── Compute schedule: sleep durations and human labels ────────────────────────
+_SCHED=$(python3 - <<'PYEOF'
+import pytz
+from datetime import datetime
+
+NY  = pytz.timezone("America/New_York")
+now = datetime.now(NY)
+
+def to_epoch(h, m):
+    return int(NY.localize(
+        datetime(now.year, now.month, now.day, h, m, 0)
+    ).timestamp())
+
+def fmt(secs):
+    if secs <= 0:
+        return "PAST"
+    h, r = divmod(secs, 3600)
+    m = r // 60
+    return f"{h}h {m}m" if h else f"{m}m"
+
+now_e    = int(now.timestamp())
+midday_e = to_epoch(12, 30)
+eod_e    = to_epoch(16, 30)
+
+sm = max(0, midday_e - now_e)
+se = max(0, eod_e    - now_e)
+
+# One value per line so bash read handles spaces in "Xh Ym" correctly
+print(sm)
+print(se)
+print(fmt(sm))
+print(fmt(se))
+PYEOF
+)
+
+SLEEP_MIDDAY=$(echo "$_SCHED" | sed -n '1p')
+SLEEP_EOD=$(echo    "$_SCHED" | sed -n '2p')
+DUR_MIDDAY=$(echo   "$_SCHED" | sed -n '3p')
+DUR_EOD=$(echo      "$_SCHED" | sed -n '4p')
+
+# ── Step 1: Forward return catch-up ───────────────────────────────────────────
 echo ""
-echo "── Step 1: Forward return catch-up ────────────────────"
-python scripts/track_forward_returns.py \
-    --no-ibkr 2>/dev/null || true
-# --no-ibkr for instant offline inspection; the EOD cron job does the live run
+echo "── [$(et)] Step 1: Forward return catch-up ──────────────────"
+python scripts/track_forward_returns.py --no-ibkr 2>/dev/null || true
 
 # ── Step 2: Morning scan ───────────────────────────────────────────────────────
 echo ""
-echo "── Step 2: Morning scan ────────────────────────────────"
+echo "── [$(et)] Step 2: Morning scan ─────────────────────────────"
 if [[ -n "$WITH_NEWS" ]]; then
     bash scripts/daily_scan.sh --with-news
 else
     bash scripts/daily_scan.sh
 fi
 
-# ── Step 3: Watchlist status ───────────────────────────────────────────────────
+# Capture the ET time right when the morning scan finishes
+MORNING_ET="$(et)"
+
+# ── Collect watchlist additions from today ────────────────────────────────────
+_WL_MSG=$(python3 - <<'PYEOF'
+from quantlab.watchlist import get_active_watchlist
+from datetime import date
+today = date.today().isoformat()
+entries = [e for e in get_active_watchlist() if str(e["date_added"]) == today]
+if entries:
+    parts = [f"{e['symbol']} {e['conviction_score']:.2f}" for e in entries]
+    print(" + ".join(parts) + " added to watchlist")
+else:
+    print("no new entries (all below 0.70)")
+PYEOF
+)
+
+# ── Schedule summary ───────────────────────────────────────────────────────────
 echo ""
-echo "── Step 3: Watchlist status ────────────────────────────"
+sep
+echo "  [$MORNING_ET] Morning scan complete — $_WL_MSG"
+
+if [[ "$SLEEP_MIDDAY" -gt 0 ]]; then
+    echo "  [12:30] Midday check scheduled — runs in $DUR_MIDDAY"
+else
+    echo "  [12:30] Midday check SKIPPED — already past"
+fi
+
+if [[ "$SLEEP_EOD" -gt 0 ]]; then
+    echo "  [16:30] EOD tracker scheduled — runs in $DUR_EOD"
+else
+    echo "  [16:30] EOD tracker SKIPPED — already past 16:30 ET"
+fi
+sep
+
+# ── Watchlist status ───────────────────────────────────────────────────────────
 python3 - <<'PYEOF'
 from datetime import date
-from quantlab.watchlist import (
-    get_active_watchlist, get_watchlist_summary, _trading_days_elapsed
-)
+from quantlab.watchlist import get_active_watchlist, get_watchlist_summary, _trading_days_elapsed
 
 active  = get_active_watchlist()
 summary = get_watchlist_summary()
-
 by_status = summary.get("by_status", {})
-watching  = by_status.get("watching", 0)
-stopped   = by_status.get("stopped_out", 0)
-expired   = by_status.get("expired", 0)
-total     = summary.get("total", 0)
 
-print(f"\n  Watchlist  total={total}  "
-      f"watching={watching}  stopped_out={stopped}  expired={expired}")
+print(f"\n  Watchlist  "
+      f"watching={by_status.get('watching',0)}  "
+      f"stopped_out={by_status.get('stopped_out',0)}  "
+      f"expired={by_status.get('expired',0)}  "
+      f"total={summary.get('total',0)}")
 
 if active:
-    print(f"\n  {'symbol':<8}  {'date_added':>12}  {'entry':>8}  {'stop':>8}  "
+    print(f"\n  {'symbol':<8}  {'added':>12}  {'entry':>8}  {'stop':>8}  "
           f"{'conv':>5}  {'days':>5}  {'unreal':>8}")
-    print(f"  {'─'*72}")
+    print(f"  {'─'*68}")
     for e in active:
-        da = date.fromisoformat(str(e["date_added"]))
-        days = _trading_days_elapsed(da)
+        da     = date.fromisoformat(str(e["date_added"]))
+        days   = _trading_days_elapsed(da)
         unreal = e.get("unrealized_ret")
-        unreal_str = f"{unreal*100:+.2f}%" if unreal is not None else "    --"
-        flag = "  ⚠ NEAR STOP" if (
-            unreal is not None and e["atr_stop"] and
-            e["current_price"] and
-            e["current_price"] < (e["atr_stop"] or 0) * 1.02
-        ) else ""
-        print(
-            f"  {e['symbol']:<8}  {str(e['date_added']):>12}  "
-            f"{e['entry_price']:>8.2f}  {e['atr_stop'] or 0:>8.2f}  "
-            f"{e['conviction_score']:>5.2f}  {days:>5}  {unreal_str:>8}{flag}"
-        )
+        ur_str = f"{unreal*100:+.2f}%" if unreal is not None else "    --"
+        near   = (unreal is not None and e["atr_stop"] and e["current_price"]
+                  and e["current_price"] < (e["atr_stop"] or 0) * 1.02)
+        print(f"  {e['symbol']:<8}  {str(e['date_added']):>12}  "
+              f"{e['entry_price']:>8.2f}  {e['atr_stop'] or 0:>8.2f}  "
+              f"{e['conviction_score']:>5.2f}  {days:>5}  {ur_str:>8}"
+              + ("  ⚠ NEAR STOP" if near else ""))
 
-# Cumulative realized return stats
 has_data = False
-for label, key in [("1D", "ret_1d"), ("3D", "ret_3d"), ("5D", "ret_5d")]:
+for label, key in [("1D","ret_1d"), ("3D","ret_3d"), ("5D","ret_5d")]:
     agg = summary.get(key, {})
-    avg = agg.get("avg")
-    hit = agg.get("hit_rate")
+    avg, hit = agg.get("avg"), agg.get("hit_rate")
     if avg is not None:
         if not has_data:
-            print("\n  Realized returns (cumulative):")
+            print("\n  Cumulative realized returns:")
             has_data = True
         stars = "★" * (1 + int(hit >= 0.6) + int(hit >= 0.75))
-        print(f"    {label}  avg={avg*100:+.2f}%  "
-              f"hit_rate={hit*100:.0f}%  {stars}")
-
+        print(f"    {label}  avg={avg*100:+.2f}%  hit={hit*100:.0f}%  {stars}")
 if not has_data:
-    print("\n  No realized returns yet — forward data accumulates after market close")
-
+    print("\n  No realized returns yet — data accumulates after market close")
 PYEOF
 
 echo ""
-sep
-echo "  Run complete: $(ts)"
-sep
-echo ""
+
+# ── Background: Midday check at 12:30 PM ET ───────────────────────────────────
+if [[ "$SLEEP_MIDDAY" -gt 0 ]]; then
+    (
+        sleep "$SLEEP_MIDDAY"
+        source "$CONDA_BASE/etc/profile.d/conda.sh" 2>/dev/null
+        conda activate "$CONDA_ENV" 2>/dev/null
+        cd "$PROJECT_DIR"
+        {
+            echo ""
+            echo "══ [12:30] Midday check — $(ts) ══════════════════════════"
+        } >> "$LOG_FILE"
+        python scripts/scan_universe.py \
+            --universe       sp500_sample \
+            --signal         breakout \
+            --lookback       5 \
+            --min-conviction 0.3 \
+            --provider       ibkr \
+            --host           "$IBKR_HOST" \
+            --port           "$IBKR_PORT" \
+            --no-news \
+            --multi-lookback \
+            --secondary-lookback 20 \
+            --add-to-watchlist \
+            >> "$LOG_FILE" 2>&1
+        echo "── [12:30] Midday check complete — $(ts)" >> "$LOG_FILE"
+    ) &
+    disown $!
+fi
+
+# ── Background: EOD tracker at 4:30 PM ET ────────────────────────────────────
+if [[ "$SLEEP_EOD" -gt 0 ]]; then
+    (
+        sleep "$SLEEP_EOD"
+        source "$CONDA_BASE/etc/profile.d/conda.sh" 2>/dev/null
+        conda activate "$CONDA_ENV" 2>/dev/null
+        cd "$PROJECT_DIR"
+        {
+            echo ""
+            echo "══ [16:30] EOD tracker — $(ts) ═══════════════════════════"
+        } >> "$LOG_FILE"
+        python scripts/track_forward_returns.py \
+            --host "$IBKR_HOST" \
+            --port "$IBKR_PORT" \
+            >> "$LOG_FILE" 2>&1
+        echo "── [16:30] EOD tracker complete — $(ts)" >> "$LOG_FILE"
+    ) &
+    disown $!
+fi
