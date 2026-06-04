@@ -58,6 +58,13 @@ def main() -> None:
 
     provider_kwargs = {}
     if args.provider == "ibkr":
+        from quantlab.providers.ibkr import ping_tws
+        if not ping_tws(args.host, args.port):
+            raise SystemExit(
+                f"\nTWS / IB Gateway is not reachable at {args.host}:{args.port}.\n"
+                "Start TWS or IB Gateway, enable API access, and try again."
+            )
+        news_client_id = get_config("ibkr").get("news_client_id", args.client_id + 40)
         provider_kwargs = {"host": args.host, "port": args.port, "client_id": args.client_id}
     provider = create_market_data_provider(args.provider, **provider_kwargs)
 
@@ -67,7 +74,7 @@ def main() -> None:
         try:
             from ib_insync import IB
             ibkr_conn = IB()
-            ibkr_conn.connect(args.host, args.port, clientId=args.client_id + 40, timeout=10)
+            ibkr_conn.connect(args.host, args.port, clientId=news_client_id, timeout=10)
         except Exception as e:
             print(f"[scanner] News connection failed ({e}) — running price-only scan")
             ibkr_conn = None

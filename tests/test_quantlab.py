@@ -737,3 +737,175 @@ class TestWalkForwardStorage:
         beta = query_oos_ranking("run_beta")
         assert len(alpha) == 1
         assert len(beta) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IBKR provider fixes (items 1–3, 6–9)
+# All tests are offline — no TWS connection required.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestIbkrProviderFixes:
+    """Tests for the 9 blocking/quality fixes to IbkrProvider."""
+
+    # ── Item 9: ping_tws ──────────────────────────────────────────────────────
+
+    def test_ping_tws_closed_port_returns_false(self):
+        from quantlab.providers.ibkr import ping_tws
+        # Port 1 is almost never open; timeout=0.5s so the test is fast
+        assert ping_tws("127.0.0.1", port=1, timeout=0.5) is False
+
+    def test_ping_tws_bad_host_returns_false(self):
+        from quantlab.providers.ibkr import ping_tws
+        assert ping_tws("192.0.2.1", port=7497, timeout=0.5) is False  # TEST-NET, RFC 5737
+
+    # ── Items 1 & 6: _duration_str and _end_date_time ────────────────────────
+
+    def test_duration_str_sub_year(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        start = date(2025, 1, 1)
+        end   = date(2025, 6, 30)
+        ds = IbkrProvider._duration_str(start, end)
+        assert ds.endswith(" D")
+        days = int(ds.split()[0])
+        assert days >= (end - start).days   # must cover the range
+
+    def test_duration_str_two_years(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        start = date(2023, 1, 1)
+        end   = date(2025, 1, 1)
+        ds = IbkrProvider._duration_str(start, end)
+        assert ds.endswith(" Y")
+        assert int(ds.split()[0]) >= 2
+
+    def test_duration_str_near_year_uses_years(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        start = date(2025, 1, 1)
+        end   = date(2025, 12, 31)
+        # 364 days + 7 buffer = 371 > 365, so code correctly returns "Y" format
+        ds = IbkrProvider._duration_str(start, end)
+        assert ds.endswith(" Y")
+        assert int(ds.split()[0]) >= 1
+
+    def test_end_date_time_today_returns_empty(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        assert IbkrProvider._end_date_time(date.today()) == ""
+
+    def test_end_date_time_future_returns_empty(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        future = date(2099, 12, 31)
+        assert IbkrProvider._end_date_time(future) == ""
+
+    def test_end_date_time_historical_returns_timestamp(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        past = date(2024, 6, 15)
+        ts = IbkrProvider._end_date_time(past)
+        assert ts == "20240615 23:59:59"
+
+    # ── Item 3: persistent connection API ─────────────────────────────────────
+
+    def test_ibkr_provider_has_connect_disconnect(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider()
+        assert hasattr(p, "connect")
+        assert hasattr(p, "disconnect")
+        assert hasattr(p, "__enter__")
+        assert hasattr(p, "__exit__")
+
+    def test_ibkr_provider_no_connection_on_init(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider()
+        assert p._ib is None
+
+    # ── Item 8: explicit spot_client_id ──────────────────────────────────────
+
+    def test_spot_client_id_default_offset(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider(client_id=1)
+        assert p.spot_client_id == 51   # default: client_id + 50
+
+    def test_spot_client_id_explicit_override(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider(client_id=1, spot_client_id=99)
+        assert p.spot_client_id == 99
+
+    def test_spot_client_id_differs_from_client_id(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider(client_id=5)
+        assert p.spot_client_id != p.client_id
+
+    # ── Item 4: factory.py fixed ──────────────────────────────────────────────
+
+    def test_factory_py_imports_correctly(self):
+        # factory.py previously imported the wrong class name; verify it loads
+        from quantlab.providers.factory import create_market_data_provider
+        from quantlab.providers.ibkr import IbkrProvider
+        p = create_market_data_provider("ibkr")
+        assert isinstance(p, IbkrProvider)
+
+    # ── Item 8: config has explicit client IDs ────────────────────────────────
+
+    def test_config_has_spot_and_news_client_ids(self):
+        from quantlab.utils import get_config
+        cfg = get_config("ibkr")
+        assert "spot_client_id" in cfg
+        assert "news_client_id" in cfg
+        assert cfg["spot_client_id"] != cfg["client_id"]
+        assert cfg["news_client_id"] != cfg["client_id"]
+        assert cfg["spot_client_id"] != cfg["news_client_id"]
+
+    # ── Item 7: cache path helper ─────────────────────────────────────────────
+
+    def test_cache_path_returns_parquet(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider()
+        path = p._cache_path("AAPL")
+        assert path.name == "AAPL_bars.parquet"
+
+    def test_cache_miss_on_absent_file(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider()
+        result = p._load_from_cache("____NOSUCHSYMBOL____", date(2024, 1, 1), date(2024, 12, 31))
+        assert result is None
+
+    def test_cache_roundtrip(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        monkeypatch.setattr(_storage, "OUTPUT_DIR", tmp_path)
+        from quantlab.providers.ibkr import IbkrProvider
+        bars = make_bars(60)
+        p = IbkrProvider()
+        p._save_to_cache("TEST", bars)
+        loaded = p._load_from_cache(
+            "TEST", bars[0].as_of, bars[-1].as_of
+        )
+        assert loaded is not None
+        assert len(loaded) == len(bars)
+        assert loaded[0].as_of == bars[0].as_of
+
+    def test_cache_miss_on_partial_coverage(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        monkeypatch.setattr(_storage, "OUTPUT_DIR", tmp_path)
+        from quantlab.providers.ibkr import IbkrProvider
+        bars = make_bars(30)   # small window
+        p = IbkrProvider()
+        p._save_to_cache("PARTIAL", bars)
+        # Request extends beyond what was cached — should be a miss
+        beyond = bars[-1].as_of.__class__.fromordinal(bars[-1].as_of.toordinal() + 10)
+        result = p._load_from_cache("PARTIAL", bars[0].as_of, beyond)
+        assert result is None
+
+
+class TestIbkrScript:
+    """Smoke-tests for the new run_universe_backtest.py script (mock provider)."""
+
+    def test_run_universe_backtest_script_importable(self):
+        import importlib.util
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location(
+            "run_universe_backtest",
+            Path(__file__).parent.parent / "scripts" / "run_universe_backtest.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert hasattr(mod, "main")

@@ -46,9 +46,13 @@ def main() -> None:
     # ── Fetch bars ────────────────────────────────────────────────────────────
     provider_kwargs = {}
     if args.provider.lower() == "ibkr":
+        from quantlab.providers.ibkr import ping_tws
+        if not ping_tws(args.host, args.port):
+            raise SystemExit(
+                f"\nTWS / IB Gateway is not reachable at {args.host}:{args.port}.\n"
+                "Start TWS or IB Gateway, enable API access, and try again."
+            )
         provider_kwargs = {"host": args.host, "port": args.port, "client_id": args.client_id}
-    else:
-        provider_kwargs = {}
 
     provider = create_market_data_provider(args.provider, **provider_kwargs)
     bars = list(provider.get_daily_bars(args.symbol, args.start, args.end))

@@ -24,6 +24,12 @@ def main() -> None:
 
     provider_kwargs = {}
     if args.provider.lower() == "ibkr":
+        from quantlab.providers.ibkr import ping_tws
+        if not ping_tws(args.host, args.port):
+            raise SystemExit(
+                f"\nTWS / IB Gateway is not reachable at {args.host}:{args.port}.\n"
+                "Start TWS or IB Gateway, enable API access, and try again."
+            )
         provider_kwargs = {
             "host": args.host,
             "port": args.port,

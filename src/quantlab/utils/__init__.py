@@ -61,7 +61,9 @@ DEFAULT_CONFIG = {
     "ibkr": {
         "host": "127.0.0.1",
         "port": 7497,
-        "client_id": 1,
+        "client_id": 1,      # historical data
+        "spot_client_id": 51, # get_spot_price — dedicated slot avoids collision
+        "news_client_id": 41, # news fetch in scanner — dedicated slot
         "timeout": 10,
     },
     "backtest": {

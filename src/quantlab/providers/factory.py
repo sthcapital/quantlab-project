@@ -1,6 +1,6 @@
 from quantlab.providers.base import MarketDataProvider
 from quantlab.providers.http import HttpMarketDataProvider
-from quantlab.providers.ibkr import IbkrMarketDataProvider
+from quantlab.providers.ibkr import IbkrProvider
 
 
 def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
@@ -10,6 +10,6 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
         return HttpMarketDataProvider(**kwargs)
 
     if normalized == "ibkr":
-        return IbkrMarketDataProvider(**kwargs)
+        return IbkrProvider(**kwargs)
 
     raise ValueError(f"Unknown market data provider: {name}")
