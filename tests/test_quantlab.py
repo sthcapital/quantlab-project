@@ -371,6 +371,8 @@ class TestExecution:
         assert len(u) == 50
         assert "AAPL" in u
         assert "GS" in u
+        assert "BRK B" in u       # IBKR-format ticker (space, not dot)
+        assert "BRK.B" not in u   # dot form fails contract qualification
 
     def test_is_actionable(self):
         r = ScanResult(
