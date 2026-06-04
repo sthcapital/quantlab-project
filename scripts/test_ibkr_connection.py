@@ -1,14 +1,32 @@
+from argparse import ArgumentParser
+
 from ib_insync import IB
+
+from quantlab.providers.ibkr import ping_tws
 
 
 def main() -> None:
-    ib = IB()
+    parser = ArgumentParser(description="Test TWS / IB Gateway connectivity.")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7497)
+    parser.add_argument("--client-id", type=int, default=1)
+    args = parser.parse_args()
 
+    print(f"Pinging {args.host}:{args.port} ...", end=" ", flush=True)
+    if not ping_tws(args.host, args.port):
+        print("UNREACHABLE")
+        raise SystemExit(
+            f"\nTWS / IB Gateway is not reachable at {args.host}:{args.port}.\n"
+            "Check that TWS is running, API is enabled, and this IP is in Trusted IPs."
+        )
+    print("OK")
+
+    ib = IB()
     try:
-        ib.connect("127.0.0.1", 7497, clientId=1, timeout=10)
-        print("CONNECTED")
-        print(f"isConnected={ib.isConnected()}")
-        print(f"serverVersion={ib.client.serverVersion()}")
+        ib.connect(args.host, args.port, clientId=args.client_id, timeout=10)
+        print(f"CONNECTED")
+        print(f"  isConnected   = {ib.isConnected()}")
+        print(f"  serverVersion = {ib.client.serverVersion()}")
     finally:
         if ib.isConnected():
             ib.disconnect()
