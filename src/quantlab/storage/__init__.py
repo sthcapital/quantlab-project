@@ -229,6 +229,119 @@ def _ensure_schema(con) -> None:
     """)
 
 
+def save_equity_curve_chart(
+    equity_curve: list[float],
+    bars: Sequence,
+    symbol: str,
+    signal_type: str,
+    run_tag: str = "",
+) -> Path:
+    """
+    Save an equity curve + drawdown chart to output/ as a PNG.
+
+    Plots strategy equity alongside a buy-and-hold baseline, with a drawdown
+    panel below. Requires matplotlib (already a project dependency).
+
+    Args:
+        equity_curve: Portfolio value at each bar, length == len(bars).
+        bars:         OHLCV bar sequence used in the backtest.
+        symbol:       Ticker symbol (used in title and filename).
+        signal_type:  Signal name (used in title and filename).
+        run_tag:      Optional suffix for the filename.
+
+    Returns:
+        Path to the saved PNG file.
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive — safe in scripts and tests
+    import matplotlib.pyplot as plt
+
+    ensure_dirs()
+    suffix = f"_{run_tag}" if run_tag else ""
+    path = OUTPUT_DIR / f"{symbol}_{signal_type}{suffix}_equity.png"
+
+    dates = [b.as_of for b in bars]
+    closes = [b.close for b in bars]
+    bah = [c / closes[0] * equity_curve[0] for c in closes]
+
+    peak = equity_curve[0]
+    drawdowns = []
+    for e in equity_curve:
+        peak = max(peak, e)
+        drawdowns.append((e / peak) - 1.0)
+
+    fig, (ax1, ax2) = plt.subplots(
+        2, 1, figsize=(12, 8), gridspec_kw={"height_ratios": [3, 1]}
+    )
+
+    ax1.plot(dates, equity_curve, color="steelblue", linewidth=1.5, label="Strategy")
+    ax1.plot(dates, bah, color="gray", linewidth=1.0, alpha=0.55, label="Buy & Hold")
+    ax1.set_title(f"{symbol} — {signal_type} equity curve")
+    ax1.set_ylabel("Portfolio value ($)")
+    ax1.legend(loc="upper left")
+    ax1.grid(True, alpha=0.3)
+
+    ax2.fill_between(dates, drawdowns, 0, color="crimson", alpha=0.45, label="Drawdown")
+    ax2.set_ylabel("Drawdown")
+    ax2.set_xlabel("Date")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="lower left")
+
+    plt.tight_layout()
+    plt.savefig(path, dpi=100, bbox_inches="tight")
+    plt.close(fig)
+
+    return path
+
+
+def append_backtest_run(
+    run_id: str,
+    symbol: str,
+    signal_type: str,
+    lookback: int,
+    start_date,
+    end_date,
+    metrics,
+) -> None:
+    """
+    Insert a PerformanceMetrics summary row into the backtest_runs DuckDB table.
+
+    Storage errors are caught and printed — they never crash the research workflow.
+
+    Args:
+        run_id:      Unique identifier for this run (e.g. from make_run_id).
+        symbol:      Ticker symbol.
+        signal_type: "breakout" or "sma".
+        lookback:    Signal lookback period.
+        start_date:  First bar date.
+        end_date:    Last bar date.
+        metrics:     PerformanceMetrics instance from compute_metrics / run_backtest.
+    """
+    try:
+        con = get_db()
+        con.execute("""
+            INSERT OR REPLACE INTO backtest_runs (
+                run_id, symbol, signal_type, lookback,
+                start_date, end_date, bar_count, trade_count,
+                total_return, max_drawdown, sharpe_ratio, sortino_ratio,
+                calmar_ratio, profit_factor, win_rate, expectancy,
+                sufficient_sample
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [
+            run_id, symbol, signal_type, lookback,
+            str(start_date), str(end_date),
+            metrics.bar_count, metrics.trade_count,
+            metrics.total_return, metrics.max_drawdown,
+            metrics.sharpe_ratio, metrics.sortino_ratio,
+            metrics.calmar_ratio, metrics.profit_factor,
+            metrics.win_rate, metrics.expectancy,
+            metrics.sufficient_sample,
+        ])
+        con.close()
+    except Exception as e:
+        print(f"[storage] DuckDB backtest_runs insert failed: {e}")
+
+
 def append_trades_to_db(
     run_id: str,
     signal_type: str,

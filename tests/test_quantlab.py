@@ -20,6 +20,12 @@ from quantlab.research import forward_returns, compute_metrics, TradeRecord, MIN
 from quantlab.risk import apply_transaction_cost, apply_costs_to_trades, fmt_pct
 from quantlab.execution import score_conviction, ScanResult, load_universe, scan_symbol
 from quantlab.utils import parse_date, make_run_id, n_days_ago
+from quantlab.backtest import (
+    run_backtest, BacktestOutput,
+    sensitivity_sweep, DEFAULT_LOOKBACKS,
+    walk_forward, WalkForwardWindow,
+    print_sensitivity_table, print_walk_forward_summary,
+)
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -358,6 +364,12 @@ class TestExecution:
         assert s1 < s2 < s3
         assert s3 <= 1.0
 
+    def test_load_universe_sp500_sample(self):
+        u = load_universe("sp500_sample")
+        assert len(u) == 50
+        assert "AAPL" in u
+        assert "GS" in u
+
     def test_is_actionable(self):
         r = ScanResult(
             symbol="AAPL", scan_date="2026-06-03",
@@ -394,3 +406,234 @@ class TestUtils:
     def test_make_run_id(self):
         run_id = make_run_id("AAPL", "breakout", "20260603_120000")
         assert run_id == "AAPL_breakout_20260603_120000"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 Item 1: Backtest engine with transaction costs
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestBacktest:
+
+    def test_run_backtest_returns_output(self):
+        bars = make_bars(100, trend=0.002)
+        out = run_backtest(bars, "AAPL", signal_type="breakout", lookback=20)
+        assert isinstance(out, BacktestOutput)
+        assert len(out.equity_curve) == len(bars)
+        assert out.metrics is not None
+
+    def test_run_backtest_equity_starts_at_initial_capital(self):
+        bars = make_bars(80)
+        out = run_backtest(bars, "TSLA", lookback=20, initial_capital=50_000.0)
+        assert out.equity_curve[0] == 50_000.0
+
+    def test_run_backtest_cost_reduces_trade_return(self):
+        bars = make_bars(200, trend=0.003)
+        out_free = run_backtest(bars, "AAPL", lookback=20, cost_bps=0.0)
+        out_cost = run_backtest(bars, "AAPL", lookback=20, cost_bps=10.0)
+        free_returns = [t.trade_return for t in out_free.trades if t.trade_return is not None]
+        cost_returns = [t.trade_return for t in out_cost.trades if t.trade_return is not None]
+        if free_returns and cost_returns:
+            assert sum(cost_returns) < sum(free_returns)
+
+    def test_run_backtest_sma_signal_type(self):
+        bars = make_bars(100, trend=0.002)
+        out = run_backtest(bars, "MSFT", signal_type="sma", lookback=20)
+        assert out.signal_type == "sma"
+        assert out.cost_bps == 10.0  # default
+
+    def test_run_backtest_insufficient_sample_flagged(self):
+        bars = make_bars(40)
+        out = run_backtest(bars, "AAPL", lookback=20)
+        assert not out.metrics.sufficient_sample
+
+    def test_run_backtest_cost_stored_on_trade(self):
+        bars = make_bars(200, trend=0.003)
+        out = run_backtest(bars, "AAPL", lookback=20, cost_bps=10.0)
+        for t in out.trades:
+            assert t.cost_bps == 10.0
+
+    def test_run_backtest_unknown_signal_raises(self):
+        bars = make_bars(50)
+        try:
+            run_backtest(bars, "AAPL", signal_type="unknown")
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "Unknown signal_type" in str(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 Item 4: Parameter sensitivity sweep
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSensitivity:
+
+    def test_sweep_returns_all_valid_lookbacks(self):
+        bars = make_bars(200, trend=0.002)
+        results = sensitivity_sweep(bars, "AAPL", lookbacks=[5, 10, 20, 50])
+        assert set(results.keys()) == {5, 10, 20, 50}
+
+    def test_sweep_skips_lookback_exceeding_bar_count(self):
+        bars = make_bars(30)
+        results = sensitivity_sweep(bars, "AAPL", lookbacks=[5, 10, 20, 50])
+        assert 50 not in results  # 50 >= 30 bars
+        assert 5 in results
+
+    def test_sweep_uses_default_lookbacks(self):
+        bars = make_bars(200, trend=0.002)
+        results = sensitivity_sweep(bars, "AAPL")
+        for lb in DEFAULT_LOOKBACKS:
+            if lb < len(bars):
+                assert lb in results
+
+    def test_sweep_metrics_are_performance_metrics(self):
+        from quantlab.research import PerformanceMetrics
+        bars = make_bars(100, trend=0.002)
+        results = sensitivity_sweep(bars, "AAPL", lookbacks=[10, 20])
+        for m in results.values():
+            assert isinstance(m, PerformanceMetrics)
+
+    def test_sweep_print_runs_without_error(self, capsys):
+        bars = make_bars(100, trend=0.002)
+        results = sensitivity_sweep(bars, "AAPL", lookbacks=[10, 20])
+        print_sensitivity_table(results)
+        captured = capsys.readouterr()
+        assert "Sensitivity" in captured.out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 Item 5: Walk-forward validation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWalkForward:
+
+    def test_walk_forward_produces_multiple_windows(self):
+        bars = make_bars(400, trend=0.001)
+        windows = walk_forward(bars, "AAPL", lookback=20, is_bars=150, oos_bars=50)
+        assert len(windows) >= 2
+
+    def test_walk_forward_oos_follows_is(self):
+        bars = make_bars(400, trend=0.001)
+        windows = walk_forward(bars, "AAPL", lookback=20, is_bars=150, oos_bars=50)
+        for w in windows:
+            assert w.oos_start_bar == w.is_end_bar
+
+    def test_walk_forward_windows_step_by_oos_size(self):
+        bars = make_bars(400, trend=0.001)
+        windows = walk_forward(bars, "AAPL", lookback=20, is_bars=150, oos_bars=50)
+        for i in range(1, len(windows)):
+            assert windows[i].is_start_bar == windows[i - 1].is_start_bar + 50
+
+    def test_walk_forward_too_few_bars_returns_empty(self):
+        bars = make_bars(50)
+        windows = walk_forward(bars, "AAPL", lookback=20, is_bars=200, oos_bars=60)
+        assert len(windows) == 0
+
+    def test_walk_forward_in_sample_metrics_present(self):
+        from quantlab.research import PerformanceMetrics
+        bars = make_bars(400, trend=0.001)
+        windows = walk_forward(bars, "AAPL", lookback=20, is_bars=150, oos_bars=50)
+        assert len(windows) > 0
+        for w in windows:
+            assert isinstance(w.in_sample, PerformanceMetrics)
+            assert isinstance(w, WalkForwardWindow)
+
+    def test_walk_forward_print_runs_without_error(self, capsys):
+        bars = make_bars(400, trend=0.001)
+        windows = walk_forward(bars, "AAPL", lookback=20, is_bars=150, oos_bars=50)
+        print_walk_forward_summary(windows)
+        captured = capsys.readouterr()
+        assert "Walk-Forward" in captured.out
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 Item 6: CSV trade log + equity curve chart
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStoragePhase3:
+
+    def test_equity_chart_creates_png(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "OUTPUT_DIR", tmp_path)
+        from quantlab.storage import save_equity_curve_chart
+        bars = make_bars(60)
+        equity = [10_000.0 * (1 + i * 0.001) for i in range(60)]
+        path = save_equity_curve_chart(equity, bars, "AAPL", "breakout", run_tag="testrun")
+        assert path.exists()
+        assert path.suffix == ".png"
+        assert "AAPL_breakout" in path.name
+
+    def test_equity_chart_no_tag(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "OUTPUT_DIR", tmp_path)
+        from quantlab.storage import save_equity_curve_chart
+        bars = make_bars(40)
+        equity = [10_000.0] * 40
+        path = save_equity_curve_chart(equity, bars, "MSFT", "sma")
+        assert path.exists()
+
+    def test_export_trades_csv_creates_file(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "OUTPUT_DIR", tmp_path)
+        from quantlab.storage import export_trades_csv
+        bars = make_bars(100, trend=0.003)
+        out = run_backtest(bars, "AAPL", lookback=20, cost_bps=10.0)
+        path = export_trades_csv("AAPL", "breakout", out.trades, run_tag="test")
+        assert path.exists()
+        assert path.suffix == ".csv"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 Item 7: DuckDB backtest run persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDuckDBStorage:
+
+    def test_append_backtest_run_stores_row(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test.duckdb")
+        from quantlab.storage import append_backtest_run
+        bars = make_bars(100, trend=0.002)
+        out = run_backtest(bars, "AAPL", lookback=20)
+        append_backtest_run(
+            "run_001", "AAPL", "breakout", 20,
+            bars[0].as_of, bars[-1].as_of, out.metrics,
+        )
+        import duckdb
+        con = duckdb.connect(str(tmp_path / "test.duckdb"))
+        rows = con.execute("SELECT run_id, trade_count FROM backtest_runs").fetchall()
+        con.close()
+        assert len(rows) == 1
+        assert rows[0][0] == "run_001"
+        assert rows[0][1] == out.metrics.trade_count
+
+    def test_append_multiple_runs(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test2.duckdb")
+        from quantlab.storage import append_backtest_run
+        bars = make_bars(100, trend=0.002)
+        for i, lb in enumerate([10, 20]):
+            out = run_backtest(bars, "AAPL", lookback=lb)
+            append_backtest_run(
+                f"run_{i:03d}", "AAPL", "breakout", lb,
+                bars[0].as_of, bars[-1].as_of, out.metrics,
+            )
+        import duckdb
+        con = duckdb.connect(str(tmp_path / "test2.duckdb"))
+        count = con.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0]
+        con.close()
+        assert count == 2
+
+    def test_append_trades_to_db_works(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "trades.duckdb")
+        from quantlab.storage import append_trades_to_db
+        bars = make_bars(200, trend=0.003)
+        out = run_backtest(bars, "AAPL", lookback=20)
+        completed = [t for t in out.trades if t.trade_return is not None]
+        if completed:
+            append_trades_to_db("run_abc", "breakout", 20, completed)
+            import duckdb
+            con = duckdb.connect(str(tmp_path / "trades.duckdb"))
+            count = con.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            con.close()
+            assert count == len(completed)

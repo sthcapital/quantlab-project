@@ -105,7 +105,7 @@ SP500_SAMPLE = [
     "MRK", "COST", "ABBV", "KO", "PEP", "BAC", "ADBE", "TMO", "WMT",
     "ACN", "MCD", "CSCO", "ABT", "CRM", "NFLX", "DHR", "ORCL", "NKE",
     "LIN", "TXN", "NEE", "RTX", "BMY", "AMGN", "UPS", "HON", "PM",
-    "INTC", "QCOM", "IBM", "CAT",
+    "INTC", "QCOM", "IBM", "CAT", "GS",
 ]
 
 WATCHLIST_SMALL = ["AAPL", "MSFT", "NVDA", "AMZN", "TSLA", "GOOGL", "META"]
