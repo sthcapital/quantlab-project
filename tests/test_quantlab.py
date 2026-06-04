@@ -2606,3 +2606,146 @@ class TestMarketCalendar:
         direct = get_scan_utc(d)
         via_to_utc = to_utc(time(9, 0), d)
         assert direct == via_to_utc
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# market_calendar — NYSE holiday calendar and is_market_open()
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNYSEHolidayCalendar:
+    """Uses fixed dates — fully deterministic, no system clock."""
+
+    # ── Easter algorithm ──────────────────────────────────────────────────────
+
+    def test_easter_2026(self):
+        from quantlab.market_calendar import _easter
+        from datetime import date
+        assert _easter(2026) == date(2026, 4, 5)
+
+    def test_easter_2027(self):
+        from quantlab.market_calendar import _easter
+        from datetime import date
+        # Meeus/Jones/Butcher + dateutil agree: Easter 2027 = March 28
+        assert _easter(2027) == date(2027, 3, 28)
+
+    def test_easter_2028(self):
+        from quantlab.market_calendar import _easter
+        from datetime import date
+        assert _easter(2028) == date(2028, 4, 16)
+
+    # ── Good Friday ───────────────────────────────────────────────────────────
+
+    def test_good_friday_2026_not_market_open(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 4, 3)) is False  # Good Friday 2026
+
+    def test_good_friday_2027_not_market_open(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        # Good Friday 2027 = March 26 (Easter is March 28, NOT April 4)
+        assert is_market_open(date(2027, 3, 26)) is False
+
+    def test_good_friday_2028_not_market_open(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2028, 4, 14)) is False  # Good Friday 2028
+
+    # ── US_MARKET_HOLIDAYS set ────────────────────────────────────────────────
+
+    def test_holiday_set_covers_three_years(self):
+        from quantlab.utils.market_calendar import US_MARKET_HOLIDAYS
+        years = {d.year for d in US_MARKET_HOLIDAYS}
+        assert years == {2026, 2027, 2028}
+
+    def test_holiday_set_per_year_exactly_ten(self):
+        from quantlab.market_calendar import _nyse_holidays
+        # _nyse_holidays(yr) produces exactly 10 holidays per year.
+        # Note: the observed date may fall in an adjacent calendar year
+        # (e.g. New Year's 2028 = Saturday → observed Fri Dec 31 2027),
+        # so we test the source set, not a year-filter on US_MARKET_HOLIDAYS.
+        for yr in [2026, 2027, 2028]:
+            count = len(_nyse_holidays(yr))
+            assert count == 10, f"{yr}: expected 10 holidays, got {count}"
+
+    def test_thanksgiving_2026_in_holidays(self):
+        from quantlab.utils.market_calendar import US_MARKET_HOLIDAYS
+        from datetime import date
+        assert date(2026, 11, 26) in US_MARKET_HOLIDAYS  # 4th Thursday Nov 2026
+
+    def test_juneteenth_observed_2027(self):
+        from quantlab.utils.market_calendar import US_MARKET_HOLIDAYS
+        from datetime import date
+        # June 19 2027 is a Saturday → observed on Friday June 18
+        assert date(2027, 6, 18) in US_MARKET_HOLIDAYS
+        assert date(2027, 6, 19) not in US_MARKET_HOLIDAYS
+
+    def test_july4_observed_2027(self):
+        from quantlab.utils.market_calendar import US_MARKET_HOLIDAYS
+        from datetime import date
+        # July 4 2027 is a Sunday → observed Monday July 5
+        assert date(2027, 7, 5) in US_MARKET_HOLIDAYS
+        assert date(2027, 7, 4) not in US_MARKET_HOLIDAYS  # Sunday already closed
+
+    def test_christmas_observed_2027(self):
+        from quantlab.utils.market_calendar import US_MARKET_HOLIDAYS
+        from datetime import date
+        # Dec 25 2027 is a Saturday → observed Friday Dec 24
+        assert date(2027, 12, 24) in US_MARKET_HOLIDAYS
+
+    # ── is_market_open ────────────────────────────────────────────────────────
+
+    def test_weekends_always_closed(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 6, 6)) is False   # Saturday
+        assert is_market_open(date(2026, 6, 7)) is False   # Sunday
+
+    def test_regular_weekday_is_open(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 6, 4)) is True    # Thursday, no holiday
+
+    def test_independence_day_2026_closed(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 7, 4)) is False   # Saturday → closed
+
+    def test_independence_day_observed_2026_closed(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 7, 3)) is False   # Fri = observed holiday
+
+    def test_monday_after_july4_2026_open(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 7, 6)) is True    # Monday — regular day
+
+    def test_thanksgiving_2026_closed(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 11, 26)) is False
+
+    def test_christmas_2026_closed(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 12, 25)) is False  # Friday
+
+    def test_monday_after_christmas_2026_open(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2026, 12, 28)) is True   # Monday, no holiday
+
+    def test_new_years_2027_closed(self):
+        from quantlab.utils.market_calendar import is_market_open
+        from datetime import date
+        assert is_market_open(date(2027, 1, 1)) is False    # Friday
+
+    def test_utils_import_path_works(self):
+        """quantlab.utils.market_calendar must re-export all public symbols."""
+        from quantlab.utils.market_calendar import (
+            is_market_open, US_MARKET_HOLIDAYS,
+            is_dst, get_scan_utc, cron_schedule_for_date,
+        )
+        assert callable(is_market_open)
+        assert isinstance(US_MARKET_HOLIDAYS, frozenset)

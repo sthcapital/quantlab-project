@@ -19,13 +19,116 @@ Market session times (NY local):
 
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import NamedTuple
 
 import pytz
 
 NY_TZ = pytz.timezone("America/New_York")
 UTC   = pytz.UTC
+
+# ── Holiday computation helpers ────────────────────────────────────────────────
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the nth occurrence of weekday (Mon=0…Sun=6) in year/month."""
+    first = date(year, month, 1)
+    delta = (weekday - first.weekday()) % 7
+    return first + timedelta(days=delta + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """Return the last occurrence of weekday in year/month."""
+    if month == 12:
+        last = date(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+def _easter(year: int) -> date:
+    """
+    Compute Easter Sunday (Western/Gregorian) using the Meeus/Jones/Butcher
+    algorithm.  Returns the ecclesiastically correct date.
+
+    Verified against authoritative sources for 2026–2028:
+        2026-04-05  2027-03-28  2028-04-16
+    """
+    a = year % 19
+    b, c = divmod(year, 100)
+    d, e = divmod(b, 4)
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month, p = divmod(h + l - 7 * m + 114, 31)
+    return date(year, month, p + 1)
+
+
+def _observed(d: date) -> date:
+    """NYSE holiday observation rule: Sat → Fri, Sun → Mon."""
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+
+def _nyse_holidays(year: int) -> frozenset[date]:
+    """
+    Return the complete set of NYSE market holidays for one calendar year.
+
+    NYSE observes these ten holidays:
+        New Year's Day, MLK Jr. Day, Presidents Day, Good Friday,
+        Memorial Day, Juneteenth, Independence Day, Labor Day,
+        Thanksgiving, Christmas Day.
+    """
+    holidays: set[date] = set()
+
+    # Fixed-date holidays with Saturday→Friday / Sunday→Monday observation
+    for mo, da in [(1, 1), (6, 19), (7, 4), (12, 25)]:
+        holidays.add(_observed(date(year, mo, da)))
+
+    # Floating weekday holidays
+    holidays.add(_nth_weekday(year, 1, 0, 3))   # MLK Day: 3rd Mon of Jan
+    holidays.add(_nth_weekday(year, 2, 0, 3))   # Presidents Day: 3rd Mon of Feb
+    holidays.add(_last_weekday(year, 5, 0))      # Memorial Day: last Mon of May
+    holidays.add(_nth_weekday(year, 9, 0, 1))   # Labor Day: 1st Mon of Sep
+    holidays.add(_nth_weekday(year, 11, 3, 4))  # Thanksgiving: 4th Thu of Nov
+
+    # Good Friday: always the Friday before Easter (no observation needed)
+    holidays.add(_easter(year) - timedelta(days=2))
+
+    return frozenset(holidays)
+
+
+# ── Public holiday API ────────────────────────────────────────────────────────
+
+#: Precomputed NYSE holiday set covering 2026–2028.
+#: Used by is_market_open() for O(1) lookups.
+US_MARKET_HOLIDAYS: frozenset[date] = frozenset(
+    h for yr in range(2026, 2029) for h in _nyse_holidays(yr)
+)
+
+
+def is_market_open(dt: date) -> bool:
+    """
+    Return True when the NYSE is open for regular trading on dt.
+
+    Returns False on weekends and on NYSE-observed holidays for 2026–2028.
+    Holidays outside that window default to weekday-only check (no holiday
+    database loaded for other years).
+
+    Args:
+        dt: Calendar date to check.
+
+    Returns:
+        bool — True means the exchange is expected to be open.
+    """
+    if dt.weekday() >= 5:   # Saturday=5, Sunday=6
+        return False
+    return dt not in US_MARKET_HOLIDAYS
 
 # ── DST transition calendar ────────────────────────────────────────────────────
 # US DST: clocks spring forward (2nd Sun of March, 2 AM → 3 AM EDT)
