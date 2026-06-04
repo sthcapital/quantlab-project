@@ -2451,3 +2451,158 @@ class TestWatchlist:
     def test_trading_days_one_week(self):
         from quantlab.watchlist import _trading_days_elapsed
         assert _trading_days_elapsed(date(2026, 6, 1), date(2026, 6, 8)) == 5
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# market_calendar — DST detection, UTC conversion, cron schedule builder
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMarketCalendar:
+    """All tests use fixed dates — no system-clock dependency."""
+
+    # ── DST transition dates ──────────────────────────────────────────────────
+
+    def test_dst_transitions_list_has_six_entries(self):
+        from quantlab.market_calendar import DST_TRANSITIONS
+        assert len(DST_TRANSITIONS) == 6
+
+    def test_dst_transitions_cover_2026_to_2028(self):
+        from quantlab.market_calendar import DST_TRANSITIONS
+        years = {d.year for _, d, _ in DST_TRANSITIONS}
+        assert years == {2026, 2027, 2028}
+
+    def test_dst_spring_dates_correct(self):
+        from quantlab.market_calendar import DST_TRANSITIONS
+        from datetime import date
+        springs = {key: d for key, d, _ in DST_TRANSITIONS if "spring" in key}
+        assert springs["spring_2026"] == date(2026,  3,  8)
+        assert springs["spring_2027"] == date(2027,  3, 14)
+        assert springs["spring_2028"] == date(2028,  3, 13)
+
+    def test_dst_fall_dates_correct(self):
+        from quantlab.market_calendar import DST_TRANSITIONS
+        from datetime import date
+        falls = {key: d for key, d, _ in DST_TRANSITIONS if "fall" in key}
+        assert falls["fall_2026"] == date(2026, 11,  1)
+        assert falls["fall_2027"] == date(2027, 11,  7)
+        assert falls["fall_2028"] == date(2028, 11,  5)
+
+    # ── is_dst / utc_offset_hours ─────────────────────────────────────────────
+
+    def test_is_dst_summer_true(self):
+        from quantlab.market_calendar import is_dst
+        from datetime import date
+        assert is_dst(date(2026, 6, 4)) is True      # June = EDT
+
+    def test_is_dst_winter_false(self):
+        from quantlab.market_calendar import is_dst
+        from datetime import date
+        assert is_dst(date(2026, 1, 15)) is False     # January = EST
+
+    def test_is_dst_spring_forward_day_true(self):
+        from quantlab.market_calendar import is_dst
+        from datetime import date
+        # By noon on March 8 2026 clocks have already sprung forward
+        assert is_dst(date(2026, 3, 8)) is True
+
+    def test_is_dst_fall_back_day_false(self):
+        from quantlab.market_calendar import is_dst
+        from datetime import date
+        # By noon on November 1 2026 clocks have already fallen back
+        assert is_dst(date(2026, 11, 1)) is False
+
+    def test_utc_offset_edt(self):
+        from quantlab.market_calendar import utc_offset_hours
+        from datetime import date
+        assert utc_offset_hours(date(2026, 6, 4)) == -4
+
+    def test_utc_offset_est(self):
+        from quantlab.market_calendar import utc_offset_hours
+        from datetime import date
+        assert utc_offset_hours(date(2026, 1, 15)) == -5
+
+    # ── to_utc / named getters ────────────────────────────────────────────────
+
+    def test_scan_utc_during_edt(self):
+        from quantlab.market_calendar import get_scan_utc
+        from datetime import date
+        t = get_scan_utc(date(2026, 6, 4))
+        assert t.hour == 13 and t.minute == 0    # 9:00 AM EDT = 13:00 UTC
+
+    def test_scan_utc_during_est(self):
+        from quantlab.market_calendar import get_scan_utc
+        from datetime import date
+        t = get_scan_utc(date(2026, 1, 15))
+        assert t.hour == 14 and t.minute == 0    # 9:00 AM EST = 14:00 UTC
+
+    def test_eod_utc_during_edt(self):
+        from quantlab.market_calendar import get_eod_utc
+        from datetime import date
+        t = get_eod_utc(date(2026, 6, 4))
+        assert t.hour == 20 and t.minute == 30   # 4:30 PM EDT = 20:30 UTC
+
+    def test_eod_utc_during_est(self):
+        from quantlab.market_calendar import get_eod_utc
+        from datetime import date
+        t = get_eod_utc(date(2026, 1, 15))
+        assert t.hour == 21 and t.minute == 30   # 4:30 PM EST = 21:30 UTC
+
+    def test_market_open_utc_edt(self):
+        from quantlab.market_calendar import get_market_open_utc
+        from datetime import date
+        t = get_market_open_utc(date(2026, 6, 4))
+        assert t.hour == 13 and t.minute == 30   # 9:30 AM EDT = 13:30 UTC
+
+    def test_market_open_utc_est(self):
+        from quantlab.market_calendar import get_market_open_utc
+        from datetime import date
+        t = get_market_open_utc(date(2026, 1, 15))
+        assert t.hour == 14 and t.minute == 30   # 9:30 AM EST = 14:30 UTC
+
+    def test_utc_time_cron_fields_format(self):
+        from quantlab.market_calendar import UtcTime
+        t = UtcTime(13, 0)
+        assert t.cron_fields() == "0 13"
+
+    def test_utc_time_str(self):
+        from quantlab.market_calendar import UtcTime
+        assert str(UtcTime(13, 0)) == "13:00 UTC"
+        assert str(UtcTime(20, 30)) == "20:30 UTC"
+
+    # ── cron_schedule_for_date ────────────────────────────────────────────────
+
+    def test_cron_schedule_edt(self):
+        from quantlab.market_calendar import cron_schedule_for_date
+        from datetime import date
+        s = cron_schedule_for_date(date(2026, 6, 4))
+        assert s["scan_cron"]  == "0 13"
+        assert s["eod_cron"]   == "30 20"
+        assert s["tz_name"]    == "EDT"
+        assert s["utc_offset"] == "-4"
+        assert s["scan_utc"]   == "13:00 UTC"
+        assert s["eod_utc"]    == "20:30 UTC"
+
+    def test_cron_schedule_est(self):
+        from quantlab.market_calendar import cron_schedule_for_date
+        from datetime import date
+        s = cron_schedule_for_date(date(2026, 1, 15))
+        assert s["scan_cron"]  == "0 14"
+        assert s["eod_cron"]   == "30 21"
+        assert s["tz_name"]    == "EST"
+        assert s["utc_offset"] == "-5"
+
+    def test_cron_schedule_differs_edt_vs_est(self):
+        from quantlab.market_calendar import cron_schedule_for_date
+        from datetime import date
+        edt = cron_schedule_for_date(date(2026, 6, 4))
+        est = cron_schedule_for_date(date(2026, 1, 15))
+        assert edt["scan_cron"] != est["scan_cron"]
+        assert edt["eod_cron"]  != est["eod_cron"]
+
+    def test_to_utc_round_trip_consistency(self):
+        from quantlab.market_calendar import to_utc, get_scan_utc
+        from datetime import date, time
+        d = date(2027, 3, 14)   # spring forward day 2027
+        direct = get_scan_utc(d)
+        via_to_utc = to_utc(time(9, 0), d)
+        assert direct == via_to_utc
