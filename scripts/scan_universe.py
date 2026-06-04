@@ -48,6 +48,8 @@ def main() -> None:
                         help="Enrich results with IBKR options flow (PCR, IV skew, unusual calls)")
     parser.add_argument("--save-db", action="store_true",
                         help="Persist all scan results (not just actionable) to DuckDB")
+    parser.add_argument("--add-to-watchlist", action="store_true",
+                        help="Add setups scoring >= 0.70 to the DuckDB watchlist table")
     parser.add_argument("--multi-lookback", action="store_true",
                         help="Run a secondary scan to confirm signals across two lookbacks")
     parser.add_argument("--secondary-lookback", type=int, default=20,
@@ -208,6 +210,14 @@ def main() -> None:
                               args.signal)
         append_scan_results(scan_id, results)
         print(f"db  → {len(results)} scan result(s) stored (scan_id={scan_id})")
+
+    # ── Watchlist ──────────────────────────────────────────────────────────────
+    if args.add_to_watchlist:
+        from quantlab.watchlist import add_to_watchlist
+        added = sum(1 for r in results if add_to_watchlist(r))
+        total_qualifying = sum(1 for r in results if r.conviction_score >= 0.70)
+        print(f"watchlist → {added}/{total_qualifying} setup(s) added "
+              f"(conviction ≥ 0.70)")
 
 
 if __name__ == "__main__":

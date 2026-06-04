@@ -280,6 +280,35 @@ def _ensure_schema(con) -> None:
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist (
+            watch_id            VARCHAR PRIMARY KEY,  -- symbol_YYYY-MM-DD
+            symbol              VARCHAR,
+            date_added          DATE,
+            entry_price         DOUBLE,
+            atr_stop            DOUBLE,
+            conviction_score    DOUBLE,
+            signal_layers       VARCHAR,   -- comma-separated labels of layers that fired
+            lookback            INTEGER,
+            signal_type         VARCHAR,
+            -- Forward return tracking (filled by track_forward_returns.py)
+            price_1d            DOUBLE,
+            price_3d            DOUBLE,
+            price_5d            DOUBLE,
+            realized_ret_1d     DOUBLE,
+            realized_ret_3d     DOUBLE,
+            realized_ret_5d     DOUBLE,
+            -- Live tracking
+            current_price       DOUBLE,
+            unrealized_ret      DOUBLE,
+            days_on_watch       INTEGER DEFAULT 0,
+            -- Status lifecycle: watching → triggered/stopped_out/expired
+            status              VARCHAR DEFAULT 'watching',
+            date_updated        DATE,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 
 def save_equity_curve_chart(
     equity_curve: list[float],

@@ -2227,3 +2227,227 @@ class TestOptionsConvictionLayer:
         )
         # 0.30+0.20+0.10+0.05+0.05+0.15 = 0.85 — no clamp needed
         assert score_conviction(r) == pytest.approx(0.85, abs=1e-9)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Watchlist — add, retrieve, forward return tracking
+# All tests use a tmp_path DuckDB — no live IBKR required.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWatchlist:
+
+    def _mock_result(self, symbol: str, conviction: float,
+                     entry_price: float = 100.0, atr_stop: float = 95.0):
+        """Create a minimal ScanResult-like object for watchlist tests."""
+        return ScanResult(
+            symbol=symbol, scan_date="2026-06-04",
+            signal_type="breakout", signal=True,
+            entry_close=entry_price, indicator_value=None, lookback=5,
+            regime_bullish=True,
+            conviction_score=conviction,
+            atr_stop=atr_stop,
+            earnings_acceleration=0.85 if conviction >= 0.70 else 0.0,
+            multi_lookback_confirmed=conviction >= 0.70,
+        )
+
+    def _setup_db(self, tmp_path, monkeypatch):
+        """Point watchlist storage at a tmp DuckDB."""
+        import quantlab.storage as _storage
+        import quantlab.watchlist as _watchlist
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test.duckdb")
+        monkeypatch.setattr(_watchlist, "DB_PATH", tmp_path / "test.duckdb")
+        return str(tmp_path / "test.duckdb")
+
+    # ── add_to_watchlist ──────────────────────────────────────────────────────
+
+    def test_add_inserts_high_conviction_entry(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist
+        r = self._mock_result("UNH", conviction=0.75)
+        added = add_to_watchlist(r)
+        assert added is True
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        row = con.execute("SELECT symbol, conviction_score, status FROM watchlist").fetchone()
+        con.close()
+        assert row is not None
+        assert row[0] == "UNH"
+        assert abs(row[1] - 0.75) < 1e-6
+        assert row[2] == "watching"
+
+    def test_add_rejects_low_conviction(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist
+        r = self._mock_result("JPM", conviction=0.60)
+        added = add_to_watchlist(r)
+        assert added is False
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        n = con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
+        con.close()
+        assert n == 0
+
+    def test_add_is_idempotent_same_symbol_same_day(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist
+        r = self._mock_result("ABT", conviction=0.72)
+        add_to_watchlist(r)
+        add_to_watchlist(r)   # second call same day — should be ignored
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        n = con.execute("SELECT COUNT(*) FROM watchlist").fetchone()[0]
+        con.close()
+        assert n == 1
+
+    def test_layers_fired_captured_correctly(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist
+        r = self._mock_result("UNH", conviction=0.75)
+        # Manually set layers on mock result
+        r.multi_lookback_confirmed = True
+        r.earnings_acceleration = 0.85
+        add_to_watchlist(r)
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        layers = con.execute("SELECT signal_layers FROM watchlist").fetchone()[0]
+        con.close()
+        assert "EARN" in layers
+        assert "MULTI_LB" in layers
+
+    # ── get_active_watchlist ──────────────────────────────────────────────────
+
+    def test_get_active_returns_watching_entries(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist, get_active_watchlist
+        for sym, conv in [("UNH", 0.75), ("ABT", 0.72), ("UPS", 0.68)]:
+            add_to_watchlist(self._mock_result(sym, conv))
+        # UPS below threshold → not added
+        active = get_active_watchlist(db_path=db)
+        assert len(active) == 2
+        assert all(e["status"] == "watching" for e in active)
+        assert active[0]["conviction_score"] >= active[1]["conviction_score"]
+
+    def test_get_active_returns_empty_when_none(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import get_active_watchlist
+        assert get_active_watchlist(db_path=db) == []
+
+    # ── update_forward_return ─────────────────────────────────────────────────
+
+    def test_update_forward_return_records_1d(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist, update_forward_return
+        r = self._mock_result("ABT", conviction=0.73, entry_price=90.0)
+        add_to_watchlist(r)
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        watch_id = con.execute("SELECT watch_id FROM watchlist").fetchone()[0]
+        con.close()
+        update_forward_return(watch_id, 1, 91.5, 0.0167, db_path=db)
+        con = duckdb.connect(db)
+        _ensure_schema(con)
+        row = con.execute("SELECT price_1d, realized_ret_1d FROM watchlist").fetchone()
+        con.close()
+        assert row[0] == pytest.approx(91.5, abs=1e-6)
+        assert row[1] == pytest.approx(0.0167, abs=1e-4)
+
+    def test_update_forward_return_all_horizons(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist, update_forward_return
+        r = self._mock_result("UNH", conviction=0.75, entry_price=399.0)
+        add_to_watchlist(r)
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        watch_id = con.execute("SELECT watch_id FROM watchlist").fetchone()[0]
+        con.close()
+        update_forward_return(watch_id, 1, 401.0, 0.005,  db_path=db)
+        update_forward_return(watch_id, 3, 405.0, 0.015,  db_path=db)
+        update_forward_return(watch_id, 5, 410.0, 0.0275, db_path=db)
+        con = duckdb.connect(db)
+        _ensure_schema(con)
+        row = con.execute(
+            "SELECT realized_ret_1d, realized_ret_3d, realized_ret_5d FROM watchlist"
+        ).fetchone()
+        con.close()
+        assert all(v is not None for v in row)
+        assert row[2] > row[1] > row[0]   # returns grew over time
+
+    # ── get_watchlist_summary ─────────────────────────────────────────────────
+
+    def test_summary_reflects_returns(self, tmp_path, monkeypatch):
+        db = self._setup_db(tmp_path, monkeypatch)
+        from quantlab.watchlist import add_to_watchlist, update_forward_return, \
+            get_watchlist_summary
+        r = self._mock_result("UNH", conviction=0.75, entry_price=399.0)
+        add_to_watchlist(r)
+        import duckdb
+        con = duckdb.connect(db)
+        from quantlab.storage import _ensure_schema
+        _ensure_schema(con)
+        watch_id = con.execute("SELECT watch_id FROM watchlist").fetchone()[0]
+        con.close()
+        update_forward_return(watch_id, 1, 403.0, 0.01, db_path=db)
+        summary = get_watchlist_summary(db_path=db)
+        assert summary["total"] == 1
+        assert summary["ret_1d"]["avg"] == pytest.approx(0.01, abs=1e-6)
+        assert summary["ret_1d"]["hit_rate"] == pytest.approx(1.0, abs=1e-6)
+
+    # ── _layers_fired helper ──────────────────────────────────────────────────
+
+    def test_layers_fired_captures_all_active_layers(self):
+        from quantlab.watchlist import _layers_fired
+        r = ScanResult(
+            symbol="UNH", scan_date="2026-06-04",
+            signal_type="breakout", signal=True,
+            entry_close=399.0, indicator_value=None, lookback=5,
+            regime_bullish=True,
+            earnings_acceleration=0.85,
+            accumulation_ratio=0.70,
+            multi_lookback_confirmed=True,
+            news_count=2, news_category="earnings",
+            conviction_score=0.85,
+        )
+        layers = _layers_fired(r)
+        assert "REGIME" in layers
+        assert "EARN" in layers
+        assert "ACCUM" in layers
+        assert "MULTI_LB" in layers
+        assert "NEWS:earnings" in layers
+
+    def test_layers_fired_minimal_signal(self):
+        from quantlab.watchlist import _layers_fired
+        r = ScanResult(
+            symbol="JPM", scan_date="2026-06-04",
+            signal_type="breakout", signal=True,
+            entry_close=307.0, indicator_value=None, lookback=5,
+            regime_bullish=False, conviction_score=0.30,
+        )
+        assert _layers_fired(r) == "signal"
+
+    # ── _trading_days_elapsed ─────────────────────────────────────────────────
+
+    def test_trading_days_zero_same_day(self):
+        from quantlab.watchlist import _trading_days_elapsed
+        d = date(2026, 6, 4)   # Thursday
+        assert _trading_days_elapsed(d, d) == 0
+
+    def test_trading_days_counts_weekdays_only(self):
+        from quantlab.watchlist import _trading_days_elapsed
+        # Friday June 5 → next Monday June 8: skip weekend
+        assert _trading_days_elapsed(date(2026, 6, 5), date(2026, 6, 8)) == 1
+
+    def test_trading_days_one_week(self):
+        from quantlab.watchlist import _trading_days_elapsed
+        assert _trading_days_elapsed(date(2026, 6, 1), date(2026, 6, 8)) == 5

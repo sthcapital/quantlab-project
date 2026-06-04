@@ -114,6 +114,7 @@ SCAN_ARGS=(
     --multi-lookback
     --secondary-lookback "$SECONDARY_LOOKBACK"
     --save-db
+    --add-to-watchlist
 )
 [[ -z "$WITH_NEWS"    ]] && SCAN_ARGS+=(--no-news)
 [[ -n "$WITH_OPTIONS" ]] && SCAN_ARGS+=(--with-options)
@@ -172,6 +173,15 @@ else
         log "─── Backtest complete: $SYM"
     done
 fi
+
+# ── Forward return tracking (run after close — records 1D/3D/5D returns) ──────
+# This updates watchlist entries that hit their return horizon today.
+# Safe to run in the morning scan too — it simply finds nothing to update yet.
+log "Updating forward returns for watchlist entries ..."
+python scripts/track_forward_returns.py \
+    --host "$IBKR_HOST" \
+    --port "$IBKR_PORT" \
+    2>&1 | tee -a "$LOG_FILE" || log "WARNING: forward return tracking failed"
 
 # ── Footer ───────────────────────────────────────────────────────────────────────
 {
