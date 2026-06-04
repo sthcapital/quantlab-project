@@ -62,8 +62,10 @@ DEFAULT_CONFIG = {
         "host": "172.23.208.1",  # Windows host IP as seen from WSL2
         "port": 7497,
         "client_id": 1,          # historical data
-        "spot_client_id": 51,    # get_spot_price — dedicated slot avoids collision
-        "news_client_id": 41,    # news fetch in scanner — dedicated slot
+        "spot_client_id": 51,              # get_spot_price — dedicated slot avoids collision
+        "news_client_id": 41,              # news fetch in scanner — dedicated slot
+        "options_chain_client_id": 21,     # reqSecDefOptParams / option chain scan
+        "options_quotes_client_id": 22,    # reqTickers for option Greeks/IV
         "timeout": 10,
     },
     "backtest": {

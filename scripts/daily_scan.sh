@@ -40,7 +40,11 @@ BACKTEST_START="$(date -d '2 years ago' +%Y-%m-%d 2>/dev/null \
 BACKTEST_END="$(date +%Y-%m-%d)"
 
 WITH_NEWS=""
-[[ "${1:-}" == "--with-news" ]] && WITH_NEWS="true"
+WITH_OPTIONS=""
+for _arg in "$@"; do
+    [[ "$_arg" == "--with-news"    ]] && WITH_NEWS="true"
+    [[ "$_arg" == "--with-options" ]] && WITH_OPTIONS="true"
+done
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
 ts()  { date '+%Y-%m-%d %H:%M:%S'; }
@@ -69,6 +73,11 @@ cd "$PROJECT_DIR"
         echo "  News      : enabled"
     else
         echo "  News      : disabled  (pass --with-news to enable)"
+    fi
+    if [[ -n "$WITH_OPTIONS" ]]; then
+        echo "  Options   : enabled"
+    else
+        echo "  Options   : disabled  (pass --with-options to enable)"
     fi
     echo "  Backtest  : $BACKTEST_START → $BACKTEST_END  (2-year window)"
     sep
@@ -106,7 +115,8 @@ SCAN_ARGS=(
     --secondary-lookback "$SECONDARY_LOOKBACK"
     --save-db
 )
-[[ -z "$WITH_NEWS" ]] && SCAN_ARGS+=(--no-news)
+[[ -z "$WITH_NEWS"    ]] && SCAN_ARGS+=(--no-news)
+[[ -n "$WITH_OPTIONS" ]] && SCAN_ARGS+=(--with-options)
 
 # Capture and tee simultaneously; || true prevents set -e from aborting on
 # a non-zero exit (e.g. if the scanner finds no setups and exits non-zero).

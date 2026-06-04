@@ -103,6 +103,9 @@ class ScanResult:
     volume_trend: float = 0.0          # volume_trend_score()       (informational)
     climactic_volume: float = 0.0      # climactic_volume_score()   ≥ 0.7 → +0.07
 
+    # Options flow conviction (requires live IBKR chain; enriched post-scan)
+    options_conviction: float = 0.0  # compute_options_score() ≥ 0.6 → +0.10; ≥ 0.8 → +0.15
+
     # Multi-lookback confirmation (set post-scan when signal fires at ≥2 lookbacks)
     multi_lookback_confirmed: bool = False  # True → +0.05 structural confirmation bonus
 
@@ -137,6 +140,8 @@ def score_conviction(result: ScanResult) -> float:
         Accumulation days ratio ≥ 0.6   : 0.08
         Climactic volume ≥ 0.7          : 0.07
         Multi-lookback confirmed        : 0.05  (signal fires at ≥2 lookback values)
+        Options conviction ≥ 0.6       : 0.10  (bullish PCR/unusual calls/IV skew)
+        Options conviction ≥ 0.8       : 0.15  (replaces the 0.10 — strong signal)
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -185,6 +190,12 @@ def score_conviction(result: ScanResult) -> float:
     # Multi-lookback structural confirmation
     if result.multi_lookback_confirmed:
         score += 0.05
+
+    # Options flow conviction (PCR + unusual calls + IV skew)
+    if result.options_conviction >= 0.8:
+        score += 0.15
+    elif result.options_conviction >= 0.6:
+        score += 0.10
 
     return max(0.0, min(score, 1.0))
 

@@ -2000,3 +2000,230 @@ class TestMultiLookbackConfirmation:
         )
         # 0.30+0.20+0.20+0.10+0.10+0.05+0.10+0.10+0.10+0.08+0.07+0.05 = 1.45 → 1.0
         assert score_conviction(r) == pytest.approx(1.0, abs=1e-9)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Options flow signals (quantlab.signals.options_flow)
+# All tests use synthetic ChainData — no IBKR connection required.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOptionsFlow:
+    """Factory helpers that build realistic mock ChainData objects."""
+
+    @staticmethod
+    def _chain(
+        spot: float = 200.0,
+        strikes: list[float] | None = None,
+        call_vols: list[float] | None = None,
+        put_vols:  list[float] | None = None,
+        call_ivs:  list[float] | None = None,
+        put_ivs:   list[float] | None = None,
+    ):
+        from quantlab.signals.options_flow import ChainData, OptionContract
+        strikes = strikes or [185.0, 190.0, 195.0, 200.0, 205.0, 210.0, 215.0]
+        call_vols = call_vols or [100.0] * len(strikes)
+        put_vols  = put_vols  or [100.0] * len(strikes)
+        call_ivs  = call_ivs  or [0.25] * len(strikes)
+        put_ivs   = put_ivs   or [0.25] * len(strikes)
+
+        contracts = []
+        for i, strike in enumerate(strikes):
+            contracts.append(OptionContract(
+                strike=strike, right="C", expiry="20261219",
+                volume=call_vols[i], implied_vol=call_ivs[i], bid=1.0, ask=1.2,
+            ))
+            contracts.append(OptionContract(
+                strike=strike, right="P", expiry="20261219",
+                volume=put_vols[i], implied_vol=put_ivs[i], bid=1.0, ask=1.2,
+            ))
+        return ChainData(symbol="TEST", spot=spot, expiry="20261219",
+                         contracts=contracts)
+
+    # ── put_call_ratio ────────────────────────────────────────────────────────
+
+    def test_pcr_bullish_when_calls_dominate(self):
+        from quantlab.signals.options_flow import put_call_ratio
+        # ATM calls at 10× put volume → pcr ≈ 0.10
+        chain = self._chain(spot=200.0, call_vols=[1000.0]*7, put_vols=[100.0]*7)
+        assert put_call_ratio(chain) < 0.70
+
+    def test_pcr_bearish_when_puts_dominate(self):
+        from quantlab.signals.options_flow import put_call_ratio
+        chain = self._chain(spot=200.0, call_vols=[100.0]*7, put_vols=[1000.0]*7)
+        assert put_call_ratio(chain) > 1.0
+
+    def test_pcr_neutral_no_calls(self):
+        from quantlab.signals.options_flow import put_call_ratio, ChainData
+        chain = ChainData("X", 200.0, "20261219", contracts=[])
+        assert put_call_ratio(chain) == 1.0
+
+    def test_pcr_atm_band_filters_otm(self):
+        from quantlab.signals.options_flow import put_call_ratio, ChainData, OptionContract
+        # OTM call spike should NOT affect ATM PCR
+        contracts = [
+            OptionContract(200.0, "C", "20261219", volume=100.0),  # ATM call
+            OptionContract(200.0, "P", "20261219", volume=100.0),  # ATM put
+            OptionContract(220.0, "C", "20261219", volume=5000.0), # far OTM — excluded
+        ]
+        chain = ChainData("X", 200.0, "20261219", contracts=contracts)
+        pcr = put_call_ratio(chain, atm_band_pct=0.05)
+        assert abs(pcr - 1.0) < 0.01   # 100 puts / 100 ATM calls = 1.0
+
+    # ── unusual_call_activity ─────────────────────────────────────────────────
+
+    def test_unusual_detected_on_volume_spike(self):
+        from quantlab.signals.options_flow import unusual_call_activity
+        # One call has 5× average
+        vols = [100.0, 100.0, 100.0, 500.0, 100.0, 100.0, 100.0]
+        chain = self._chain(call_vols=vols)
+        is_unusual, ratio = unusual_call_activity(chain, avg_volume_threshold=2.0)
+        assert is_unusual is True
+        assert ratio > 2.0
+
+    def test_not_unusual_on_uniform_volume(self):
+        from quantlab.signals.options_flow import unusual_call_activity
+        chain = self._chain(call_vols=[100.0]*7)
+        is_unusual, ratio = unusual_call_activity(chain)
+        assert is_unusual is False
+        assert ratio == pytest.approx(1.0, abs=0.01)
+
+    def test_unusual_returns_correct_ratio(self):
+        from quantlab.signals.options_flow import unusual_call_activity
+        # max=300, avg=(100+100+300)/3=166.7, ratio≈1.80
+        chain = self._chain(
+            strikes=[190.0, 200.0, 210.0],
+            call_vols=[100.0, 100.0, 300.0],
+            put_vols=[100.0]*3, call_ivs=[0.25]*3, put_ivs=[0.25]*3,
+        )
+        _, ratio = unusual_call_activity(chain)
+        assert ratio == pytest.approx(300.0 / (500.0/3), abs=0.01)
+
+    def test_unusual_returns_false_on_too_few_contracts(self):
+        from quantlab.signals.options_flow import unusual_call_activity, ChainData, OptionContract
+        chain = ChainData("X", 200.0, "20261219", contracts=[
+            OptionContract(200.0, "C", "20261219", volume=500.0)  # only 1 call
+        ])
+        is_unusual, _ = unusual_call_activity(chain)
+        assert is_unusual is False
+
+    # ── iv_skew_score ─────────────────────────────────────────────────────────
+
+    def test_iv_skew_neutral_at_parity(self):
+        from quantlab.signals.options_flow import iv_skew_score
+        chain = self._chain(call_ivs=[0.25]*7, put_ivs=[0.25]*7)
+        score = iv_skew_score(chain)
+        assert score == pytest.approx(0.5, abs=0.05)
+
+    def test_iv_skew_bullish_when_calls_pricier(self):
+        from quantlab.signals.options_flow import iv_skew_score
+        # OTM calls at IV=0.35 vs OTM puts at IV=0.20
+        chain = self._chain(
+            spot=200.0,
+            strikes=[185.0, 190.0, 200.0, 210.0, 215.0],
+            call_ivs=[0.25, 0.25, 0.25, 0.35, 0.35],  # OTM calls expensive
+            put_ivs =[0.30, 0.28, 0.25, 0.22, 0.20],  # normal smirk
+        )
+        assert iv_skew_score(chain) > 0.5
+
+    def test_iv_skew_bearish_when_puts_pricier(self):
+        from quantlab.signals.options_flow import iv_skew_score
+        chain = self._chain(
+            spot=200.0,
+            strikes=[185.0, 190.0, 200.0, 210.0, 215.0],
+            call_ivs=[0.20, 0.22, 0.25, 0.27, 0.28],
+            put_ivs =[0.35, 0.33, 0.25, 0.22, 0.20],  # heavy put premium
+        )
+        assert iv_skew_score(chain) < 0.5
+
+    def test_iv_skew_neutral_when_no_iv_data(self):
+        from quantlab.signals.options_flow import iv_skew_score, ChainData, OptionContract
+        chain = ChainData("X", 200.0, "20261219", contracts=[
+            OptionContract(200.0, "C", "20261219", implied_vol=None),
+            OptionContract(200.0, "P", "20261219", implied_vol=None),
+        ])
+        assert iv_skew_score(chain) == 0.5
+
+    def test_iv_skew_in_range(self):
+        from quantlab.signals.options_flow import iv_skew_score
+        chain = self._chain(call_ivs=[0.30]*7, put_ivs=[0.20]*7)
+        assert 0.0 <= iv_skew_score(chain) <= 1.0
+
+    # ── compute_options_score ─────────────────────────────────────────────────
+
+    def test_score_zero_on_bearish_chain(self):
+        from quantlab.signals.options_flow import compute_options_score
+        # High PCR (more puts) + no unusual calls + normal skew → score=0
+        chain = self._chain(call_vols=[100.0]*7, put_vols=[500.0]*7,
+                            call_ivs=[0.25]*7, put_ivs=[0.30]*7)
+        assert compute_options_score(chain) == pytest.approx(0.0, abs=0.01)
+
+    def test_score_high_on_full_bullish_chain(self):
+        from quantlab.signals.options_flow import compute_options_score
+        # PCR < 0.5 (+0.60) + unusual calls (+0.25) + positive skew (+0.15) = 1.0
+        chain = self._chain(
+            call_vols=[500.0, 500.0, 500.0, 2500.0, 500.0, 500.0, 500.0],
+            put_vols =[50.0] * 7,
+            call_ivs =[0.22, 0.23, 0.24, 0.35, 0.36, 0.37, 0.38],
+            put_ivs  =[0.30, 0.29, 0.28, 0.26, 0.25, 0.24, 0.23],
+        )
+        score = compute_options_score(chain)
+        assert score >= 0.85   # PCR well below 0.5, unusual spike, positive skew
+
+    def test_score_in_range(self):
+        from quantlab.signals.options_flow import compute_options_score
+        chain = self._chain()
+        assert 0.0 <= compute_options_score(chain) <= 1.0
+
+    def test_moderate_score_for_moderate_pcr(self):
+        from quantlab.signals.options_flow import compute_options_score
+        # PCR = 0.6 (between 0.5 and 0.7) → +0.40 only
+        chain = self._chain(call_vols=[100.0]*7, put_vols=[60.0]*7)
+        score = compute_options_score(chain)
+        assert score >= 0.40   # at least the PCR contribution
+
+
+# ── options_conviction wired into score_conviction ────────────────────────────
+
+class TestOptionsConvictionLayer:
+
+    def _r(self, **kw) -> ScanResult:
+        defaults = dict(symbol="UNH", scan_date="2026-06-04",
+                        signal_type="breakout", signal=True,
+                        entry_close=399.0, indicator_value=None, lookback=5,
+                        regime_bullish=False)
+        defaults.update(kw)
+        return ScanResult(**defaults)
+
+    def test_options_below_threshold_no_boost(self):
+        r = self._r(options_conviction=0.59)
+        # signal(0.30) only — regime off, no other layers
+        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+
+    def test_options_ge_0_6_adds_0_10(self):
+        low  = score_conviction(self._r(options_conviction=0.59))
+        high = score_conviction(self._r(options_conviction=0.60))
+        assert high - low == pytest.approx(0.10, abs=1e-9)
+
+    def test_options_ge_0_8_adds_0_15(self):
+        low  = score_conviction(self._r(options_conviction=0.59))
+        high = score_conviction(self._r(options_conviction=0.80))
+        assert high - low == pytest.approx(0.15, abs=1e-9)
+
+    def test_options_0_8_replaces_0_6_not_stacks(self):
+        # 0.80 should give +0.15 total, not +0.10+0.15
+        mid   = score_conviction(self._r(options_conviction=0.70))
+        strong = score_conviction(self._r(options_conviction=0.85))
+        assert strong - mid == pytest.approx(0.05, abs=1e-9)  # 0.15 - 0.10 = 0.05
+
+    def test_options_field_defaults_zero(self):
+        r = ScanResult("UNH","2026-06-04","breakout",True,399.0,None,5)
+        assert r.options_conviction == 0.0
+
+    def test_full_conviction_with_options_clamped(self):
+        r = self._r(
+            regime_bullish=True, earnings_acceleration=0.8,
+            absorption=0.8, multi_lookback_confirmed=True,
+            options_conviction=0.85,
+        )
+        # 0.30+0.20+0.10+0.05+0.05+0.15 = 0.85 — no clamp needed
+        assert score_conviction(r) == pytest.approx(0.85, abs=1e-9)

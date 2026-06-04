@@ -44,6 +44,8 @@ def main() -> None:
     parser.add_argument("--client-id", type=int, default=ibkr_cfg["client_id"])
     parser.add_argument("--no-news", action="store_true",
                         help="Skip news fetching (faster, price-only scan)")
+    parser.add_argument("--with-options", action="store_true",
+                        help="Enrich results with IBKR options flow (PCR, IV skew, unusual calls)")
     parser.add_argument("--save-db", action="store_true",
                         help="Persist all scan results (not just actionable) to DuckDB")
     parser.add_argument("--multi-lookback", action="store_true",
@@ -154,6 +156,7 @@ def main() -> None:
             f"  cv={r.climactic_volume:.2f}"
         )
         multi_str = " ✓" if r.multi_lookback_confirmed else "  "
+        opt_str   = f"  opt={r.options_conviction:.2f}" if r.options_conviction > 0 else ""
         print(
             f"  {i:2d}. {r.symbol:<8} "
             f"conviction={r.conviction_score:.2f}{multi_str}  "
@@ -161,10 +164,43 @@ def main() -> None:
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
-            f"{ea_str}{vol_str}{rv_str}{stop_str}"
+            f"{ea_str}{opt_str}{vol_str}{rv_str}{stop_str}"
         )
 
     print(f"\n{'='*60}\n")
+
+    # ── Options flow enrichment (IBKR connection on options_client_id) ─────────
+    if args.with_options and args.provider == "ibkr" and results:
+        from quantlab.signals.options_flow import options_conviction_score
+        from quantlab.execution import score_conviction
+        from ib_insync import IB
+
+        options_client_id = ibkr_cfg.get("options_chain_client_id", 21)
+        print(f"Fetching options flow ({len(results)} symbols, "
+              f"client_id={options_client_id}) ...")
+        ib_opt = IB()
+        try:
+            ib_opt.connect(args.host, args.port,
+                           clientId=options_client_id, timeout=10)
+            for r in results:
+                try:
+                    bars = list(provider.get_daily_bars(r.symbol, start_date, end_date))
+                    opt_score = options_conviction_score(r.symbol, bars, ib_opt)
+                    r.options_conviction = opt_score
+                    r.conviction_score   = score_conviction(r)
+                    flag = " ▲" if opt_score >= 0.6 else ""
+                    print(f"  {r.symbol:<8}  opt={opt_score:.2f}  "
+                          f"conv={r.conviction_score:.2f}{flag}")
+                except Exception as e:
+                    print(f"  {r.symbol:<8}  options ERROR — {e}")
+        except Exception as e:
+            print(f"[options] Connection failed: {e} — skipping options enrichment")
+        finally:
+            if ib_opt.isConnected():
+                ib_opt.disconnect()
+
+        results.sort(key=lambda r: r.conviction_score, reverse=True)
+        print()
 
     # ── Persist to DuckDB ─────────────────────────────────────────────────────
     if args.save_db:
