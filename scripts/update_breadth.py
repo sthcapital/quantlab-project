@@ -91,6 +91,17 @@ def recompute_rolling(days: int = 60) -> list[BreadthSnapshot]:
     return snapshots
 
 
+def _trading_days_between(start: date, end: date) -> list[date]:
+    """Return list of Mon-Fri market-open days from start to end inclusive."""
+    days: list[date] = []
+    current = start
+    while current <= end:
+        if is_market_open(current):
+            days.append(current)
+        current += timedelta(days=1)
+    return days
+
+
 def main() -> None:
     setup_logging(level="WARNING")
 
@@ -100,9 +111,52 @@ def main() -> None:
                         help="Skip Polygon fetch; only recompute rolling from DuckDB")
     parser.add_argument("--days-rolling", type=int, default=60,
                         help="Days of history to use for rolling metrics (default 60)")
+    # ── Backfill ──────────────────────────────────────────────────────────────
+    parser.add_argument("--backfill", action="store_true",
+                        help="Fetch a range of historical dates one at a time with rate-limit delays")
+    parser.add_argument("--start-date", default=None,
+                        help="Backfill start date YYYY-MM-DD (required with --backfill)")
+    parser.add_argument("--end-date", default=None,
+                        help="Backfill end date YYYY-MM-DD (default: today)")
     args = parser.parse_args()
 
     trade_date = date.fromisoformat(args.date) if args.date else date.today()
+
+    # ── Backfill mode: iterate trading days sequentially ──────────────────────
+    if args.backfill:
+        if not args.start_date:
+            raise SystemExit("--backfill requires --start-date YYYY-MM-DD")
+        start_bf = date.fromisoformat(args.start_date)
+        end_bf   = date.fromisoformat(args.end_date) if args.end_date else date.today()
+        days     = _trading_days_between(start_bf, end_bf)
+        api_key  = __import__("os").environ.get("POLYGON_API_KEY", "")
+        if not api_key:
+            raise SystemExit("POLYGON_API_KEY not set — cannot backfill")
+        from quantlab.providers.polygon import PolygonProvider
+        # grouped_daily_sleep=12s respects free-tier 5 req/min limit between dates
+        provider = PolygonProvider(api_key=api_key, grouped_daily_sleep=12.0)
+        print(f"\n{'='*62}")
+        print(f"  Backfill: {start_bf} → {end_bf}  ({len(days)} trading days)")
+        print(f"  Rate: 1 request per ~12s (Polygon free tier).  ETA: ~{len(days)*13//60}min")
+        print(f"{'='*62}")
+        stored = 0
+        for i, d in enumerate(days, 1):
+            snap = fetch_and_store(d, provider)
+            if snap:
+                save_breadth_snapshot(snap)
+                stored += 1
+                print(f"  [{i:>4}/{len(days)}] {d}  A={snap.advances} D={snap.declines}"
+                      f"  up4%={snap.up_4pct_count} dn4%={snap.down_4pct_count}")
+            else:
+                print(f"  [{i:>4}/{len(days)}] {d}  skipped (no data)")
+        # Recompute rolling after all dates are stored
+        print(f"\n  Stored {stored} snapshots.  Recomputing rolling metrics ...")
+        recompute_rolling(max(args.days_rolling, stored + 10))
+        latest = get_latest_snapshot()
+        if latest:
+            print(f"\n  Latest: {latest.summary_line()}")
+        print(f"{'='*62}\n")
+        return
 
     print(f"\n{'='*62}")
     print(f"  Breadth Update  —  {trade_date}")

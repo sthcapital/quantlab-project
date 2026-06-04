@@ -54,9 +54,36 @@ def main() -> None:
                         help="Run a secondary scan to confirm signals across two lookbacks")
     parser.add_argument("--secondary-lookback", type=int, default=20,
                         help="Secondary lookback for multi-lookback confirmation (default 20)")
+    parser.add_argument("--ignore-breadth", action="store_true",
+                        help="Skip breadth regime check — don't auto-raise min_conviction")
     args = parser.parse_args()
 
     ensure_dirs()
+
+    # ── Breadth regime check (before scan — adjusts threshold if bear tape) ───
+    from quantlab.signals.breadth import get_latest_snapshot
+    breadth_snap      = get_latest_snapshot()
+    breadth_override  = False
+    bear_tape_active  = False
+
+    if breadth_snap and not args.ignore_breadth:
+        _ratio = breadth_snap.ratio_10d
+        _mc    = breadth_snap.mcclellan_oscillator
+        _ad    = breadth_snap.ad_line
+        ratio_str = f"{_ratio:.2f}" if _ratio is not None else "--"
+        mc_str    = f"{_mc:+.0f}"   if _mc    is not None else "--"
+        ad_str    = f"{_ad:+,}"     if _ad    is not None else "--"
+        print(f"\n  Tape: {breadth_snap.tape} | "
+              f"10d-ratio={ratio_str} | McClellan={mc_str} | AD={ad_str}")
+
+        if breadth_snap.tape == "BEAR":
+            bear_tape_active = True
+            if args.min_conviction < 0.80:
+                print(f"  WARNING: Bear tape active — "
+                      f"conviction threshold raised to 0.80 (was {args.min_conviction:.2f})")
+                args.min_conviction = 0.80
+    elif not breadth_snap:
+        print("\n  Breadth: no data — run update_breadth.py after market close")
 
     symbols = (
         [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
@@ -90,8 +117,9 @@ def main() -> None:
             print(f"[scanner] News connection failed ({e}) — running price-only scan")
             ibkr_conn = None
 
+    bear_flag = "  ⚠ BEAR TAPE" if bear_tape_active else ""
     print(f"\n{'='*60}")
-    print(f"  QuantLab Universe Scanner")
+    print(f"  QuantLab Universe Scanner{bear_flag}")
     print(f"  {len(symbols)} symbols | signal={args.signal} | lookback={args.lookback}")
     print(f"  {start_date} → {end_date} | min_conviction={args.min_conviction}")
     print(f"{'='*60}\n")
@@ -115,14 +143,6 @@ def main() -> None:
     if not results:
         print("No actionable setups found today.\n")
         return
-
-    # ── Breadth tape summary ───────────────────────────────────────────────────
-    from quantlab.signals.breadth import get_latest_snapshot
-    _snap = get_latest_snapshot()
-    if _snap:
-        print(f"\n  {_snap.summary_line()}")
-    else:
-        print("\n  Breadth: no data (run update_breadth.py after market close)")
 
     # ── Multi-lookback confirmation ────────────────────────────────────────────
     # Run a fast secondary scan (bars already cached) to find symbols that also

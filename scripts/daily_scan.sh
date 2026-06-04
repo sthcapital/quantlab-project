@@ -31,7 +31,7 @@ UNIVERSE="sp500_sample"
 SIGNAL="breakout"
 LOOKBACK="5"
 SECONDARY_LOOKBACK="20"         # secondary lookback for multi-confirmation (lb=5 + lb=20)
-MIN_CONVICTION="0.4"
+MIN_CONVICTION="0.4"            # floor; auto-raised to 0.80 when breadth tape=BEAR
 HIGH_CONV_THRESHOLD="0.70"      # symbols above this trigger a backtest run
 
 # Two-year backtest window (GNU date / BSD date fallback for macOS)

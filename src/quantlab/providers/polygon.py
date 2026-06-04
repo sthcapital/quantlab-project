@@ -47,24 +47,77 @@ class PolygonProvider(MarketDataProvider):
         self,
         api_key: str | None = None,
         request_sleep: float = 0.25,
+        grouped_daily_sleep: float = 12.0,
+        max_retries: int = 3,
     ) -> None:
-        self.api_key      = api_key or os.environ.get("POLYGON_API_KEY", "")
-        self.request_sleep = request_sleep
-        self._session = requests.Session()
+        """
+        Args:
+            api_key:             Polygon API key (default: POLYGON_API_KEY env var).
+            request_sleep:       Seconds between ordinary requests (default 0.25s).
+            grouped_daily_sleep: Seconds between successive get_grouped_daily() calls
+                                 when backfilling.  Free tier = 5 req/min → 12s.
+            max_retries:         Number of retries on 429 / transient errors (default 3).
+        """
+        self.api_key             = api_key or os.environ.get("POLYGON_API_KEY", "")
+        self.request_sleep       = request_sleep
+        self.grouped_daily_sleep = grouped_daily_sleep
+        self.max_retries         = max_retries
+        self._session            = requests.Session()
         if not self.api_key:
             logger.warning("POLYGON_API_KEY not set — API calls will fail with 403")
 
     # ── Internal HTTP helper ───────────────────────────────────────────────────
 
     def _get(self, path: str, params: dict | None = None) -> dict:
-        """Execute a GET request and return parsed JSON.  Raises on HTTP error."""
-        url = f"{_BASE_URL}{path}"
-        p   = dict(params or {})
+        """
+        Execute a GET request with exponential backoff on 429 (rate limit).
+
+        Retry schedule on 429:
+            attempt 1: wait  60 s
+            attempt 2: wait 120 s
+            attempt 3: wait 240 s  (max_retries=3 default)
+
+        Other HTTP errors (4xx except 429, 5xx) are raised immediately.
+        """
+        url      = f"{_BASE_URL}{path}"
+        p        = dict(params or {})
         p["apiKey"] = self.api_key
-        resp = self._session.get(url, params=p, timeout=30)
-        resp.raise_for_status()
-        time.sleep(self.request_sleep)
-        return resp.json()
+        last_exc = None
+
+        for attempt in range(self.max_retries + 1):
+            try:
+                resp = self._session.get(url, params=p, timeout=30)
+
+                if resp.status_code == 429:
+                    wait = 60 * (2 ** attempt)    # 60 → 120 → 240 s
+                    logger.warning(
+                        "Rate limited (429) on %s — waiting %ds "
+                        "(attempt %d/%d)",
+                        path, wait, attempt + 1, self.max_retries,
+                    )
+                    time.sleep(wait)
+                    last_exc = requests.HTTPError(response=resp)
+                    continue
+
+                resp.raise_for_status()
+                time.sleep(self.request_sleep)
+                return resp.json()
+
+            except requests.HTTPError as exc:
+                # Non-429 HTTP errors are not retried
+                raise
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt < self.max_retries:
+                    logger.warning(
+                        "Request error on %s (%s) — retrying (%d/%d)",
+                        path, exc, attempt + 1, self.max_retries,
+                    )
+                    time.sleep(self.request_sleep * 4)
+
+        raise last_exc or RuntimeError(
+            f"Max retries ({self.max_retries}) exceeded for {path}"
+        )
 
     @staticmethod
     def _bar_from_agg(item: dict, bar_date: date) -> Bar:
@@ -137,6 +190,10 @@ class PolygonProvider(MarketDataProvider):
 
         logger.info("Grouped daily %s: %d symbols fetched", trade_date, len(result))
         self._save_breadth_cache(trade_date, result)
+        # Extra sleep for free-tier backfilling (caller may invoke this in a loop).
+        # Single-date daily runs don't need this; backfill loops rely on it.
+        if self.grouped_daily_sleep > self.request_sleep:
+            time.sleep(self.grouped_daily_sleep - self.request_sleep)
         return result
 
     def get_previous_close(self, symbol: str) -> Bar | None:

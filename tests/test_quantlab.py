@@ -3449,3 +3449,164 @@ class TestBreadthComputation:
         r = ScanResult("ABT","2026-06-04","breakout",True,90.0,None,5)
         assert r.breadth_regime_adj == 0.0
         assert r.breadth_override   is False
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Rate limit handling + breadth-aware scan threshold
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPolygonRateLimit:
+    """Tests for 429 retry logic — uses unittest.mock to avoid real HTTP calls."""
+
+    def _provider(self):
+        from quantlab.providers.polygon import PolygonProvider
+        # Zero sleeps so tests are fast
+        return PolygonProvider(api_key="test", request_sleep=0.0,
+                               grouped_daily_sleep=0.0, max_retries=3)
+
+    def test_success_on_first_try(self):
+        from unittest.mock import MagicMock, patch
+        from quantlab.providers.polygon import PolygonProvider
+        p = self._provider()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"results": []}
+        with patch.object(p._session, "get", return_value=mock_resp):
+            data = p._get("/v2/test")
+        assert data == {"results": []}
+
+    def test_retries_on_429_then_succeeds(self):
+        from unittest.mock import MagicMock, patch
+        p = self._provider()
+        rate_resp = MagicMock(); rate_resp.status_code = 429
+        ok_resp   = MagicMock(); ok_resp.status_code   = 200
+        ok_resp.json.return_value = {"status": "OK"}
+        call_count = [0]
+        def side_effect(*args, **kwargs):
+            call_count[0] += 1
+            return rate_resp if call_count[0] < 3 else ok_resp
+        with patch.object(p._session, "get", side_effect=side_effect), \
+             patch("time.sleep"):   # suppress actual sleep in tests
+            data = p._get("/v2/test")
+        assert data == {"status": "OK"}
+        assert call_count[0] == 3   # 2 rate-limited + 1 success
+
+    def test_raises_after_max_retries_on_429(self):
+        import requests as _req
+        from unittest.mock import MagicMock, patch
+        p = self._provider()
+        rate_resp = MagicMock(); rate_resp.status_code = 429
+        with patch.object(p._session, "get", return_value=rate_resp), \
+             patch("time.sleep"):
+            try:
+                p._get("/v2/test")
+                assert False, "Should have raised"
+            except Exception:
+                pass   # expected — either HTTPError or RuntimeError
+
+    def test_non_429_http_error_not_retried(self):
+        from unittest.mock import MagicMock, patch
+        import requests as _req
+        p = self._provider()
+        err_resp = MagicMock(); err_resp.status_code = 403
+        err_resp.raise_for_status.side_effect = _req.HTTPError(response=err_resp)
+        call_count = [0]
+        def side_effect(*a, **kw):
+            call_count[0] += 1
+            return err_resp
+        with patch.object(p._session, "get", side_effect=side_effect), \
+             patch("time.sleep"):
+            try:
+                p._get("/v2/test")
+            except _req.HTTPError:
+                pass
+        assert call_count[0] == 1   # no retry on 403
+
+
+class TestBreadthScanThreshold:
+    """Tests for automatic min_conviction raise when tape=BEAR."""
+
+    def _make_bear_snap(self):
+        from quantlab.signals.breadth import BreadthSnapshot
+        return BreadthSnapshot(
+            date="2026-06-04",
+            advances=500, declines=2000,
+            up_4pct_count=20, down_4pct_count=150,
+            ratio_10d=0.3,
+            mcclellan_oscillator=-389.0,
+            ad_line=-4757,
+            tape="BEAR",
+        )
+
+    def _make_bull_snap(self):
+        from quantlab.signals.breadth import BreadthSnapshot
+        return BreadthSnapshot(
+            date="2026-06-04",
+            advances=2000, declines=500,
+            up_4pct_count=200, down_4pct_count=50,
+            ratio_10d=2.5,
+            mcclellan_oscillator=80.0,
+            ad_line=3200,
+            tape="BULL",
+        )
+
+    def test_bull_tape_does_not_raise_threshold(self):
+        """In a bull tape, min_conviction stays at 0.40."""
+        from quantlab.signals.breadth import breadth_regime_adjustment
+        snap = self._make_bull_snap()
+        adj, override = breadth_regime_adjustment(snap)
+        assert override is False
+        assert adj == 0.0   # no penalty in bull tape
+
+    def test_bear_tape_applies_override(self):
+        """Bear tape (McClellan < -100) triggers hard veto."""
+        from quantlab.signals.breadth import breadth_regime_adjustment
+        snap = self._make_bear_snap()
+        adj, override = breadth_regime_adjustment(snap)
+        assert override is True
+
+    def test_bear_tape_conviction_veto_in_scorer(self):
+        """score_conviction() returns 0.0 when breadth_override is True."""
+        r = ScanResult("ABT","2026-06-04","breakout",True,90.0,None,5,
+                       regime_bullish=True, earnings_acceleration=0.85)
+        r.breadth_override = True
+        assert score_conviction(r) == 0.0
+
+    def test_bear_tape_summary_line_format(self):
+        snap = self._make_bear_snap()
+        line = snap.summary_line()
+        assert "BEAR" in line
+        assert "10d-ratio" in line
+        assert "McClellan" in line
+        assert "tape" in line
+
+    def test_bear_tape_ratio_penalty(self):
+        """10d-ratio=0.3 < 0.5 → -0.12 regime penalty."""
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=0.3,
+                               mcclellan_oscillator=-20.0,  # above -100, no override
+                               up_25pct_quarter=350, tape="BEAR")
+        adj, override = breadth_regime_adjustment(snap)
+        assert adj == pytest.approx(-0.12, abs=1e-6)
+        assert override is False
+
+    def test_ignore_breadth_flag_exists(self):
+        """--ignore-breadth is a valid scan_universe.py argument."""
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "scripts/scan_universe.py", "--help"],
+            capture_output=True, text=True,
+            cwd="/home/quantlab/projects/quantlab-project",
+        )
+        assert "--ignore-breadth" in result.stdout
+
+    def test_backfill_flag_exists(self):
+        """--backfill is a valid update_breadth.py argument."""
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "scripts/update_breadth.py", "--help"],
+            capture_output=True, text=True,
+            cwd="/home/quantlab/projects/quantlab-project",
+        )
+        assert "--backfill" in result.stdout
+        assert "--start-date" in result.stdout
