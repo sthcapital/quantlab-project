@@ -532,15 +532,64 @@ class UniverseManager:
                 logger.info("Universe cache hit for %s: %d symbols", trade_date, len(symbols))
                 return symbols, stats
 
-        # ── Step 1: Polygon grouped daily ─────────────────────────────────────
-        logger.info("Fetching grouped daily for %s ...", trade_date)
-        grouped = polygon_provider.get_grouped_daily(trade_date)
-        if not grouped:
-            logger.warning("No grouped daily data for %s", trade_date)
+        # ── Step 1: Polygon grouped daily (with previous-day fallback on 403) ──
+        # Polygon returns 403 for today's data while the market is still open.
+        # Walk back through recent trading days until valid data is found.
+        # Universe composition doesn't change intraday, so yesterday's filtered
+        # list is valid for today's scan.
+        import requests as _requests
+        from quantlab.market_calendar import prev_trading_day as _prev_day
+
+        _MAX_DAY_LOOKBACK = 5
+        actual_date = trade_date
+        grouped = None
+
+        for _attempt in range(_MAX_DAY_LOOKBACK):
+            if _attempt > 0:
+                # Check fallback date cache before hitting the API again
+                if not force_rebuild:
+                    _fb = load_universe_cache(actual_date)
+                    if _fb is not None:
+                        _fb_syms, _fb_stats = _fb
+                        logger.warning(
+                            "Universe: %s unavailable — using cached %s (%d symbols)",
+                            trade_date, actual_date, len(_fb_syms),
+                        )
+                        return _fb_syms, _fb_stats
+
+            logger.info("Fetching grouped daily for %s ...", actual_date)
+            try:
+                grouped = polygon_provider.get_grouped_daily(actual_date)
+                if actual_date != trade_date:
+                    logger.warning(
+                        "Universe: %s unavailable — fell back to %s (%d raw tickers)",
+                        trade_date, actual_date, len(grouped),
+                    )
+                break
+            except _requests.HTTPError as _exc:
+                _status = getattr(getattr(_exc, "response", None), "status_code", None)
+                if _status == 403:
+                    logger.warning(
+                        "Grouped daily for %s returned 403 "
+                        "(market may still be open) — trying previous trading day",
+                        actual_date,
+                    )
+                    actual_date = _prev_day(actual_date)
+                else:
+                    raise
+        else:
+            logger.warning(
+                "No grouped daily data available within %d trading days of %s",
+                _MAX_DAY_LOOKBACK, trade_date,
+            )
             return [], UniverseStats(date=trade_date.isoformat())
 
+        if not grouped:
+            logger.warning("No grouped daily data for %s", actual_date)
+            return [], UniverseStats(date=actual_date.isoformat())
+
         stats = UniverseStats(
-            date             = trade_date.isoformat(),
+            date             = actual_date.isoformat(),
             total_raw        = len(grouped),
             min_price        = self.min_price,
             min_volume       = self.min_volume,
@@ -607,7 +656,7 @@ class UniverseManager:
         stats.final_count = len(candidates)
 
         # ── Step 6: Cache ──────────────────────────────────────────────────────
-        save_universe_cache(trade_date, candidates, dvols)
+        save_universe_cache(actual_date, candidates, dvols)
         self._save_stats_to_db(stats)
 
         logger.info("Universe built: %d symbols for %s", stats.final_count, trade_date)

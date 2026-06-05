@@ -112,6 +112,14 @@ US_MARKET_HOLIDAYS: frozenset[date] = frozenset(
 )
 
 
+def prev_trading_day(d: date) -> date:
+    """Return the most recent NYSE trading day strictly before d."""
+    d = d - timedelta(days=1)
+    while not is_market_open(d):
+        d = d - timedelta(days=1)
+    return d
+
+
 def is_market_open(dt: date) -> bool:
     """
     Return True when the NYSE is open for regular trading on dt.

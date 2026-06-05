@@ -4771,3 +4771,129 @@ class TestUniverseManager:
         assert "BIGETF" not in symbols
         assert stats.total_raw == 4
         assert stats.final_count == len(symbols)
+
+    # ── prev_trading_day ──────────────────────────────────────────────────────
+
+    def test_prev_trading_day_monday_returns_friday(self):
+        from quantlab.market_calendar import prev_trading_day
+        monday = date(2026, 6, 1)   # Monday
+        assert monday.weekday() == 0
+        assert prev_trading_day(monday) == date(2026, 5, 29)  # Friday
+
+    def test_prev_trading_day_skips_weekend(self):
+        from quantlab.market_calendar import prev_trading_day
+        wednesday = date(2026, 6, 3)
+        assert prev_trading_day(wednesday) == date(2026, 6, 2)  # Tuesday
+
+    def test_prev_trading_day_skips_holiday(self):
+        from quantlab.market_calendar import prev_trading_day
+        # Juneteenth 2026 is June 19 (Friday) — market closed.
+        # June 20 is a Saturday, June 21 is a Sunday.
+        # So Monday June 22's prev trading day should be Thursday June 18.
+        monday_after_juneteenth = date(2026, 6, 22)
+        result = prev_trading_day(monday_after_juneteenth)
+        assert result == date(2026, 6, 18)   # Thursday before Juneteenth Friday
+
+    def test_prev_trading_day_returns_date_before_input(self):
+        from quantlab.market_calendar import prev_trading_day
+        d = date(2026, 6, 5)
+        assert prev_trading_day(d) < d
+
+    # ── build_tradeable_universe 403 fallback ──────────────────────────────────
+
+    def test_build_falls_back_to_prev_day_on_403(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager
+        from quantlab.providers.base import Bar
+        import requests
+
+        today = date(2026, 6, 5)
+        yesterday = date(2026, 6, 4)
+
+        class MockPoly403Then200:
+            def get_grouped_daily(self, d):
+                if d == today:
+                    resp = requests.models.Response()
+                    resp.status_code = 403
+                    raise requests.HTTPError(response=resp)
+                return {"AAPL": Bar(d, 150, 151, 149, 150, 5_000_000.0)}
+
+        mgr = UniverseManager()
+        symbols, stats = mgr.build_tradeable_universe(
+            today, MockPoly403Then200(), ib=None, optionable_only=False,
+        )
+        assert symbols == ["AAPL"]
+        assert stats.date == yesterday.isoformat()
+
+    def test_build_uses_prev_day_cache_on_403(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager, save_universe_cache
+        from quantlab.providers.base import Bar
+        import requests
+
+        today = date(2026, 6, 5)
+        yesterday = date(2026, 6, 4)
+        save_universe_cache(yesterday, ["MSFT", "NVDA"], [8e8, 7e8])
+
+        call_count = {"n": 0}
+
+        class MockPoly403:
+            def get_grouped_daily(self, d):
+                call_count["n"] += 1
+                resp = requests.models.Response()
+                resp.status_code = 403
+                raise requests.HTTPError(response=resp)
+
+        mgr = UniverseManager()
+        symbols, stats = mgr.build_tradeable_universe(
+            today, MockPoly403(), ib=None, optionable_only=False,
+        )
+        assert symbols == ["MSFT", "NVDA"]
+        assert stats.date == yesterday.isoformat()
+        # Only one API call before cache hit on prev day
+        assert call_count["n"] == 1
+
+    def test_build_non_403_http_error_propagates(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager
+        import requests
+
+        class MockPoly500:
+            def get_grouped_daily(self, d):
+                resp = requests.models.Response()
+                resp.status_code = 500
+                raise requests.HTTPError(response=resp)
+
+        mgr = UniverseManager()
+        with pytest.raises(requests.HTTPError):
+            mgr.build_tradeable_universe(
+                date(2026, 6, 5), MockPoly500(), ib=None, optionable_only=False,
+            )
+
+    def test_build_stats_date_reflects_actual_data_date(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager
+        from quantlab.providers.base import Bar
+        import requests
+
+        today = date(2026, 6, 5)
+        prev = date(2026, 6, 4)
+
+        class MockPoly:
+            def get_grouped_daily(self, d):
+                if d == today:
+                    resp = requests.models.Response()
+                    resp.status_code = 403
+                    raise requests.HTTPError(response=resp)
+                return {"AAPL": Bar(d, 150, 151, 149, 150, 5_000_000.0)}
+
+        mgr = UniverseManager()
+        _, stats = mgr.build_tradeable_universe(
+            today, MockPoly(), ib=None, optionable_only=False,
+        )
+        assert stats.date == prev.isoformat()
+        assert stats.date != today.isoformat()
