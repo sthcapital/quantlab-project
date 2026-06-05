@@ -93,16 +93,16 @@ class IbkrProvider(MarketDataProvider):
         self.client_id = client_id
         self.timeout = timeout
         self.spot_client_id = spot_client_id if spot_client_id is not None else client_id + 50
-        self._ib: IB | None = None   # internally managed persistent connection
+        self._shared_ib: IB | None = None   # persistent connection shared across requests
 
     # ── Persistent connection management ──────────────────────────────────────
 
     def connect(self) -> "IbkrProvider":
         """Open a persistent connection. Returns self for method chaining."""
-        if self._ib is None:
-            self._ib = IB()
-        if not self._ib.isConnected():
-            self._ib.connect(
+        if self._shared_ib is None:
+            self._shared_ib = IB()
+        if not self._shared_ib.isConnected():
+            self._shared_ib.connect(
                 self.host, self.port,
                 clientId=self.client_id,
                 timeout=self.timeout,
@@ -115,10 +115,10 @@ class IbkrProvider(MarketDataProvider):
 
     def disconnect(self) -> None:
         """Close the persistent connection if open."""
-        if self._ib and self._ib.isConnected():
-            self._ib.disconnect()
+        if self._shared_ib and self._shared_ib.isConnected():
+            self._shared_ib.disconnect()
             logger.info("IbkrProvider disconnected")
-        self._ib = None
+        self._shared_ib = None
 
     def __enter__(self) -> "IbkrProvider":
         return self.connect()
@@ -129,11 +129,13 @@ class IbkrProvider(MarketDataProvider):
     def _get_ib(self) -> tuple[IB, bool]:
         """Return (ib_instance, is_temporary).
 
-        Returns the persistent connection when available. Otherwise creates and
-        connects a temporary IB() that the caller must disconnect after use.
+        Returns the shared persistent connection when available (i.e. inside a
+        ``with`` block or after an explicit ``connect()`` call).  Otherwise
+        creates and connects a temporary IB() that the caller must disconnect
+        after use.
         """
-        if self._ib is not None and self._ib.isConnected():
-            return self._ib, False
+        if self._shared_ib is not None and self._shared_ib.isConnected():
+            return self._shared_ib, False
         ib = IB()
         ib.connect(self.host, self.port, clientId=self.client_id, timeout=self.timeout)
         return ib, True

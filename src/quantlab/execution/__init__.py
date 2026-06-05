@@ -653,6 +653,7 @@ def run_universe_scan(
     Returns:
         List of ScanResult sorted by conviction_score descending.
     """
+    from contextlib import nullcontext
     from quantlab.news import fetch_news, compute_news_features
     from quantlab.storage import append_trades_to_db
     from datetime import datetime
@@ -660,74 +661,81 @@ def run_universe_scan(
     results = []
     total = len(symbols)
 
-    # Load latest breadth snapshot for regime adjustment and override flag.
-    # Non-fatal — scan proceeds with neutral breadth (adj=0, override=False).
-    from quantlab.signals.breadth import get_latest_snapshot, breadth_regime_adjustment
-    _breadth_snap = get_latest_snapshot()
-    _breadth_adj, _breadth_override = breadth_regime_adjustment(_breadth_snap)
-    if _breadth_snap:
-        logger.info(
-            "Breadth: %s  tape=%s  10d-ratio=%s  McClellan=%s",
-            _breadth_snap.date, _breadth_snap.tape,
-            f"{_breadth_snap.ratio_10d:.2f}" if _breadth_snap.ratio_10d else "--",
-            f"{_breadth_snap.mcclellan_oscillator:+.0f}" if _breadth_snap.mcclellan_oscillator else "--",
-        )
-
-    # Fetch SPY bars once for regime filter and RS calculation.
-    # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
-    spy_bars = None
-    try:
-        spy_bars = list(provider.get_daily_bars("SPY", start_date, end_date))
-        if spy_bars:
-            logger.info("SPY bars: %d bars loaded (regime filter + RS reference)", len(spy_bars))
-    except Exception as _spy_err:
-        logger.debug("SPY bars unavailable (%s) — regime=bullish, RS scores=0", _spy_err)
-
-    for i, symbol in enumerate(symbols, 1):
-        try:
-            logger.info(f"[{i}/{total}] Scanning {symbol}...")
-
-            bars = provider.get_daily_bars(symbol, start_date, end_date)
-            if not bars:
-                logger.warning(f"{symbol}: no bars returned")
-                continue
-
-            # Fetch news if IBKR connection is provided
-            news_feat = None
-            if ibkr_connection is not None:
-                try:
-                    from ib_insync import Stock as _Stock
-                    contract = _Stock(symbol, "SMART", "USD")
-                    qualified = ibkr_connection.qualifyContracts(contract)
-                    if qualified:
-                        news_items = fetch_news(ibkr_connection, qualified[0], days=30, limit=50)
-                        news_feat = compute_news_features(
-                            news_items,
-                            end_date.isoformat(),
-                            lookback_days=7,
-                        )
-                except Exception as e:
-                    logger.debug(f"{symbol} news fetch failed: {e}")
-
-            result = scan_symbol(
-                symbol=symbol,
-                bars=bars,
-                signal_type=signal_type,
-                lookback=lookback,
-                regime_bars=spy_bars,   # enables regime filter + RS scoring
-                news_features=news_feat,
+    # Use the provider as a context manager when it supports one (e.g. IbkrProvider).
+    # This opens a single persistent TWS connection for all bar requests in this scan,
+    # eliminating the per-symbol connect/disconnect handshake (~2 s each).
+    # Providers without __enter__ (MockMarketDataProvider, PolygonProvider) fall
+    # through to nullcontext so this change is backward-compatible.
+    _ctx = provider if hasattr(provider, "__enter__") else nullcontext()
+    with _ctx:
+        # Load latest breadth snapshot for regime adjustment and override flag.
+        # Non-fatal — scan proceeds with neutral breadth (adj=0, override=False).
+        from quantlab.signals.breadth import get_latest_snapshot, breadth_regime_adjustment
+        _breadth_snap = get_latest_snapshot()
+        _breadth_adj, _breadth_override = breadth_regime_adjustment(_breadth_snap)
+        if _breadth_snap:
+            logger.info(
+                "Breadth: %s  tape=%s  10d-ratio=%s  McClellan=%s",
+                _breadth_snap.date, _breadth_snap.tape,
+                f"{_breadth_snap.ratio_10d:.2f}" if _breadth_snap.ratio_10d else "--",
+                f"{_breadth_snap.mcclellan_oscillator:+.0f}" if _breadth_snap.mcclellan_oscillator else "--",
             )
 
-            if result is not None:
-                # Apply breadth regime adjustment and re-score
-                result.breadth_regime_adj = _breadth_adj
-                result.breadth_override   = _breadth_override
-                result.conviction_score   = score_conviction(result)
-                results.append(result)
+        # Fetch SPY bars once for regime filter and RS calculation.
+        # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
+        spy_bars = None
+        try:
+            spy_bars = list(provider.get_daily_bars("SPY", start_date, end_date))
+            if spy_bars:
+                logger.info("SPY bars: %d bars loaded (regime filter + RS reference)", len(spy_bars))
+        except Exception as _spy_err:
+            logger.debug("SPY bars unavailable (%s) — regime=bullish, RS scores=0", _spy_err)
 
-        except Exception as e:
-            logger.error(f"{symbol}: scan error — {e}")
-            continue
+        for i, symbol in enumerate(symbols, 1):
+            try:
+                logger.info(f"[{i}/{total}] Scanning {symbol}...")
+
+                bars = provider.get_daily_bars(symbol, start_date, end_date)
+                if not bars:
+                    logger.warning(f"{symbol}: no bars returned")
+                    continue
+
+                # Fetch news if IBKR connection is provided
+                news_feat = None
+                if ibkr_connection is not None:
+                    try:
+                        from ib_insync import Stock as _Stock
+                        contract = _Stock(symbol, "SMART", "USD")
+                        qualified = ibkr_connection.qualifyContracts(contract)
+                        if qualified:
+                            news_items = fetch_news(ibkr_connection, qualified[0], days=30, limit=50)
+                            news_feat = compute_news_features(
+                                news_items,
+                                end_date.isoformat(),
+                                lookback_days=7,
+                            )
+                    except Exception as e:
+                        logger.debug(f"{symbol} news fetch failed: {e}")
+
+                result = scan_symbol(
+                    symbol=symbol,
+                    bars=bars,
+                    signal_type=signal_type,
+                    lookback=lookback,
+                    regime_bars=spy_bars,   # enables regime filter + RS scoring
+                    news_features=news_feat,
+                )
+
+                if result is not None:
+                    # Apply breadth regime adjustment and re-score
+                    result.breadth_regime_adj = _breadth_adj
+                    result.breadth_override   = _breadth_override
+                    result.conviction_score   = score_conviction(result)
+                    results.append(result)
+
+            except Exception as e:
+                logger.error(f"{symbol}: scan error — {e}")
+                continue
 
     # Sort by conviction score, highest first
     results.sort(key=lambda r: r.conviction_score, reverse=True)

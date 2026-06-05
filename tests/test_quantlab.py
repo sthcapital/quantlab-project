@@ -817,7 +817,7 @@ class TestIbkrProviderFixes:
     def test_ibkr_provider_no_connection_on_init(self):
         from quantlab.providers.ibkr import IbkrProvider
         p = IbkrProvider()
-        assert p._ib is None
+        assert p._shared_ib is None
 
     # ── Item 8: explicit spot_client_id ──────────────────────────────────────
 
@@ -897,6 +897,108 @@ class TestIbkrProviderFixes:
         beyond = bars[-1].as_of.__class__.fromordinal(bars[-1].as_of.toordinal() + 10)
         result = p._load_from_cache("PARTIAL", bars[0].as_of, beyond)
         assert result is None
+
+
+class TestIbkrPersistentConnection:
+    """Verify _shared_ib lifecycle and run_universe_scan context-manager wiring."""
+
+    def test_shared_ib_none_on_init(self):
+        from quantlab.providers.ibkr import IbkrProvider
+        p = IbkrProvider()
+        assert p._shared_ib is None
+
+    def test_run_universe_scan_calls_enter_and_exit(self):
+        """run_universe_scan() must open/close the provider's context manager."""
+        from quantlab.execution import run_universe_scan
+
+        entered = []
+        exited  = []
+
+        class TrackingProvider:
+            """Minimal provider that records context-manager calls."""
+            def __enter__(self):
+                entered.append(True)
+                return self
+            def __exit__(self, *_):
+                exited.append(True)
+            def get_daily_bars(self, symbol, start, end):
+                return make_bars(60)
+
+        run_universe_scan(
+            provider     = TrackingProvider(),
+            symbols      = ["AAPL"],
+            start_date   = date(2026, 1, 2),
+            end_date     = date(2026, 6, 5),
+            min_conviction = 0.0,
+        )
+        assert entered == [True], "__enter__ should have been called exactly once"
+        assert exited  == [True], "__exit__ should have been called exactly once"
+
+    def test_run_universe_scan_works_without_context_manager(self):
+        """Providers without __enter__ must still work (nullcontext fallback)."""
+        from quantlab.execution import run_universe_scan
+
+        class SimpleProvider:
+            def get_daily_bars(self, symbol, start, end):
+                return make_bars(60)
+
+        # Must not raise
+        run_universe_scan(
+            provider     = SimpleProvider(),
+            symbols      = ["AAPL"],
+            start_date   = date(2026, 1, 2),
+            end_date     = date(2026, 6, 5),
+            min_conviction = 0.0,
+        )
+
+    def test_shared_ib_used_when_set(self):
+        """_get_ib() returns (shared_ib, False) — not a new temp conn — when _shared_ib is connected."""
+        from quantlab.providers.ibkr import IbkrProvider
+        from unittest.mock import MagicMock
+
+        p = IbkrProvider()
+        mock_ib = MagicMock()
+        mock_ib.isConnected.return_value = True
+        p._shared_ib = mock_ib
+
+        ib, is_temporary = p._get_ib()
+        assert ib is mock_ib
+        assert is_temporary is False
+
+    def test_get_ib_creates_temp_when_shared_ib_none(self):
+        """_get_ib() must signal is_temporary=True when _shared_ib is not set."""
+        from quantlab.providers.ibkr import IbkrProvider
+        from unittest.mock import patch, MagicMock
+
+        p = IbkrProvider()
+        assert p._shared_ib is None
+
+        mock_ib = MagicMock()
+        mock_ib.isConnected.return_value = True
+
+        with patch("quantlab.providers.ibkr.IB", return_value=mock_ib):
+            ib, is_temporary = p._get_ib()
+
+        assert is_temporary is True
+
+    def test_get_ib_creates_temp_when_shared_ib_disconnected(self):
+        """_get_ib() treats a disconnected _shared_ib as absent."""
+        from quantlab.providers.ibkr import IbkrProvider
+        from unittest.mock import patch, MagicMock
+
+        p = IbkrProvider()
+        stale = MagicMock()
+        stale.isConnected.return_value = False  # already disconnected
+        p._shared_ib = stale
+
+        fresh = MagicMock()
+        fresh.isConnected.return_value = True
+
+        with patch("quantlab.providers.ibkr.IB", return_value=fresh):
+            ib, is_temporary = p._get_ib()
+
+        assert is_temporary is True
+        assert ib is not stale
 
 
 class TestIbkrScript:
