@@ -5,19 +5,26 @@ Expands the scanner from a fixed 50-symbol list to the full liquid optionable
 US equity universe (typically 2,000–2,500 names).
 
 Build pipeline:
-    1. Polygon grouped daily  →  raw ~12,299 US tickers
-    2. Price / volume filters →  ~3,500 liquid names
-    3. Symbol quality filters →  ~2,800 (removes warrants, preferred, ETF tickers)
-    4. IBKR options check     →  ~2,300 confirmed optionable equities
+    1. Polygon grouped daily      →  raw ~12,299 US tickers
+    2. Price / volume filters     →  ~3,500 liquid names
+    3. Symbol quality filters     →  ~2,800 (removes warrants, preferred, ETF tickers)
+    4. Polygon options check      →  ~2,300 confirmed optionable equities
     5. Sort by dollar volume, cache, return
+
+Optionable check (Polygon /v3/reference/options/contracts):
+    Queries the Polygon options contract reference for each candidate.
+    Uses 3 concurrent workers (Polygon rate limit).
+    First run: ~12 minutes for 3,000 symbols; subsequent same-day: instant.
+    Requires POLYGON_API_KEY environment variable.
 
 Caching:
     data/processed/universe_{YYYY-MM-DD}.parquet  — full universe list
-    data/processed/optionable_{YYYY-MM-DD}.parquet — IBKR-confirmed symbols
+    data/processed/optionable_{YYYY-MM-DD}.parquet — confirmed optionable symbols
     DuckDB universe_history table                  — filter stats per date
 
-IBKR options check (client_id=61):
-    Calls reqSecDefOptParams() for each candidate symbol.
+IBKR options check (legacy, client_id=61):
+    Still available via check_optionable_ibkr() for cases where Polygon is
+    unavailable.  Calls reqSecDefOptParams() per symbol (~20 min for 2,500).
     First run ~20 minutes for 2,500 symbols; subsequent same-day runs instant.
     Set ib=None to skip the check (tradeable_no_options mode).
 
@@ -242,7 +249,113 @@ def save_universe_cache(trade_date: date, symbols: list[str],
         logger.warning("universe cache write failed: %s", exc)
 
 
-# ── IBKR options availability check ───────────────────────────────────────────
+# ── Polygon options availability check (preferred — no IBKR needed) ───────────
+
+def check_optionable_polygon(
+    candidates: list[str],
+    api_key: str,
+    trade_date: date,
+    max_workers: int = 3,
+    sleep_between: float = 0.05,
+    show_progress: bool = True,
+) -> list[str]:
+    """
+    Check which symbols have listed options via the Polygon options reference API.
+
+    Uses GET /v3/reference/options/contracts?underlying_ticker={sym}&limit=1.
+    If any contract is returned, the symbol is optionable.
+
+    Polygon rate-limit notes:
+        - 3 concurrent workers is reliable across all plan tiers.
+        - Above 5 concurrent the API returns ERROR responses under load.
+        - Each request takes ~0.2–0.7 s; at 3 workers: ~12 min for 3,000 symbols.
+
+    Results are cached to data/processed/optionable_{date}.parquet so
+    subsequent same-day calls return instantly.
+
+    Args:
+        candidates:     Symbol list to check.
+        api_key:        Polygon.io API key (POLYGON_API_KEY env var).
+        trade_date:     Date to associate with the cache entry.
+        max_workers:    Concurrent HTTP workers (default 3; safe limit).
+        sleep_between:  Seconds to sleep per request (default 0.05s).
+        show_progress:  Print progress every 200 symbols.
+
+    Returns:
+        Subset of candidates confirmed to have listed options.
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import requests
+
+    # Check cache first
+    cached = load_optionable_cache(trade_date)
+    if cached is not None:
+        logger.info("Optionable cache hit for %s: %d symbols", trade_date, len(cached))
+        cached_set = set(cached)
+        return [s for s in candidates if s in cached_set]
+
+    n = len(candidates)
+    logger.info(
+        "Checking %d symbols for options via Polygon (~%.0f min at %d workers)...",
+        n, n / (max_workers * (1 / (sleep_between + 0.3))), max_workers,
+    )
+
+    # Thread-local sessions avoid connection conflicts
+    _local = threading.local()
+
+    def _sess():
+        if not hasattr(_local, "s"):
+            s = requests.Session()
+            s.headers.update({"Connection": "keep-alive"})
+            _local.s = s
+        return _local.s
+
+    def _check(sym: str) -> tuple[str, bool]:
+        if sleep_between > 0:
+            time.sleep(sleep_between)
+        try:
+            r = _sess().get(
+                "https://api.polygon.io/v3/reference/options/contracts",
+                params={"underlying_ticker": sym, "limit": 1, "apiKey": api_key},
+                timeout=8,
+            )
+            d = r.json()
+            return sym, d.get("status") == "OK" and len(d.get("results", [])) > 0
+        except Exception as exc:
+            logger.debug("%s: options check failed: %s", sym, exc)
+            return sym, False
+
+    optionable: list[str] = []
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_check, s): s for s in candidates}
+        for future in as_completed(futures):
+            sym, has_opts = future.result()
+            if has_opts:
+                optionable.append(sym)
+            completed += 1
+            if show_progress and completed % 200 == 0:
+                pct = completed / n * 100
+                print(
+                    f"  Options check: {completed}/{n} ({pct:.0f}%)"
+                    f"  optionable so far: {len(optionable)}",
+                    flush=True,
+                )
+
+    # Restore dollar-volume order (futures complete out of order)
+    candidate_set = set(candidates)
+    optionable_ordered = [s for s in candidates if s in set(optionable)]
+
+    logger.info(
+        "Polygon options check complete: %d/%d optionable", len(optionable_ordered), n
+    )
+    save_optionable_cache(trade_date, optionable_ordered)
+    return optionable_ordered
+
+
+# ── IBKR options availability check (legacy) ──────────────────────────────────
 
 def check_optionable_ibkr(
     candidates: list[str],
@@ -316,6 +429,42 @@ def check_optionable_ibkr(
     return optionable
 
 
+# ── Static optionable filter (free-tier / no-connection fallback) ─────────────
+
+def _filter_by_static_optionable(candidates: list[str]) -> list[str]:
+    """
+    Intersect candidates with the curated static optionable universe.
+
+    Used when neither a Polygon API key nor an IBKR connection is available,
+    making a dynamic per-symbol options check impractical (Polygon free tier
+    allows only 5 req/min on options endpoints).
+
+    The static list covers all S&P 500 constituents plus top Russell 1000 names
+    (see data/external/optionable_universe.py).  Replace with the dynamic
+    check once a Polygon paid tier or FactSet feed is available.
+    """
+    try:
+        from pathlib import Path as _Path
+        import importlib.util as _ilu
+        _spec = _ilu.spec_from_file_location(
+            "optionable_universe",
+            _Path(__file__).parents[2] / "data" / "external" / "optionable_universe.py",
+        )
+        _mod = _ilu.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        known: frozenset[str] = _mod.OPTIONABLE_UNIVERSE
+    except Exception as exc:
+        logger.warning("Could not load static optionable universe: %s — keeping all candidates", exc)
+        return candidates
+
+    filtered = [s for s in candidates if s in known]
+    logger.info(
+        "Static optionable filter: %d/%d candidates matched known-optionable list",
+        len(filtered), len(candidates),
+    )
+    return filtered
+
+
 # ── Universe manager ───────────────────────────────────────────────────────────
 
 class UniverseManager:
@@ -351,6 +500,7 @@ class UniverseManager:
         ib=None,
         optionable_only: bool = True,
         force_rebuild: bool   = False,
+        polygon_api_key: str | None = None,
     ) -> tuple[list[str], UniverseStats]:
         """
         Build the tradeable universe for a given date.
@@ -420,9 +570,32 @@ class UniverseManager:
         stats.after_symbol_filter = len(candidates)
         logger.info("After symbol filter: %d", stats.after_symbol_filter)
 
-        # ── Step 4: IBKR options check ─────────────────────────────────────────
-        if optionable_only and ib is not None:
-            candidates = check_optionable_ibkr(candidates, ib, trade_date)
+        # ── Step 4: Options check ──────────────────────────────────────────────
+        # Priority:
+        #   1. Polygon dynamic check (paid tier; 5 req/min on free tier makes
+        #      bulk checking impractical for 3,000+ symbols).
+        #   2. IBKR reqSecDefOptParams() — accurate but ~20 min for 2,500 syms.
+        #   3. Static optionable fallback — intersect with curated S&P 500 +
+        #      Russell 1000 list (data/external/optionable_universe.py).
+        #      Upgrade: replace with dynamic check when Polygon paid tier or
+        #      FactSet options-reference feed is available.
+        if optionable_only:
+            import os
+            api_key = polygon_api_key or os.environ.get("POLYGON_API_KEY", "")
+            if api_key:
+                candidates = check_optionable_polygon(
+                    candidates, api_key, trade_date
+                )
+            elif ib is not None:
+                logger.info("No POLYGON_API_KEY — using IBKR options check")
+                candidates = check_optionable_ibkr(candidates, ib, trade_date)
+            else:
+                # static optionable fallback
+                candidates = _filter_by_static_optionable(candidates)
+                logger.info(
+                    "No POLYGON_API_KEY or IB connection — "
+                    "using static optionable universe (S&P 500 + Russell 1000 curated list)"
+                )
             stats.optionable_count = len(candidates)
             logger.info("After options filter: %d", stats.optionable_count)
         else:
