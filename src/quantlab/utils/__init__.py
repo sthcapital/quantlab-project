@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
         "min_conviction": 0.4,
         "min_rel_volume": 1.5,
         "news_lookback_days": 7,
+        "SHORT_SIGNAL_ENABLED": False,   # activate after long side validated in paper trading (Phase 8+)
     },
     "news": {
         "provider_codes": "BRFG+BRFUPDN+DJNL",

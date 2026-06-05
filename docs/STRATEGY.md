@@ -481,3 +481,343 @@ assert result.conviction_score > 0.80
 This is the entry checklist. Every layer that fails is a reason to reduce
 size or pass entirely.
 
+---
+
+## Short Selling Framework
+
+> **Status: not yet active.** `SHORT_SIGNAL_ENABLED = False` in `DEFAULT_CONFIG`.
+> Build sequence is documented here so the architecture is decided before code
+> is written. Activate only after the long side has been validated in paper
+> trading for 3+ months with consistent positive expectancy.
+
+Short selling is the mirror of the accumulation-breakout playbook. The edge
+comes from the same source — identifying institutional positioning before the
+move — but the direction is reversed: large holders *exiting* rather than
+*entering*, and the price failing rather than succeeding.
+
+---
+
+### Short Signal Criteria
+
+Five conditions must align. Any single condition alone is insufficient; the
+high-conviction setup requires at least three, with the volume signature and
+relative weakness as non-negotiable anchors.
+
+**1. Breakdown below N-day low on above-average volume**
+
+The structural entry trigger. Price violates the N-day range low (same
+lookback as the long-side breakout, default 20 days) with volume exceeding
+the 20-day average by at least 1.5×. A low-volume breakdown is a trap —
+no conviction, likely to reverse. High-volume breakdown means institutional
+selling, not just retail stops being hit.
+
+```python
+def breakdown_signal(bars, symbol, lookback=20, min_rel_volume=1.5):
+    """Mirror of breakout_signal() — fires when price closes below N-day low
+    on volume >= min_rel_volume * avg_volume_20d."""
+    n_day_low = min(b.low for b in bars[-(lookback + 1):-1])
+    rel_vol   = bars[-1].volume / mean(b.volume for b in bars[-21:-1])
+    signal    = bars[-1].close < n_day_low and rel_vol >= min_rel_volume
+    return SignalResult(signal=signal, signal_type="breakdown", ...)
+```
+
+**2. Wyckoff distribution signature**
+
+Price rising on declining volume — the opposite of accumulation. The
+composite operator is *offloading* into retail buying. Key indicators:
+
+- Up-days on below-average volume (rallies have no institutional backing)
+- Down-days on above-average volume (heavy supply on every pullback)
+- `volume_character_score() < 0.40` — sustained over 40–60 bar window
+- Multiple failed tests of the same resistance level (supply never absorbed)
+- `absorption_score() < 0.40` on high-volume bars making new highs
+
+A distribution top looks like a breakout at first. The tell is what happens
+to volume *after* the breakout attempt: it collapses if real, or
+the high-volume bars print on down-days if distribution.
+
+**3. Earnings deceleration**
+
+The fundamental anchor for a short thesis. Without deteriorating business
+fundamentals, a declining stock can recover rapidly on any positive
+re-rating. Required signals:
+
+- Two or more consecutive EPS misses vs consensus estimate
+- Revenue growth decelerating — not just slower, but trending toward zero
+- Forward guidance cut — management lowering its own expectations
+- Margin compression — gross or operating margin declining YoY
+- Estimate revision trend: analysts *cutting* forward estimates, not raising
+
+```python
+@dataclass
+class EarningsDeceleration:
+    consecutive_misses:   int         # >= 2 required for short thesis
+    revenue_growth_trend: str         # "decelerating" | "flat" | "negative"
+    guidance_cut:         bool        # management lowered guidance
+    margin_trend:         str         # "compressing" | "stable" | "expanding"
+    estimate_revisions:   str         # "falling" | "flat" | "rising"
+    deceleration_score:   float       # 0.0–1.0 composite
+```
+
+Data source: same as earnings acceleration — Polygon.io financials endpoint
+or FactSet fundamentals. **This data is not yet available in the system.**
+Without it, short signals carry significantly higher false-positive risk.
+
+**4. Relative weakness vs SPY**
+
+A stock must be *underperforming the market* to merit a short. Shorting a
+stock that is merely not keeping up with a raging bull market is a losing
+strategy — broad market strength can overwhelm even poor fundamentals.
+
+- 63-day relative return: `stock_return_63d - spy_return_63d < -0.05`
+  (underperforming SPY by at least 5% over the prior quarter)
+- 126-day relative return: `stock_return_126d - spy_return_126d < -0.10`
+  (underperforming SPY by at least 10% over the prior half-year)
+- `rs_score() < 0.35` — sustained relative weakness, not a single bad week
+
+Both timeframes must confirm. A stock weak over 63 days that is starting to
+outperform over 126 days is potentially bottoming, not a short setup.
+
+**5. Analyst downgrades with high IBKR C: confidence scores**
+
+Analyst downgrades are already in the news pipeline (`classify_headline()`
+→ `"downgrade"`). For the short side, high-conviction downgrades add weight:
+
+- `news_category == "downgrade"` within the last 7 days
+- `news_c_score >= 0.75` — IBKR's internal confidence score for the article
+- Multiple downgrades from different firms within 14 days: sector rotation
+  signal, not idiosyncratic noise
+- Target price cuts alongside rating cuts: the analyst has recalibrated the
+  fundamental model, not just reacted to price
+
+Downgrades *already reduce* long-side conviction in `score_conviction()`.
+On the short side, they add conviction rather than reduce it.
+
+---
+
+### Options-Based Institutional Exit Signals
+
+Institutions cannot exit large positions by simply selling shares without
+moving the market against themselves. They use options to hedge, accelerate,
+or partially monetise their exposure. These signals are detectable in the
+options market days or weeks before the price breakdown becomes obvious in
+OHLCV bars.
+
+**1. Deep ITM call selling (delta > 0.80)**
+
+A large holder selling deep in-the-money calls is executing a synthetic
+short hedge. The delta > 0.80 calls behave almost identically to short stock
+— collecting premium while capping upside. This is the options market
+fingerprint of an institution protecting a large long position from downside
+without triggering a public 13F disclosure of a sale.
+
+```
+Signal: unusual OI or volume at call strikes where delta > 0.80
+        (strikes significantly below current price for calls)
+Threshold: OI > 5× the 20-day average OI at that strike
+Interpretation: large holder hedging downside / synthetically exiting
+```
+
+Note: deep ITM *put* buying is a direct hedge. Deep ITM *call selling* is
+the more subtle and information-rich signal because it requires the seller to
+hold the underlying and is typically done by a large long reducing risk.
+
+**2. Negative call skew (deep ITM call IV > ATM call IV)**
+
+Normal call skew is negative: ATM calls trade at higher IV than deep ITM
+calls because ATM options embed the most uncertainty. When this skew
+*inverts* — deep ITM call IV exceeds ATM call IV — it signals that someone
+is paying a premium to hedge existing long exposure at the deep ITM strikes.
+
+```
+Negative call skew = IV(delta=0.85 call) > IV(delta=0.50 call)
+Normal skew:    IV(0.85) < IV(0.50)   → no institutional hedging signal
+Inverted skew:  IV(0.85) > IV(0.50)   → paid hedging, exit signal
+```
+
+This is the options market equivalent of distribution in the OHLCV data —
+the institutional fingerprint of a large holder protecting gains without
+visibly selling stock.
+
+**3. OI accumulation at deep ITM call strikes**
+
+A single day of unusual volume at deep ITM calls can be noise — a covered
+call writer, a structured product unwind. Sustained OI *building over
+multiple sessions* at the same strikes is the institutional signal:
+
+```
+Signal: OI at delta > 0.80 call strikes growing over 5+ consecutive sessions
+        without corresponding price decline (hedging, not closing)
+Threshold: OI growth > 20% over 5 sessions at the target strike cluster
+Interpretation: sustained hedging campaign, not a one-day event
+```
+
+OI that builds then disappears in a single session is likely market-maker
+hedging of a customer order. OI that accumulates and persists is a strategic
+position.
+
+**4. Combined high-conviction short setup**
+
+The highest-conviction short signal requires all three options layers to
+confirm simultaneously with the fundamental and price signals:
+
+```
+DISTRIBUTION VOLUME      → volume_character_score() < 0.40
+  +
+DEEP ITM CALL SELLING   → unusual OI at delta > 0.80 calls, sustained 5+ days
+  +
+EARNINGS DECELERATION   → consecutive_misses >= 2, guidance cut = True
+  +
+RELATIVE WEAKNESS       → rs_score() < 0.35, underperforming SPY 63d and 126d
+─────────────────────────────────────────────────────────────────────────────
+= HIGH CONVICTION SHORT SETUP (target conviction_score_short >= 0.70)
+```
+
+No single factor is sufficient. The convergence of price structure
+(distribution), positioning (institutional hedging via deep ITM calls), and
+fundamentals (earnings deceleration) is what separates a tradeable short
+from a stock that is merely having a bad week.
+
+**5. Data requirements**
+
+The full options signal stack requires historical options data that the
+current IBKR integration does not provide at scale:
+
+- **FactSet Options API** — real-time and historical Greeks, OI, IV surface.
+  Required for the IV skew calculation and sustained OI monitoring.
+- **Theta Data** — tick-level options data with historical OI series.
+  Lower cost than FactSet, adequate for backtesting the deep ITM signal.
+- **IBKR options chain** (`fetch_ibkr_option_chain.py`) — already wired for
+  single-symbol snapshots. Not sufficient for universe-scale screening.
+
+Until FactSet or Theta Data is integrated, the deep ITM call signals cannot
+be computed. The framework is documented here to define what to build.
+
+---
+
+### Regime-Aware Shorting
+
+The tape regime (from `signals/breadth.py`) gates which direction the
+scanner operates in:
+
+| Tape | Long side | Short side |
+|------|-----------|------------|
+| BULL | Scan longs, full universe | Long-only mode — no shorts |
+| NEUTRAL | Scan longs, reduced universe | Short candidates added alongside longs |
+| BEAR | Selective longs (conviction >= 0.80) | Short candidates are primary focus |
+
+In BULL tape, adding short exposure is fighting the market's primary trend.
+The expected value of a short in a broad bull market is negative even when
+the individual stock thesis is correct — rising tide lifts most boats and
+short squeezes are frequent.
+
+In BEAR tape (McClellan oscillator < −100, or fewer than 200 stocks in the
+universe at 52-week highs), the scanner flips to adding short candidates
+alongside any remaining high-conviction longs:
+
+```python
+# Pseudocode — not yet implemented (SHORT_SIGNAL_ENABLED = False)
+if breadth_snap.tape == "BEAR" and SHORT_SIGNAL_ENABLED:
+    short_candidates = scan_for_breakdowns(
+        symbols, min_conviction=0.65,
+        require_earnings_decel=True,
+        require_relative_weakness=True,
+    )
+    results = long_candidates + short_candidates
+```
+
+The `SHORT_SIGNAL_ENABLED` flag in `DEFAULT_CONFIG["scanner"]` is the
+master switch. It stays `False` until the long side is validated and the
+short infrastructure (earnings deceleration data, options OI monitoring)
+is in place.
+
+---
+
+### Risk Differences vs Long Positions
+
+Short selling carries structurally different risks that require separate
+risk management rules. The long-side kill switches and position sizing
+module must be fully operational before any short is placed.
+
+**Asymmetric risk**
+A long position can lose at most 100% of capital invested (the stock goes to
+zero). A short position has theoretically unlimited loss — a stock can rise
+10×, 50×, or more. This is not a theoretical risk; it has destroyed accounts
+in NVDA (2023), GME (2021), and dozens of other squeeze events.
+Risk per short trade must be sized at 50% of the equivalent long position
+size until the short side is validated with a minimum 30-trade sample.
+
+**Borrow availability and cost**
+Short selling requires borrowing shares from a broker. Hard-to-borrow stocks
+carry daily fees that can exceed the trade's expected return. IBKR provides
+borrow rate data via the Short Stock (SLB) indicator. Before entering any
+short, confirm:
+- Borrow is available (not "HTB" — hard to borrow)
+- Borrow rate < 5% annualised (above this, the carry cost erodes the edge)
+- Float is large enough that a recall is unlikely within the holding period
+
+**The uptick rule**
+SEC Rule 10a-1 (modified uptick rule) restricts short sales when a stock has
+declined more than 10% in a single day. This can prevent entry at the
+intended price on a strong breakdown day — the most attractive short entry
+point. Build execution logic to check for uptick rule restrictions before
+submitting short orders.
+
+**Margin requirements**
+Reg T requires 150% of the short position value to be held in the account
+(100% proceeds + 50% margin). Portfolio margin accounts reduce this, but
+during high-volatility periods brokers can increase margin requirements
+without notice. The position sizing module must account for the higher
+capital reservation per short.
+
+**Never short into earnings**
+Earnings are the highest-risk event for a short position. A company with
+every short signal aligned can report one better-than-feared quarter and
+gap up 15–25% overnight, hitting the stop at a loss equivalent to several
+months of expected edge. The rule is absolute:
+- Check earnings date before entering any short
+- Do not initiate a short position within 5 trading days of a scheduled
+  earnings release
+- If already short, reduce to half-size or exit before the announcement
+
+---
+
+### Build Sequence
+
+Short selling is Phase 8+, after the long side is operationally mature.
+Each prerequisite must be complete before proceeding to the next:
+
+```
+Prerequisites (must all be green before writing short-selling code):
+
+  [Phase 5] Polygon.io fundamentals client — EarningsProfile data available
+  [Phase 6] Live paper trading (longs) — IBKR order submission working
+  [Phase 6] Position sizing module — Kelly / fixed fractional implemented
+  [Phase 6] Portfolio-level risk limits — max drawdown kill switch live
+  [Phase 7] 3+ months paper trading (longs) — positive expectancy confirmed
+             Minimum 30 completed long trades with documented outcomes
+
+Short selling build sequence (Phase 8):
+
+  [ ] breakdown_signal() — mirror of breakout_signal(), price + volume
+  [ ] EarningsDeceleration dataclass — fetch from Polygon/FactSet
+  [ ] rs_score() short threshold — rs_score() < 0.35 filter
+  [ ] Borrow availability check — IBKR SLB rate query before entry
+  [ ] Uptick rule detection — check SSR flag on entry bar
+  [ ] Short-side conviction scorer — separate weights from long scorer
+  [ ] Regime gate — SHORT_SIGNAL_ENABLED = True only when BEAR tape
+
+Short options signals (Phase 9 — requires FactSet or Theta Data):
+
+  [ ] IV surface loader — historical Greeks per strike per expiry
+  [ ] Deep ITM call OI monitor — flag sustained OI buildup at delta > 0.80
+  [ ] Call skew inversion detector — IV(0.85Δ) > IV(0.50Δ)
+  [ ] Combined signal aggregator — distribution + deep ITM calls + decel
+```
+
+The key principle: **prove the long side works first**. Short selling
+amplifies both the return and the operational complexity. A system that
+cannot consistently identify long-side breakouts will not consistently
+identify short-side breakdowns. The signals are mirrors of each other;
+the edge must be demonstrated in one direction before being extended to both.
+
