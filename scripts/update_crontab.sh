@@ -73,6 +73,19 @@ ${SCAN_CRON} * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh 
 # ── End-of-day forward return tracker (04:30 PM ET, Mon–Fri) ─────────────────
 ${EOD_CRON} * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && python scripts/track_forward_returns.py' >> ${LOG_FILE} 2>&1
 
+# ── Daily health check (05:15 PM ET, Mon–Fri) ────────────────────────────────
+# Runs after all other jobs complete; exits 1 if any critical job is missing.
+# EDT: 05:15 PM = 21:15 UTC  |  EST: 05:15 PM = 22:15 UTC
+# The UTC time is derived from the EOD offset + 45 minutes.
+$(python3 -c "
+import pytz; from datetime import datetime
+NY=pytz.timezone('America/New_York')
+now=datetime.now(NY)
+import pytz as _p; utc=_p.UTC
+dt=NY.localize(datetime(now.year,now.month,now.day,17,15,0)).astimezone(utc)
+print(f'{dt.minute} {dt.hour}')
+") * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && python scripts/check_daily_runs.py' >> ${LOG_FILE} 2>&1
+
 # ── DST auto-update ────────────────────────────────────────────────────────────
 # Spring forward: 2nd Sunday of March (day 8–14), 3:00 AM EDT = 07:00 UTC
 0 7 8-14 3 0 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && bash scripts/update_crontab.sh' >> ${LOG_FILE} 2>&1

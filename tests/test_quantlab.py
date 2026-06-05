@@ -4069,3 +4069,238 @@ class TestMorningShScript:
             "nohup processes should redirect stdin from /dev/null "
             "to prevent accidental terminal reads"
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# check_daily_runs.py — health check unit tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestCheckDailyRuns:
+    """Tests for the daily health check script using synthetic log content."""
+
+    @staticmethod
+    def _script_path():
+        from pathlib import Path
+        return Path(__file__).parent.parent / "scripts" / "check_daily_runs.py"
+
+    def _import(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "check_daily_runs", self._script_path()
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _write_log(self, tmp_path, lines):
+        p = tmp_path / "test.log"
+        p.write_text("\n".join(lines))
+        return p
+
+    # ── extract_time ──────────────────────────────────────────────────────────
+
+    def test_extract_time_bracket_format(self):
+        m = self._import()
+        from datetime import time
+        t = m.extract_time("[2026-06-05 09:05:33] Starting universe scan ...")
+        assert t == time(9, 5, 33)
+
+    def test_extract_time_logging_format(self):
+        m = self._import()
+        from datetime import time
+        t = m.extract_time("2026-06-05 16:32:01  INFO  quantlab  connected")
+        assert t == time(16, 32, 1)
+
+    def test_extract_time_dash_format(self):
+        m = self._import()
+        from datetime import time
+        t = m.extract_time("── [16:30] EOD tracker complete — 2026-06-05 16:44:22")
+        assert t == time(16, 44, 22)
+
+    def test_extract_time_none_on_no_match(self):
+        m = self._import()
+        assert m.extract_time("  QuantLab Daily Pre-Market Scan") is None
+        assert m.extract_time("  50 symbols | signal=breakout") is None
+
+    # ── todays_lines ──────────────────────────────────────────────────────────
+
+    def test_todays_lines_filters_correctly(self):
+        from datetime import date
+        m = self._import()
+        lines = [
+            "[2026-06-04 09:00:00] old entry",
+            "[2026-06-05 09:01:00] today entry",
+            "some line with no date",
+            "2026-06-05 09:02:00  INFO  test",
+        ]
+        result = m.todays_lines(lines, date(2026, 6, 5))
+        assert len(result) == 2
+        assert all("2026-06-05" in ln for ln in result)
+
+    # ── find_job ──────────────────────────────────────────────────────────────
+
+    def test_find_job_exact_pattern_match(self):
+        from datetime import date, time
+        m = self._import()
+        spec = m.JOBS[0]   # Morning scan
+        today = [
+            "[2026-06-05 09:01:33] Starting universe scan ...",
+            "2026-06-05 09:01:33  INFO  ib_insync.client  Connecting",
+        ]
+        found, run_time = m.find_job(today, spec)
+        assert found is True
+        assert run_time == time(9, 1, 33)
+
+    def test_find_job_timestamp_from_nearby_line(self):
+        """Pattern on line N, timestamp on line N-1."""
+        from datetime import date, time
+        m = self._import()
+        spec = m.JOBS[0]   # Morning scan
+        today = [
+            "[2026-06-05 09:00:05] Pre-flight OK",
+            "  QuantLab Daily Pre-Market Scan",   # no timestamp on this line
+            "  Universe : sp500_sample",
+        ]
+        found, run_time = m.find_job(today, spec)
+        assert found is True
+        assert run_time == time(9, 0, 5)   # picked up from preceding line
+
+    def test_find_job_not_found(self):
+        m = self._import()
+        spec = m.JOBS[1]   # EOD tracker
+        today = [
+            "[2026-06-05 09:01:00] Starting universe scan ...",
+            "  Scan complete: 50 symbols processed",
+        ]
+        found, run_time = m.find_job(today, spec)
+        assert found is False
+        assert run_time is None
+
+    def test_find_job_found_without_timestamp(self):
+        """Pattern found but no timestamp on any nearby line."""
+        m = self._import()
+        spec = m.JOBS[2]   # Breadth update
+        today = [
+            "  Breadth Update  — 2026-06-05",   # date but no HH:MM:SS
+            "  A=1847 D=842 | up4%=234",
+        ]
+        found, run_time = m.find_job(today, spec)
+        assert found is True
+        assert run_time is None
+
+    # ── check_and_report ──────────────────────────────────────────────────────
+
+    def test_all_jobs_ok_returns_0(self, tmp_path):
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            "[2026-06-05 09:02:00] Starting universe scan ...",
+            "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
+            "── [16:35] Breadth update complete — 2026-06-05 16:50:00",
+        ])
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        assert code == 0
+
+    def test_missing_critical_job_returns_1(self, tmp_path):
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            # Morning scan present, EOD missing
+            "[2026-06-05 09:02:00] Starting universe scan ...",
+        ])
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        assert code == 1
+
+    def test_missing_advisory_job_returns_0(self, tmp_path):
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            "[2026-06-05 09:02:00] Starting universe scan ...",
+            "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
+            # Breadth update MISSING — advisory only
+        ])
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        assert code == 0
+
+    def test_empty_log_returns_1(self, tmp_path):
+        from datetime import date
+        m = self._import()
+        log = tmp_path / "empty.log"
+        log.write_text("")
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        assert code == 1
+
+    def test_absent_log_returns_1(self, tmp_path):
+        from datetime import date
+        m = self._import()
+        code = m.check_and_report(tmp_path / "missing.log", date(2026, 6, 5), quiet=True)
+        assert code == 1
+
+    def test_late_job_does_not_set_exit_code_1(self, tmp_path):
+        """A job that ran but outside its expected window should not fail."""
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            # Morning scan at 10:30 AM (outside 8:30-9:30 window)
+            "[2026-06-05 10:30:00] Starting universe scan ...",
+            "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
+            "── [16:35] Breadth update complete — 2026-06-05 16:50:00",
+        ])
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        assert code == 0   # [LATE] is advisory, not a failure
+
+    def test_output_contains_ok_and_missing(self, tmp_path, capsys):
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            "[2026-06-05 09:02:00] Starting universe scan ...",
+            "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
+            # breadth missing
+        ])
+        m.check_and_report(log, date(2026, 6, 5), quiet=False)
+        out = capsys.readouterr().out
+        assert "OK" in out or "LATE" in out   # morning scan or EOD found
+        assert "MISSING" in out               # breadth update missing
+
+    # ── in_window ─────────────────────────────────────────────────────────────
+
+    def test_in_window_true_at_boundary(self):
+        from datetime import time
+        m = self._import()
+        spec = m.JOBS[0]   # Morning scan: 08:30–09:30
+        assert spec.in_window(time(8, 30))  is True   # start boundary
+        assert spec.in_window(time(9, 0))   is True   # midpoint
+        assert spec.in_window(time(9, 30))  is True   # end boundary
+
+    def test_in_window_false_outside(self):
+        from datetime import time
+        m = self._import()
+        spec = m.JOBS[0]
+        assert spec.in_window(time(8, 29))  is False  # just before
+        assert spec.in_window(time(9, 31))  is False  # just after
+        assert spec.in_window(time(13, 0))  is False  # afternoon
+
+    # ── crontab entry ─────────────────────────────────────────────────────────
+
+    def test_health_check_in_crontab(self):
+        import subprocess
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        assert "check_daily_runs.py" in result.stdout
+
+    def test_health_check_cron_time_is_21_15(self):
+        import subprocess, re
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        # Should be "15 21 * * 1-5 ... check_daily_runs.py"
+        lines = [ln for ln in result.stdout.splitlines() if "check_daily_runs" in ln]
+        assert len(lines) == 1
+        assert re.match(r'15 2[12] \* \* 1-5', lines[0].strip()), (
+            f"Unexpected cron time: {lines[0]}"
+        )
+
+    def test_script_syntax_valid(self):
+        import subprocess, sys
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(self._script_path())],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, result.stderr
