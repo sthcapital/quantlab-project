@@ -4552,3 +4552,222 @@ class TestIbkrFundamentalsProvider:
             assert False, "Should have raised ValueError"
         except ValueError as e:
             assert "ib" in str(e).lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Universe manager — filter functions and load_universe() expansion
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestUniverseManager:
+    """All tests are offline — no Polygon or IBKR connection needed."""
+
+    # ── apply_symbol_filter ───────────────────────────────────────────────────
+
+    def test_excludes_dot_tickers(self):
+        from quantlab.universe import apply_symbol_filter
+        result = apply_symbol_filter(["AAPL", "BRK.A", "BRK.B", "MSFT"])
+        assert "BRK.A" not in result
+        assert "BRK.B" not in result
+        assert "AAPL" in result
+        assert "MSFT" in result
+
+    def test_excludes_long_tickers(self):
+        from quantlab.universe import apply_symbol_filter
+        result = apply_symbol_filter(["AAPL", "GOOGLY", "NVDA", "TOOLONG"])
+        assert "GOOGLY" not in result   # 6 chars
+        assert "TOOLONG" not in result  # 7 chars
+        assert "AAPL" in result
+        assert "NVDA" in result
+
+    def test_excludes_warrant_suffixes(self):
+        from quantlab.universe import apply_symbol_filter
+        result = apply_symbol_filter(["AAPL", "XYZW", "ABCR", "DEFZ", "GHIQ"])
+        assert "XYZW" not in result   # W = warrant
+        assert "ABCR" not in result   # R = rights
+        assert "DEFZ" not in result   # Z = when-issued
+        assert "GHIQ" not in result   # Q = bankruptcy
+        assert "AAPL" in result
+
+    def test_excludes_etf_substrings(self):
+        from quantlab.universe import apply_symbol_filter
+        result = apply_symbol_filter(["AAPL", "XETF", "YETP", "ZETN", "SPY"])
+        assert "XETF" not in result
+        assert "YETP" not in result
+        assert "ZETN" not in result
+        assert "AAPL" in result
+        assert "SPY"  in result   # SPY itself is fine (no ETF substring)
+
+    def test_passes_clean_tickers(self):
+        from quantlab.universe import apply_symbol_filter
+        clean = ["AAPL", "MSFT", "NVDA", "CAT", "GS", "LLY", "UNH", "ABT"]
+        result = apply_symbol_filter(clean)
+        assert result == clean
+
+    def test_empty_input_returns_empty(self):
+        from quantlab.universe import apply_symbol_filter
+        assert apply_symbol_filter([]) == []
+
+    # ── apply_price_volume_filter ─────────────────────────────────────────────
+
+    def test_filters_by_price(self):
+        from quantlab.universe import apply_price_volume_filter
+        from datetime import date
+        from quantlab.providers.base import Bar
+        data = {
+            "AAPL": Bar(date(2026,6,5), 150.0, 152.0, 149.0, 150.0, 5_000_000.0),
+            "PCNY": Bar(date(2026,6,5),   5.0,   5.1,   4.9,   5.0, 2_000_000.0),  # below $10
+        }
+        result = apply_price_volume_filter(data, min_price=10.0, min_volume=100_000,
+                                            min_dollar_volume=1)
+        syms = [s for s, _ in result]
+        assert "AAPL" in syms
+        assert "PCNY" not in syms
+
+    def test_filters_by_volume(self):
+        from quantlab.universe import apply_price_volume_filter
+        from datetime import date
+        from quantlab.providers.base import Bar
+        data = {
+            "AAPL": Bar(date(2026,6,5), 150.0, 152.0, 149.0, 150.0, 5_000_000.0),
+            "THIN": Bar(date(2026,6,5),  50.0,  51.0,  49.0,  50.0,    50_000.0),  # low volume
+        }
+        result = apply_price_volume_filter(data, min_price=10.0, min_volume=100_000,
+                                            min_dollar_volume=1)
+        syms = [s for s, _ in result]
+        assert "AAPL" in syms
+        assert "THIN" not in syms
+
+    def test_filters_by_dollar_volume(self):
+        from quantlab.universe import apply_price_volume_filter
+        from datetime import date
+        from quantlab.providers.base import Bar
+        data = {
+            "AAPL": Bar(date(2026,6,5), 150.0, 152.0, 149.0, 150.0, 5_000_000.0),
+            # dvol = $15 × 200k = $3M < $5M threshold
+            "LOWDV": Bar(date(2026,6,5), 15.0, 15.5, 14.5, 15.0, 200_000.0),
+        }
+        result = apply_price_volume_filter(data, min_price=10.0, min_volume=100_000,
+                                            min_dollar_volume=5_000_000)
+        syms = [s for s, _ in result]
+        assert "AAPL" in syms
+        assert "LOWDV" not in syms
+
+    def test_sorted_by_dollar_volume_descending(self):
+        from quantlab.universe import apply_price_volume_filter
+        from datetime import date
+        from quantlab.providers.base import Bar
+        data = {
+            "SMALL": Bar(date(2026,6,5), 20.0, 20.5, 19.5, 20.0,  1_000_000.0),  # dvol=$20M
+            "LARGE": Bar(date(2026,6,5), 50.0, 51.0, 49.0, 50.0, 10_000_000.0),  # dvol=$500M
+        }
+        result = apply_price_volume_filter(data, min_price=10.0, min_volume=100_000,
+                                            min_dollar_volume=1)
+        assert result[0][0] == "LARGE"   # highest dvol first
+
+    def test_empty_input_returns_empty(self):
+        from quantlab.universe import apply_price_volume_filter
+        assert apply_price_volume_filter({}) == []
+
+    # ── UniverseStats ─────────────────────────────────────────────────────────
+
+    def test_stats_summary_format(self):
+        from quantlab.universe import UniverseStats
+        s = UniverseStats(
+            date="2026-06-05", total_raw=12299, final_count=2341,
+            min_price=10.0, min_dollar_volume=5_000_000, optionable_only=True,
+        )
+        summary = s.summary()
+        assert "2,341" in summary
+        assert "12,299" in summary
+        assert "options confirmed" in summary
+
+    def test_stats_summary_no_options_flag(self):
+        from quantlab.universe import UniverseStats
+        s = UniverseStats(date="2026-06-05", final_count=3000,
+                          optionable_only=False, total_raw=12299)
+        summary = s.summary()
+        assert "options confirmed" not in summary
+
+    # ── Caching ───────────────────────────────────────────────────────────────
+
+    def test_optionable_cache_roundtrip(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import save_optionable_cache, load_optionable_cache
+        from datetime import date
+        symbols = ["AAPL", "MSFT", "NVDA"]
+        save_optionable_cache(date(2026, 6, 5), symbols)
+        loaded = load_optionable_cache(date(2026, 6, 5))
+        assert loaded == symbols
+
+    def test_optionable_cache_miss_returns_none(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import load_optionable_cache
+        from datetime import date
+        assert load_optionable_cache(date(2099, 1, 1)) is None
+
+    def test_universe_cache_roundtrip(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import save_universe_cache, load_universe_cache
+        from datetime import date
+        symbols = ["AAPL", "MSFT", "NVDA"]
+        dvols   = [1e9, 8e8, 7e8]
+        save_universe_cache(date(2026, 6, 5), symbols, dvols)
+        result = load_universe_cache(date(2026, 6, 5))
+        assert result is not None
+        loaded_syms, stats = result
+        assert loaded_syms == symbols
+        assert stats.final_count == 3
+
+    # ── load_universe() expansion ─────────────────────────────────────────────
+
+    def test_tradeable_falls_back_to_sp500_sample_when_no_cache(self):
+        from quantlab.execution import load_universe, SP500_SAMPLE
+        # If today's cache doesn't exist, returns sp500_sample
+        result = load_universe("tradeable")
+        assert len(result) >= 1   # either cache or fallback, never empty
+
+    def test_sp500_sample_unchanged(self):
+        from quantlab.execution import load_universe, SP500_SAMPLE
+        assert load_universe("sp500_sample") == SP500_SAMPLE
+
+    def test_small_unchanged(self):
+        from quantlab.execution import load_universe, WATCHLIST_SMALL
+        assert load_universe("small") == WATCHLIST_SMALL
+
+    def test_custom_csv_still_works(self):
+        from quantlab.execution import load_universe
+        result = load_universe("AAPL,MSFT,NVDA")
+        assert result == ["AAPL", "MSFT", "NVDA"]
+
+    # ── UniverseManager.build_tradeable_universe (with mock Polygon data) ────
+
+    def test_build_tradeable_uses_filters(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager
+        from datetime import date
+        from quantlab.providers.base import Bar
+
+        # Mock provider returning synthetic data
+        class MockPoly:
+            def get_grouped_daily(self, d):
+                return {
+                    "AAPL":   Bar(d, 150, 151, 149, 150, 5_000_000.0),   # passes all
+                    "CHEAP":  Bar(d,   5,   6,   4,   5, 1_000_000.0),   # price < 10
+                    "LOW.V":  Bar(d,  20,  21,  19,  20,   10_000.0),    # dot + low vol
+                    "BIGETF": Bar(d,  30,  31,  29,  30, 2_000_000.0),   # ETF substring
+                }
+
+        mgr = UniverseManager()
+        symbols, stats = mgr.build_tradeable_universe(
+            date(2026, 6, 5), MockPoly(), ib=None, optionable_only=False,
+        )
+        assert "AAPL" in symbols
+        assert "CHEAP"  not in symbols
+        assert "LOW.V"  not in symbols
+        assert "BIGETF" not in symbols
+        assert stats.total_raw == 4
+        assert stats.final_count == len(symbols)

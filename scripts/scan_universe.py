@@ -85,11 +85,38 @@ def main() -> None:
     elif not breadth_snap:
         print("\n  Breadth: no data — run update_breadth.py after market close")
 
-    symbols = (
-        [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-        if args.symbols
-        else load_universe(args.universe)
-    )
+    # ── Symbol list / tradeable universe build ────────────────────────────────
+    universe_stats = None
+    if args.symbols:
+        symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    elif args.universe in ("tradeable", "tradeable_no_options"):
+        # For tradeable universe: try cache first, then offer to build
+        from quantlab.universe import UniverseManager, load_universe_cache
+        from datetime import date as _today_date
+        cached = load_universe_cache(_today_date.today())
+        if cached:
+            symbols, universe_stats = cached
+            print(f"\n  {universe_stats.summary()}")
+        else:
+            print(f"\n  Tradeable universe not cached for today.")
+            if args.provider == "polygon" or args.provider == "ibkr":
+                print("  Building tradeable universe (first run ~20 min with options check)...")
+                from quantlab.providers.polygon import PolygonProvider
+                pg   = PolygonProvider()
+                mgr  = UniverseManager()
+                need_options = args.universe == "tradeable"
+                symbols, universe_stats = mgr.build_tradeable_universe(
+                    trade_date       = _today_date.today(),
+                    polygon_provider = pg,
+                    ib               = None,   # options check runs separately below
+                    optionable_only  = False,  # phase 1: build without options
+                )
+                print(f"  {universe_stats.summary()}")
+            else:
+                print("  Falling back to sp500_sample. Use --provider polygon to build.")
+                symbols = load_universe("sp500_sample")
+    else:
+        symbols = load_universe(args.universe)
 
     start_date = parse_date(args.start)
     end_date = parse_date(args.end)
@@ -120,7 +147,11 @@ def main() -> None:
     bear_flag = "  ⚠ BEAR TAPE" if bear_tape_active else ""
     print(f"\n{'='*60}")
     print(f"  QuantLab Universe Scanner{bear_flag}")
-    print(f"  {len(symbols)} symbols | signal={args.signal} | lookback={args.lookback}")
+    if universe_stats:
+        print(f"  {universe_stats.summary()}")
+    else:
+        print(f"  {len(symbols)} symbols | universe={args.universe}")
+    print(f"  signal={args.signal} | lookback={args.lookback}")
     print(f"  {start_date} → {end_date} | min_conviction={args.min_conviction}")
     print(f"{'='*60}\n")
 

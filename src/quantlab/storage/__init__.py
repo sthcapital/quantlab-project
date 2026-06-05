@@ -358,6 +358,24 @@ def _ensure_schema(con) -> None:
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS universe_history (
+            date                DATE PRIMARY KEY,
+            total_raw           INTEGER,
+            after_price         INTEGER,
+            after_volume        INTEGER,
+            after_dollar_vol    INTEGER,
+            after_symbol_filter INTEGER,
+            optionable_count    INTEGER,
+            final_count         INTEGER,
+            min_price           DOUBLE,
+            min_volume          DOUBLE,
+            min_dollar_volume   DOUBLE,
+            optionable_only     BOOLEAN,
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
 
 def save_equity_curve_chart(
     equity_curve: list[float],

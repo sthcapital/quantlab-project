@@ -396,14 +396,39 @@ def load_universe(name: str = "small") -> list[str]:
     """
     Return a symbol list by name.
 
+    Supported names:
+        "small"                — 7 curated names for fast testing
+        "sp500_sample"         — 50-symbol SP500 sample (default for CI/tests)
+        "tradeable"            — full filtered optionable US equity universe
+                                 loaded from today's parquet cache;
+                                 build first with UniverseManager.build_tradeable_universe()
+        "tradeable_no_options" — same but skips the IBKR options-check filter
+        comma-separated list   — e.g. "AAPL,MSFT,NVDA"
+
     Args:
-        name: "small" (7 symbols for testing), "sp500_sample" (50 symbols),
-              or pass a comma-separated string like "AAPL,MSFT,NVDA"
+        name: Universe name or comma-separated symbol list.
+
+    Returns:
+        List of ticker symbols, uppercase.
     """
     if name == "small":
         return WATCHLIST_SMALL
     if name == "sp500_sample":
         return SP500_SAMPLE
+    if name in ("tradeable", "tradeable_no_options"):
+        from datetime import date as _date
+        from quantlab.universe import load_universe_cache
+        cached = load_universe_cache(_date.today())
+        if cached:
+            syms, _ = cached
+            logger.info("Loaded tradeable universe from cache: %d symbols", len(syms))
+            return syms
+        logger.warning(
+            "Tradeable universe not cached for today. "
+            "Run: python -c \"from quantlab.universe import UniverseManager; "
+            "UniverseManager().build_tradeable_universe(date.today(), polygon_provider)\""
+        )
+        return SP500_SAMPLE   # graceful fallback
     # custom comma-separated
     return [s.strip().upper() for s in name.split(",") if s.strip()]
 
