@@ -4400,3 +4400,155 @@ class TestWSL2AutostartScripts:
         content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
         assert "--install" in content   # mentions the WSL2 setup step
         assert "NEXT STEP" in content.upper() or "next step" in content.lower()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IbkrFundamentalsProvider — all tests use mock mode (no live IBKR required)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestIbkrFundamentalsProvider:
+
+    @staticmethod
+    def _p():
+        from quantlab.providers.ibkr_fundamentals import IbkrFundamentalsProvider
+        return IbkrFundamentalsProvider(use_mock=True)
+
+    # ── get_earnings_profile ──────────────────────────────────────────────────
+
+    def test_returns_profile_dataclass(self):
+        from quantlab.providers.ibkr_fundamentals import FundamentalEarningsProfile
+        p = self._p().get_earnings_profile("AAPL")
+        assert isinstance(p, FundamentalEarningsProfile)
+
+    def test_source_is_mock(self):
+        assert self._p().get_earnings_profile("AAPL").source == "mock"
+
+    def test_eight_quarters_returned(self):
+        p = self._p().get_earnings_profile("AAPL")
+        assert p.n_quarters == 8
+        assert len(p.surprise_history) == 8
+
+    def test_symbol_preserved(self):
+        assert self._p().get_earnings_profile("CAT").symbol == "CAT"
+
+    def test_consecutive_beats_nonneg(self):
+        p = self._p().get_earnings_profile("AAPL")
+        assert p.consecutive_beats >= 0
+        assert p.consecutive_beats <= p.n_quarters
+
+    def test_positive_surprise_rate_in_range(self):
+        p = self._p().get_earnings_profile("NVDA")
+        assert 0.0 <= p.positive_surprise_rate <= 1.0
+
+    def test_earnings_acceleration_is_bool(self):
+        p = self._p().get_earnings_profile("LLY")
+        assert isinstance(p.earnings_acceleration, bool)
+
+    def test_deterministic_per_symbol(self):
+        prov = self._p()
+        p1 = prov.get_earnings_profile("MSFT")
+        p2 = prov.get_earnings_profile("MSFT")
+        assert p1.consecutive_beats == p2.consecutive_beats
+        assert p1.eps_growth_yoy    == p2.eps_growth_yoy
+
+    def test_different_symbols_differ(self):
+        prov = self._p()
+        a = prov.get_earnings_profile("AAPL")
+        b = prov.get_earnings_profile("XOM")
+        assert a.eps_growth_yoy != b.eps_growth_yoy
+
+    # ── EarningsSurpriseRecord ────────────────────────────────────────────────
+
+    def test_surprise_history_ordered(self):
+        hist = self._p().get_earnings_profile("AAPL").surprise_history
+        dates = [r.report_date for r in hist]
+        assert dates == sorted(dates)
+
+    def test_surprise_beat_consistent_with_pct(self):
+        for r in self._p().get_earnings_profile("AAPL").surprise_history:
+            if r.surprise_pct is not None:
+                expected_beat = r.surprise_pct > 0
+                assert r.beat == expected_beat
+
+    def test_surprise_pct_formula(self):
+        for r in self._p().get_earnings_profile("AAPL").surprise_history:
+            if r.actual_eps and r.estimate_eps and r.estimate_eps != 0:
+                expected = (r.actual_eps - r.estimate_eps) / abs(r.estimate_eps) * 100
+                assert abs((r.surprise_pct or 0) - expected) < 0.01
+
+    def test_period_labels_not_empty(self):
+        for r in self._p().get_earnings_profile("AAPL").surprise_history:
+            assert r.period_label.strip() != ""
+
+    # ── convenience wrappers ──────────────────────────────────────────────────
+
+    def test_get_consecutive_beats_returns_int(self):
+        assert isinstance(self._p().get_consecutive_beats("AAPL"), int)
+
+    def test_get_next_earnings_date_format(self):
+        ned = self._p().get_next_earnings_date("AAPL")
+        assert ned is not None
+        from datetime import date
+        date.fromisoformat(ned)   # raises ValueError if format wrong
+
+    # ── to_ohlcv_profile round-trip ───────────────────────────────────────────
+
+    def test_to_ohlcv_profile_returns_earningsprofile(self):
+        from quantlab.signals.earnings import EarningsProfile
+        fp   = self._p().get_earnings_profile("NVDA")
+        prof = fp.to_ohlcv_profile()
+        assert isinstance(prof, EarningsProfile)
+
+    def test_to_ohlcv_profile_symbol_preserved(self):
+        fp = self._p().get_earnings_profile("CAT")
+        assert fp.to_ohlcv_profile().symbol == "CAT"
+
+    def test_to_ohlcv_profile_positive_surprise_rate_matches(self):
+        fp   = self._p().get_earnings_profile("LLY")
+        prof = fp.to_ohlcv_profile()
+        assert abs(prof.positive_surprise_rate - fp.positive_surprise_rate) < 0.001
+
+    def test_earnings_acceleration_score_uses_profile(self):
+        from quantlab.signals.earnings import earnings_acceleration_score
+        fp    = self._p().get_earnings_profile("NVDA")
+        score = earnings_acceleration_score(fp.to_ohlcv_profile())
+        assert 0.0 <= score <= 1.0
+
+    # ── integration with compute_earnings_profile ─────────────────────────────
+
+    def test_compute_earnings_profile_uses_fundamentals_when_provided(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        from quantlab.providers.base import Bar
+        from datetime import date, timedelta
+
+        bars = [Bar(date(2025,1,2)+timedelta(days=i), 100.0, 101.0, 99.0, 100.0, 1e6)
+                for i in range(300)]
+        prov = self._p()
+        prof = compute_earnings_profile("AAPL", bars, fundamentals_provider=prov)
+        # Real fundamental data gives 8 quarters; OHLCV on flat bars gives 0
+        assert prof.earnings_count == 8
+
+    def test_compute_earnings_profile_falls_back_without_provider(self):
+        from quantlab.signals.earnings import compute_earnings_profile
+        from quantlab.providers.base import Bar
+        from datetime import date, timedelta
+
+        bars = [Bar(date(2025,1,2)+timedelta(days=i), 100.0, 101.0, 99.0, 100.0, 1e6)
+                for i in range(300)]
+        prof = compute_earnings_profile("AAPL", bars)   # no provider
+        # Flat bars → no earnings events detected
+        assert prof.earnings_count == 0
+
+    # ── IbkrFundamentalsUnavailable ───────────────────────────────────────────
+
+    def test_unavailable_exception_is_runtime_error(self):
+        from quantlab.providers.ibkr_fundamentals import IbkrFundamentalsUnavailable
+        assert issubclass(IbkrFundamentalsUnavailable, RuntimeError)
+
+    def test_require_ib_when_not_mock(self):
+        from quantlab.providers.ibkr_fundamentals import IbkrFundamentalsProvider
+        try:
+            IbkrFundamentalsProvider(use_mock=False)
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "ib" in str(e).lower()

@@ -1,19 +1,28 @@
 """
-quantlab.signals.earnings — Earnings acceleration detection from OHLCV bars.
+quantlab.signals.earnings — Earnings acceleration detection.
 
-No fundamental data is required.  The module identifies likely earnings dates
-from overnight price gaps accompanied by volume spikes, then characterises
-the pattern of post-earnings moves over time.
+Supports two data sources, selected automatically by availability:
 
-The core insight: stocks with *accelerating* post-earnings moves are under
-active institutional re-rating — the kind of momentum that precedes large
-breakout moves.  A rising EPS surprise magnitude, measured entirely from
-price data, is a useful conviction filter even without fundamental data.
+    1. IBKR Fundamentals (preferred when subscription is active)
+       Uses IbkrFundamentalsProvider to obtain real EPS actuals vs consensus
+       estimates, beat streaks, and revenue growth from Reuters data.
+       Requires the "Reuters Fundamentals" subscription in TWS.
+
+    2. OHLCV inference (fallback, always available)
+       Identifies likely earnings dates from overnight price gaps with volume
+       spikes, then characterises the pattern of post-earnings price moves.
+       No fundamental data or additional subscriptions required.
+
+Primary entry point:
+    compute_earnings_profile(symbol, bars, fundamentals_provider=None)
+        Returns EarningsProfile regardless of data source.
+        When fundamentals_provider is supplied and not in mock mode,
+        the real fundamental data is used automatically.
 
 Functions:
-    detect_earnings_dates(bars)       — gap + volume anomaly detection
-    compute_earnings_profile(sym, bars) — full EarningsProfile from bars
-    earnings_acceleration_score(profile) — 0.0–1.0 conviction input
+    detect_earnings_dates(bars)           — OHLCV gap + volume detection
+    compute_earnings_profile(sym, bars)   — EarningsProfile (OHLCV or real)
+    earnings_acceleration_score(profile)  — 0.0–1.0 conviction input
 """
 
 from __future__ import annotations
@@ -147,29 +156,58 @@ def compute_earnings_profile(
     gap_threshold: float = 0.025,
     max_gap: float = 0.20,
     vol_threshold: float = 1.5,
+    fundamentals_provider=None,
 ) -> EarningsProfile:
     """
-    Build a complete EarningsProfile from bar history.
+    Build a complete EarningsProfile, using real fundamental data when available.
 
-    The gap on the first bar of an earnings event (open vs prior close) is
-    used as the post-earnings return proxy.  A positive gap indicates a
-    positive surprise; a negative gap indicates disappointment or a miss.
-
-    Acceleration is measured by comparing the mean absolute gap in the
-    second half of all detected events against the first half.
+    Data source selection (automatic):
+        1. If ``fundamentals_provider`` is supplied and has the IBKR Fundamentals
+           subscription, real EPS surprise history from Reuters is used.
+           The profile fields ``positive_surprise_rate`` and
+           ``acceleration_trend`` will reflect actual analyst estimates.
+        2. Otherwise falls back to OHLCV gap-based inference.
 
     Args:
-        symbol:          Ticker symbol label.
-        bars:            Full OHLCV history (oldest first). More bars = better
-                         acceleration signal; minimum ~1 year for 4 events.
-        gap_threshold:   Passed through to detect_earnings_dates().
-        max_gap:         Passed through to detect_earnings_dates().
-        vol_threshold:   Passed through to detect_earnings_dates().
+        symbol:                  Ticker symbol label.
+        bars:                    OHLCV bar sequence (oldest first).
+        gap_threshold:           OHLCV fallback: minimum gap to qualify.
+        max_gap:                 OHLCV fallback: maximum gap (splits filter).
+        vol_threshold:           OHLCV fallback: volume multiple above average.
+        fundamentals_provider:   Optional IbkrFundamentalsProvider instance.
+                                 When supplied, real fundamental data is
+                                 attempted first; OHLCV is used on failure.
 
     Returns:
-        EarningsProfile with all metrics populated.  If fewer than 2 events
-        are detected, most metrics default to 0.0.
+        EarningsProfile with all metrics populated.
     """
+    # ── Attempt real fundamental data ─────────────────────────────────────────
+    if fundamentals_provider is not None:
+        try:
+            from quantlab.providers.ibkr_fundamentals import (
+                IbkrFundamentalsProvider,
+                IbkrFundamentalsUnavailable,
+            )
+            if isinstance(fundamentals_provider, IbkrFundamentalsProvider):
+                fp = fundamentals_provider.get_earnings_profile(symbol)
+                profile = fp.to_ohlcv_profile()
+                import logging
+                logging.getLogger(__name__).debug(
+                    "%s: using %s fundamental data (%d quarters)",
+                    symbol, fp.source, fp.n_quarters,
+                )
+                return profile
+        except IbkrFundamentalsUnavailable as exc:
+            import logging
+            logging.getLogger(__name__).info(
+                "%s: IBKR Fundamentals unavailable (%s) — falling back to OHLCV",
+                symbol, exc,
+            )
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).debug(
+                "%s: fundamentals fetch failed (%s) — falling back to OHLCV", symbol, exc
+            )
     bars = list(bars)
     _empty = EarningsProfile(
         symbol=symbol, earnings_dates=[],
