@@ -3626,14 +3626,16 @@ class TestWatchlistBreadthNote:
         return str(tmp_path / "test.duckdb")
 
     def _add_abt(self, db):
-        """Insert a synthetic ABT entry and return watch_id."""
+        """Insert a synthetic ABT entry and return the generated watch_id."""
+        from datetime import date as _date
         r = ScanResult("ABT","2026-06-04","breakout",True,90.93,None,5,
                        regime_bullish=True, earnings_acceleration=0.65,
                        conviction_score=0.70, atr_stop=86.72,
                        multi_lookback_confirmed=True)
         from quantlab.watchlist import add_to_watchlist
         add_to_watchlist(r)
-        return "ABT_2026-06-04"
+        # watch_id is always symbol_YYYY-MM-DD using today's date at insert time
+        return f"ABT_{_date.today().isoformat()}"
 
     def test_note_stored_on_insert(self, tmp_path, monkeypatch):
         db = self._setup_db(tmp_path, monkeypatch)
