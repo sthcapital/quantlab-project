@@ -4304,3 +4304,99 @@ class TestCheckDailyRuns:
             capture_output=True, text=True,
         )
         assert result.returncode == 0, result.stderr
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WSL2 autostart scripts — structural checks
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWSL2AutostartScripts:
+    """Static analysis of the WSL2 autostart / keepalive scripts."""
+
+    @staticmethod
+    def _proj():
+        from pathlib import Path
+        return Path(__file__).parent.parent / "scripts"
+
+    # ── wsl2_keepalive.sh ─────────────────────────────────────────────────────
+
+    def test_keepalive_script_exists(self):
+        assert (self._proj() / "wsl2_keepalive.sh").exists()
+
+    def test_keepalive_syntax_valid(self):
+        import subprocess
+        result = subprocess.run(
+            ["bash", "-n", str(self._proj() / "wsl2_keepalive.sh")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"Syntax error:\n{result.stderr}"
+
+    def test_keepalive_has_install_flag(self):
+        content = (self._proj() / "wsl2_keepalive.sh").read_text()
+        assert "--install" in content
+
+    def test_keepalive_installs_to_profile_d(self):
+        content = (self._proj() / "wsl2_keepalive.sh").read_text()
+        assert "/etc/profile.d/" in content
+
+    def test_keepalive_uses_noninteractive_sudo(self):
+        """sudo -n must be used so /etc/profile.d/ execution never prompts."""
+        content = (self._proj() / "wsl2_keepalive.sh").read_text()
+        assert "sudo -n" in content
+
+    def test_keepalive_checks_systemctl_and_service(self):
+        """Must handle both systemd and sysV init systems."""
+        content = (self._proj() / "wsl2_keepalive.sh").read_text()
+        assert "systemctl" in content
+        assert "service" in content
+
+    def test_keepalive_is_silent_when_cron_active(self):
+        """Running the script with cron already active should exit 0, no output."""
+        import subprocess
+        result = subprocess.run(
+            ["bash", str(self._proj() / "wsl2_keepalive.sh")],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        assert result.stdout.strip() == ""   # no output in normal operation
+
+    # ── setup_wsl2_autostart.ps1 ──────────────────────────────────────────────
+
+    def test_powershell_script_exists(self):
+        assert (self._proj() / "setup_wsl2_autostart.ps1").exists()
+
+    def test_powershell_contains_task_name(self):
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "QuantLab WSL2 Autostart" in content
+
+    def test_powershell_targets_correct_distro(self):
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "Ubuntu-22.04" in content
+
+    def test_powershell_uses_sleep_infinity(self):
+        """sleep infinity keeps WSL2 alive indefinitely."""
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "sleep infinity" in content
+
+    def test_powershell_triggers_at_logon(self):
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "AtLogOn" in content or "AtLogon" in content.lower()
+
+    def test_powershell_hides_window(self):
+        """The /B flag in cmd start suppresses the console window."""
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "/B" in content, "cmd start /B needed to suppress console window"
+
+    def test_powershell_starts_task_immediately(self):
+        """Should start the task without requiring logoff/logon cycle."""
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "Start-ScheduledTask" in content
+
+    def test_powershell_has_requires_admin(self):
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "RunAsAdministrator" in content
+
+    def test_powershell_prints_next_steps(self):
+        content = (self._proj() / "setup_wsl2_autostart.ps1").read_text()
+        assert "--install" in content   # mentions the WSL2 setup step
+        assert "NEXT STEP" in content.upper() or "next step" in content.lower()
