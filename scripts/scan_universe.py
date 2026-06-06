@@ -222,8 +222,14 @@ def main() -> None:
             f"  cv={r.climactic_volume:.2f}"
         )
         multi_str   = " ✓" if r.multi_lookback_confirmed else "  "
+        _tier       = r.market_cap_tier or "?"
         _opt_val    = r.options_score if r.options_score > 0 else r.options_conviction
-        opt_str     = f"  opt={_opt_val:.2f}" if _opt_val > 0 else ""
+        if r.unusual_options_score > 0:
+            opt_str = f"  unusual_opts={r.unusual_options_score:.2f} [{_tier}]"
+        elif _opt_val > 0:
+            opt_str = f"  opt={_opt_val:.2f} [{_tier}]"
+        else:
+            opt_str = f"  [{_tier}]" if _tier and _tier != "?" else ""
         sector_abbr = _SECTOR_ABBREV.get(r.sector, r.sector[:6]) if r.sector else "?"
         sector_str  = f"  [{sector_abbr}{'⚑' if r.sector_cluster else ''}]"
         rs_str      = f"  rs={r.rs_score:.2f}" if r.rs_score > 0 else "  rs=--"
@@ -249,16 +255,50 @@ def main() -> None:
 
         if polygon_key:
             from quantlab.providers.massive_options import MassiveOptionsProvider
-            mp = MassiveOptionsProvider(api_key=polygon_key)
-            print(f"\nOptions enrichment via Polygon ({len(results)} symbols) ...")
+            from quantlab.providers.flat_files import FlatFileProvider
+            from quantlab.signals.unusual_options import (
+                detect_unusual_activity, score_unusual_activity,
+            )
+            from quantlab.execution import market_cap_tier as _mct
+
+            mp   = MassiveOptionsProvider(api_key=polygon_key)
+            flat = FlatFileProvider()
+
+            print(f"\nOptions enrichment — tier-aware ({len(results)} symbols) ...")
             for r in results:
+                tier = r.market_cap_tier or _mct(r.symbol)
+                r.market_cap_tier = tier
                 try:
-                    opt_score = mp.compute_options_score(r.symbol, r.entry_close)
-                    r.options_score    = opt_score
-                    r.conviction_score = score_conviction(r)
-                    flag = " ▲" if opt_score >= 0.6 else ""
-                    print(f"  {r.symbol:<8}  opt_score={opt_score:.2f}  "
-                          f"conv={r.conviction_score:.2f}{flag}")
+                    if tier == "mid_cap":
+                        sigs = detect_unusual_activity(
+                            r.symbol, end_date, flat, r.entry_close,
+                            volume_ratio_threshold=5.0,
+                        )
+                        u_score = score_unusual_activity(sigs)
+                        r.unusual_options_score = u_score
+                        r.conviction_score = score_conviction(r)
+                        flag = " ▲" if u_score >= 0.7 else ""
+                        print(f"  {r.symbol:<8}  unusual_opts={u_score:.2f} [mid_cap]"
+                              f"  conv={r.conviction_score:.2f}{flag}")
+                    elif tier == "large_cap":
+                        sigs = detect_unusual_activity(
+                            r.symbol, end_date, flat, r.entry_close,
+                            volume_ratio_threshold=3.0,
+                        )
+                        u_score = score_unusual_activity(sigs)
+                        r.unusual_options_score = u_score
+                        r.conviction_score = score_conviction(r)
+                        flag = " ▲" if u_score >= 0.6 else ""
+                        print(f"  {r.symbol:<8}  unusual_opts={u_score:.2f} [large_cap]"
+                              f"  conv={r.conviction_score:.2f}{flag}")
+                    else:
+                        # mega_cap / small_cap: PCR + IV skew from REST
+                        opt_score = mp.compute_options_score(r.symbol, r.entry_close)
+                        r.options_score    = opt_score
+                        r.conviction_score = score_conviction(r)
+                        flag = " ▲" if opt_score >= 0.6 else ""
+                        print(f"  {r.symbol:<8}  opt_score={opt_score:.2f} [{tier}]"
+                              f"  conv={r.conviction_score:.2f}{flag}")
                 except Exception as e:
                     print(f"  {r.symbol:<8}  options ERROR — {e}")
 

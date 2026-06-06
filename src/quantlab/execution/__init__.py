@@ -126,6 +126,10 @@ class ScanResult:
     # EDGAR fundamentals (populated by run_universe_scan; None = unavailable)
     edgar_acceleration: float | None = None  # real score; falls back to earnings_acceleration
 
+    # Unusual options activity (mid-cap; populated via --with-options flat-file path)
+    unusual_options_score: float = 0.0  # score_unusual_activity(); 0.0 = not computed
+    market_cap_tier: str = ""           # "mega_cap"|"large_cap"|"mid_cap" — set at scan time
+
     # Macro regime (populated from FRED + CBOE by run_universe_scan)
     macro_regime: str = "risk_on"   # "risk_on" | "risk_off" | "stress"
     vix_regime: str = "low"         # "low" | "elevated" | "high" | "extreme"
@@ -161,8 +165,12 @@ def score_conviction(result: ScanResult) -> float:
         Accumulation days ratio ≥ 0.6   : 0.08
         Climactic volume ≥ 0.7          : 0.07
         Multi-lookback confirmed        : 0.05  (signal fires at ≥2 lookback values)
-        Options score ≥ 0.6            : 0.10  (Polygon PCR/unusual calls/IV skew; IBKR fallback)
-        Options score ≥ 0.8            : 0.15  (replaces the 0.10 — strong signal)
+        Options (tier-aware):
+          mid_cap unusual ≥ 0.7       : 0.15  (institutional call spike at 5×+ avg vol)
+          mid_cap unusual ≥ 0.5       : 0.08
+          mega/large_cap PCR/IV ≥ 0.8 : 0.15  (Polygon options_score; IBKR fallback)
+          mega/large_cap PCR/IV ≥ 0.6 : 0.10
+          small_cap                   : 0.00  (options too illiquid)
         RS score ≥ 0.6 (outperforming) : 0.08
         RS score ≥ 0.8 (leader)        : 0.12  (replaces the 0.08)
         Breadth regime adjustment       : 0.00 to -0.12 (from 10-day ratio)
@@ -226,12 +234,22 @@ def score_conviction(result: ScanResult) -> float:
     if result.multi_lookback_confirmed:
         score += 0.05
 
-    # Options flow — prefer Polygon options_score, fall back to IBKR options_conviction
-    _opt = result.options_score if result.options_score > 0 else result.options_conviction
-    if _opt >= 0.8:
-        score += 0.15
-    elif _opt >= 0.6:
-        score += 0.10
+    # Options — tier-aware routing
+    _tier = result.market_cap_tier or market_cap_tier(result.symbol)
+    if _tier == "mid_cap" and result.unusual_options_score > 0:
+        # Mid-cap: unusual volume spike is the primary options signal
+        if result.unusual_options_score >= 0.7:
+            score += 0.15
+        elif result.unusual_options_score >= 0.5:
+            score += 0.08
+    elif _tier != "small_cap":
+        # mega_cap / large_cap (or mid_cap without unusual data): PCR + IV skew
+        _opt = result.options_score if result.options_score > 0 else result.options_conviction
+        if _opt >= 0.8:
+            score += 0.15
+        elif _opt >= 0.6:
+            score += 0.10
+    # small_cap: 0 options contribution (options market too thin)
 
     # Relative strength vs market benchmark (SPY)
     if result.rs_score >= 0.8:
@@ -415,6 +433,29 @@ def stock_profile(symbol: str) -> str:
     return "mid_cap_growth"
 
 
+def market_cap_tier(symbol: str) -> str:
+    """
+    Map a symbol to a market-cap tier for options signal routing.
+
+    Tiers:
+        "mega_cap"  — >$200B (MEGA_CAP_LIQUID set): use PCR + IV skew only.
+        "large_cap" — $10B–$200B (rest of SP500_SAMPLE): unusual volume ≥ 3×.
+        "mid_cap"   — $1B–$10B (not in SP500_SAMPLE): unusual volume ≥ 5×,
+                       highest signal quality for flat-file detector.
+        "small_cap" — <$1B: options market too thin — no score contribution.
+
+    Currently uses symbol-name heuristics (SP500_SAMPLE / MEGA_CAP_LIQUID).
+    The "small_cap" bucket is indistinguishable from "mid_cap" without real
+    market-cap data; that separation arrives with Polygon reference integration.
+    """
+    profile = stock_profile(symbol)
+    if profile == "mega_cap_liquid":
+        return "mega_cap"
+    if profile == "large_cap_growth":
+        return "large_cap"
+    return "mid_cap"   # mid_cap_growth (includes unclassifiable small-caps)
+
+
 def load_universe(name: str = "small") -> list[str]:
     """
     Return a symbol list by name.
@@ -582,6 +623,7 @@ def scan_symbol(
         climactic_volume=climax,
         sector=SECTOR_MAP.get(symbol, ""),
         rs_score=rs,
+        market_cap_tier=market_cap_tier(symbol),
     )
 
     result.conviction_score = score_conviction(result)
