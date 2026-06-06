@@ -222,7 +222,8 @@ def main() -> None:
             f"  cv={r.climactic_volume:.2f}"
         )
         multi_str   = " ✓" if r.multi_lookback_confirmed else "  "
-        opt_str     = f"  opt={r.options_conviction:.2f}" if r.options_conviction > 0 else ""
+        _opt_val    = r.options_score if r.options_score > 0 else r.options_conviction
+        opt_str     = f"  opt={_opt_val:.2f}" if _opt_val > 0 else ""
         sector_abbr = _SECTOR_ABBREV.get(r.sector, r.sector[:6]) if r.sector else "?"
         sector_str  = f"  [{sector_abbr}{'⚑' if r.sector_cluster else ''}]"
         rs_str      = f"  rs={r.rs_score:.2f}" if r.rs_score > 0 else "  rs=--"
@@ -238,35 +239,59 @@ def main() -> None:
 
     print(f"\n{'='*60}\n")
 
-    # ── Options flow enrichment (IBKR connection on options_client_id) ─────────
-    if args.with_options and args.provider == "ibkr" and results:
-        from quantlab.signals.options_flow import options_conviction_score
+    # ── Options flow enrichment ────────────────────────────────────────────────
+    # Primary source: Polygon/Massive (POLYGON_API_KEY) — Greeks, IV, OI, PCR.
+    # Fallback: IBKR live chain when provider=ibkr and no Polygon key.
+    if args.with_options and results:
+        from quantlab.config import settings as _opt_cfg
         from quantlab.execution import score_conviction
-        from ib_insync import IB
+        polygon_key = getattr(_opt_cfg, "polygon_api_key", "") or ""
 
-        options_client_id = ibkr_cfg.get("options_chain_client_id", 21)
-        print(f"Fetching options flow ({len(results)} symbols, "
-              f"client_id={options_client_id}) ...")
-        ib_opt = IB()
-        try:
-            ib_opt.connect(args.host, args.port,
-                           clientId=options_client_id, timeout=10)
+        if polygon_key:
+            from quantlab.providers.massive_options import MassiveOptionsProvider
+            mp = MassiveOptionsProvider(api_key=polygon_key)
+            print(f"\nOptions enrichment via Polygon ({len(results)} symbols) ...")
             for r in results:
                 try:
-                    bars = list(provider.get_daily_bars(r.symbol, start_date, end_date))
-                    opt_score = options_conviction_score(r.symbol, bars, ib_opt)
-                    r.options_conviction = opt_score
-                    r.conviction_score   = score_conviction(r)
+                    opt_score = mp.compute_options_score(r.symbol, r.entry_close)
+                    r.options_score    = opt_score
+                    r.conviction_score = score_conviction(r)
                     flag = " ▲" if opt_score >= 0.6 else ""
-                    print(f"  {r.symbol:<8}  opt={opt_score:.2f}  "
+                    print(f"  {r.symbol:<8}  opt_score={opt_score:.2f}  "
                           f"conv={r.conviction_score:.2f}{flag}")
                 except Exception as e:
                     print(f"  {r.symbol:<8}  options ERROR — {e}")
-        except Exception as e:
-            print(f"[options] Connection failed: {e} — skipping options enrichment")
-        finally:
-            if ib_opt.isConnected():
-                ib_opt.disconnect()
+
+        elif args.provider == "ibkr":
+            from quantlab.signals.options_flow import options_conviction_score
+            from ib_insync import IB
+
+            options_client_id = ibkr_cfg.get("options_chain_client_id", 21)
+            print(f"\nOptions enrichment via IBKR ({len(results)} symbols, "
+                  f"client_id={options_client_id}) ...")
+            ib_opt = IB()
+            try:
+                ib_opt.connect(args.host, args.port,
+                               clientId=options_client_id, timeout=10)
+                for r in results:
+                    try:
+                        bars = list(provider.get_daily_bars(r.symbol, start_date, end_date))
+                        opt_score = options_conviction_score(r.symbol, bars, ib_opt)
+                        r.options_conviction = opt_score
+                        r.conviction_score   = score_conviction(r)
+                        flag = " ▲" if opt_score >= 0.6 else ""
+                        print(f"  {r.symbol:<8}  opt={opt_score:.2f}  "
+                              f"conv={r.conviction_score:.2f}{flag}")
+                    except Exception as e:
+                        print(f"  {r.symbol:<8}  options ERROR — {e}")
+            except Exception as e:
+                print(f"[options] IBKR connection failed: {e} — skipping")
+            finally:
+                if ib_opt.isConnected():
+                    ib_opt.disconnect()
+
+        else:
+            print("\n--with-options: set POLYGON_API_KEY for Polygon options data.")
 
         results.sort(key=lambda r: r.conviction_score, reverse=True)
         print()

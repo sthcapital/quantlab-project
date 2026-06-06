@@ -103,8 +103,11 @@ class ScanResult:
     volume_trend: float = 0.0          # volume_trend_score()       (informational)
     climactic_volume: float = 0.0      # climactic_volume_score()   ≥ 0.7 → +0.07
 
-    # Options flow conviction (requires live IBKR chain; enriched post-scan)
-    options_conviction: float = 0.0  # compute_options_score() ≥ 0.6 → +0.10; ≥ 0.8 → +0.15
+    # Options flow conviction (IBKR chain; enriched post-scan)
+    options_conviction: float = 0.0  # IBKR source: ≥ 0.6 → +0.10; ≥ 0.8 → +0.15
+
+    # Polygon/Massive options score (preferred over IBKR options_conviction when > 0)
+    options_score: float = 0.0       # MassiveOptionsProvider.compute_options_score()
 
     # Multi-lookback confirmation (set post-scan when signal fires at ≥2 lookbacks)
     multi_lookback_confirmed: bool = False  # True → +0.05 structural confirmation bonus
@@ -158,8 +161,8 @@ def score_conviction(result: ScanResult) -> float:
         Accumulation days ratio ≥ 0.6   : 0.08
         Climactic volume ≥ 0.7          : 0.07
         Multi-lookback confirmed        : 0.05  (signal fires at ≥2 lookback values)
-        Options conviction ≥ 0.6       : 0.10  (bullish PCR/unusual calls/IV skew)
-        Options conviction ≥ 0.8       : 0.15  (replaces the 0.10 — strong signal)
+        Options score ≥ 0.6            : 0.10  (Polygon PCR/unusual calls/IV skew; IBKR fallback)
+        Options score ≥ 0.8            : 0.15  (replaces the 0.10 — strong signal)
         RS score ≥ 0.6 (outperforming) : 0.08
         RS score ≥ 0.8 (leader)        : 0.12  (replaces the 0.08)
         Breadth regime adjustment       : 0.00 to -0.12 (from 10-day ratio)
@@ -223,10 +226,11 @@ def score_conviction(result: ScanResult) -> float:
     if result.multi_lookback_confirmed:
         score += 0.05
 
-    # Options flow conviction (PCR + unusual calls + IV skew)
-    if result.options_conviction >= 0.8:
+    # Options flow — prefer Polygon options_score, fall back to IBKR options_conviction
+    _opt = result.options_score if result.options_score > 0 else result.options_conviction
+    if _opt >= 0.8:
         score += 0.15
-    elif result.options_conviction >= 0.6:
+    elif _opt >= 0.6:
         score += 0.10
 
     # Relative strength vs market benchmark (SPY)
