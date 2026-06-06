@@ -165,16 +165,36 @@ class PolygonProvider(MarketDataProvider):
         """
         Fetch ALL US stocks for a single trading day in one request.
 
-        Uses /v2/aggs/grouped/locale/us/market/stocks/{date}.
-        Results are cached to data/processed/breadth/{date}.parquet.
+        Priority:
+          1. Breadth Parquet cache (data/processed/breadth/{date}.parquet) — instant.
+          2. S3 flat file via FlatFileProvider — ~214 KB download, then cached.
+          3. Polygon REST API /v2/aggs/grouped/ — rate-limited, paid-tier.
 
         Returns:
-            Dict {symbol: Bar} — typically 12,000–13,000 entries.
+            Dict {symbol: Bar} — typically 11,000–13,000 entries.
         """
         cached = self._load_breadth_cache(trade_date)
         if cached is not None:
             logger.debug("Breadth cache hit for %s (%d symbols)", trade_date, len(cached))
             return cached
+
+        # Try S3 flat file first — one small download beats a rate-limited API call.
+        try:
+            from quantlab.providers.flat_files import FlatFileProvider
+            flat = FlatFileProvider()
+            result = flat.get_grouped_daily(trade_date)
+            if result:
+                logger.info(
+                    "Grouped daily %s: %d symbols from S3 flat file",
+                    trade_date, len(result),
+                )
+                self._save_breadth_cache(trade_date, result)
+                return result
+        except Exception as _flat_err:
+            logger.debug(
+                "Flat file grouped daily failed for %s (%s) — falling back to REST",
+                trade_date, _flat_err,
+            )
 
         path = f"/v2/aggs/grouped/locale/us/market/stocks/{trade_date.isoformat()}"
         data = self._get(path, {"adjusted": "true"})
