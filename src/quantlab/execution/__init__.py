@@ -120,6 +120,10 @@ class ScanResult:
     breadth_regime_adj: float = 0.0  # -0.12 to 0.0 depending on tape
     breadth_override: bool = False   # True → hard veto (McClellan<-100 or bear)
 
+    # Macro regime (populated from FRED + CBOE by run_universe_scan)
+    macro_regime: str = "risk_on"   # "risk_on" | "risk_off" | "stress"
+    vix_regime: str = "low"         # "low" | "elevated" | "high" | "extreme"
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -157,6 +161,7 @@ def score_conviction(result: ScanResult) -> float:
         RS score ≥ 0.8 (leader)        : 0.12  (replaces the 0.08)
         Breadth regime adjustment       : 0.00 to -0.12 (from 10-day ratio)
         Breadth override                : returns 0.0 immediately (bear market veto)
+        Macro regime (FRED+CBOE)        : 0.00 (risk_on), -0.05 (risk_off), -0.10 (stress)
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -224,6 +229,12 @@ def score_conviction(result: ScanResult) -> float:
 
     # Breadth regime adjustment (0.0 in bull, negative in weak/bear tape)
     score += result.breadth_regime_adj
+
+    # Macro regime adjustment (FRED yield spreads + CBOE VIX)
+    if result.macro_regime == "stress":
+        score -= 0.10
+    elif result.macro_regime == "risk_off":
+        score -= 0.05
 
     return max(0.0, min(score, 1.0))
 
@@ -681,6 +692,44 @@ def run_universe_scan(
                 f"{_breadth_snap.mcclellan_oscillator:+.0f}" if _breadth_snap.mcclellan_oscillator else "--",
             )
 
+        # Fetch macro context (CBOE VIX always; FRED if API key configured).
+        # Non-fatal — defaults to risk_on / low when unavailable.
+        _macro_regime = "risk_on"
+        _vix_regime = "low"
+        _vix_close: float | None = None
+        try:
+            from datetime import timedelta as _td
+            from quantlab.providers.cboe import fetch_vix_history, classify_vix_regime
+            _vix_bars = fetch_vix_history(end_date - _td(days=10), end_date)
+            if _vix_bars:
+                _vix_close = _vix_bars[-1].close
+                _vix_regime, _vix_score = classify_vix_regime(_vix_close)
+                logger.info("VIX: %.2f → %s (score %d)", _vix_close, _vix_regime, _vix_score)
+        except Exception as _vix_err:
+            logger.debug("VIX fetch failed: %s", _vix_err)
+
+        try:
+            from quantlab.config import settings as _cfg
+            _fred_key = getattr(_cfg, "fred_api_key", "") or ""
+            if _fred_key:
+                from quantlab.providers.fred import fetch_macro_snapshot, classify_macro_regime as _cmr
+                _snap = fetch_macro_snapshot(_fred_key, end_date)
+                if _vix_close is not None:
+                    _snap.vix_close = _vix_close
+                    _snap.macro_regime = _cmr(_snap)
+                _macro_regime = _snap.macro_regime
+                logger.info(
+                    "Macro regime: %s  10y2y=%s  HY=%s  VIX=%s",
+                    _macro_regime,
+                    f"{_snap.yield_spread_10y2y:+.2f}" if _snap.yield_spread_10y2y is not None else "--",
+                    f"{_snap.hy_credit_spread:.2f}" if _snap.hy_credit_spread is not None else "--",
+                    f"{_vix_close:.2f}" if _vix_close is not None else "--",
+                )
+            else:
+                logger.debug("FRED_API_KEY not configured — macro regime defaults to risk_on")
+        except Exception as _fred_err:
+            logger.debug("FRED macro context failed: %s", _fred_err)
+
         # Fetch SPY bars once for regime filter and RS calculation.
         # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
         spy_bars = None
@@ -727,9 +776,11 @@ def run_universe_scan(
                 )
 
                 if result is not None:
-                    # Apply breadth regime adjustment and re-score
+                    # Apply breadth and macro adjustments, then re-score
                     result.breadth_regime_adj = _breadth_adj
                     result.breadth_override   = _breadth_override
+                    result.macro_regime       = _macro_regime
+                    result.vix_regime         = _vix_regime
                     result.conviction_score   = score_conviction(result)
                     results.append(result)
 
@@ -747,8 +798,9 @@ def run_universe_scan(
     actionable = [r for r in results if r.is_actionable(min_conviction)]
 
     logger.info(
-        f"Scan complete: {total} symbols → {len(results)} processed → "
-        f"{len(actionable)} actionable (min_conviction={min_conviction})"
+        "Scan complete: %d symbols → %d processed → %d actionable "
+        "(min_conviction=%s  macro=%s  vix=%s)",
+        total, len(results), len(actionable), min_conviction, _macro_regime, _vix_regime,
     )
 
     return actionable

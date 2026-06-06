@@ -20,6 +20,7 @@ class Settings:
     market_data_api_key: str = os.getenv("MARKET_DATA_API_KEY", "")
     market_data_api_secret: str = os.getenv("MARKET_DATA_API_SECRET", "")
     market_data_base_url: str = os.getenv("MARKET_DATA_BASE_URL", "")
+    fred_api_key: str = os.getenv("FRED_API_KEY", "")
     project_root: str = str(PROJECT_ROOT)
     data_dir: str = str(DATA_DIR)
     raw_data_dir: str = str(RAW_DATA_DIR)
