@@ -120,6 +120,9 @@ class ScanResult:
     breadth_regime_adj: float = 0.0  # -0.12 to 0.0 depending on tape
     breadth_override: bool = False   # True → hard veto (McClellan<-100 or bear)
 
+    # EDGAR fundamentals (populated by run_universe_scan; None = unavailable)
+    edgar_acceleration: float | None = None  # real score; falls back to earnings_acceleration
+
     # Macro regime (populated from FRED + CBOE by run_universe_scan)
     macro_regime: str = "risk_on"   # "risk_on" | "risk_off" | "stress"
     vix_regime: str = "low"         # "low" | "elevated" | "high" | "extreme"
@@ -151,7 +154,7 @@ def score_conviction(result: ScanResult) -> float:
                                                   needs intraday data to discriminate)
         Wyckoff vol character ≥ 0.6     : 0.10
         Wyckoff spring detected         : 0.10
-        Earnings acceleration ≥ 0.5     : 0.10
+        Earnings acceleration ≥ 0.5     : 0.10  (EDGAR score preferred; OHLCV fallback)
         Accumulation days ratio ≥ 0.6   : 0.08
         Climactic volume ≥ 0.7          : 0.07
         Multi-lookback confirmed        : 0.05  (signal fires at ≥2 lookback values)
@@ -201,8 +204,13 @@ def score_conviction(result: ScanResult) -> float:
     if result.wyckoff_spring:
         score += 0.10
 
-    # Earnings acceleration (detected from price/volume anomalies in bar history)
-    if result.earnings_acceleration >= 0.5:
+    # Earnings acceleration — EDGAR-based when available, else OHLCV inferred
+    _accel = (
+        result.edgar_acceleration
+        if result.edgar_acceleration is not None
+        else result.earnings_acceleration
+    )
+    if _accel >= 0.5:
         score += 0.10
 
     # Institutional volume signature
@@ -730,6 +738,12 @@ def run_universe_scan(
         except Exception as _fred_err:
             logger.debug("FRED macro context failed: %s", _fred_err)
 
+        # Import EDGAR helper once before the per-symbol loop.
+        try:
+            from quantlab.providers.edgar import get_edgar_acceleration as _get_edgar_accel
+        except Exception:
+            _get_edgar_accel = None  # type: ignore[assignment]
+
         # Fetch SPY bars once for regime filter and RS calculation.
         # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
         spy_bars = None
@@ -748,6 +762,15 @@ def run_universe_scan(
                 if not bars:
                     logger.warning(f"{symbol}: no bars returned")
                     continue
+
+                # Fetch EDGAR earnings acceleration (DuckDB-cached, 7-day TTL).
+                # Non-fatal — OHLCV inference used when EDGAR is unavailable.
+                edgar_accel: float | None = None
+                if _get_edgar_accel is not None:
+                    try:
+                        edgar_accel = _get_edgar_accel(symbol)
+                    except Exception as _ea_err:
+                        logger.debug("%s: EDGAR acceleration unavailable: %s", symbol, _ea_err)
 
                 # Fetch news if IBKR connection is provided
                 news_feat = None
@@ -776,12 +799,18 @@ def run_universe_scan(
                 )
 
                 if result is not None:
-                    # Apply breadth and macro adjustments, then re-score
-                    result.breadth_regime_adj = _breadth_adj
-                    result.breadth_override   = _breadth_override
-                    result.macro_regime       = _macro_regime
-                    result.vix_regime         = _vix_regime
-                    result.conviction_score   = score_conviction(result)
+                    # Apply breadth, macro, and EDGAR adjustments, then re-score
+                    result.breadth_regime_adj  = _breadth_adj
+                    result.breadth_override    = _breadth_override
+                    result.macro_regime        = _macro_regime
+                    result.vix_regime          = _vix_regime
+                    result.edgar_acceleration  = edgar_accel
+                    result.conviction_score    = score_conviction(result)
+                    if edgar_accel is not None:
+                        logger.debug(
+                            "%s: edgar_accel=%.2f  ohlcv_accel=%.2f",
+                            symbol, edgar_accel, result.earnings_acceleration,
+                        )
                     results.append(result)
 
             except Exception as e:

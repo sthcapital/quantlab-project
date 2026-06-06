@@ -349,21 +349,16 @@ class TestEdgar:
                 }
             }
         }
+        mock_facts_resp = MagicMock()
+        mock_facts_resp.json.return_value = facts_data
+        mock_facts_resp.raise_for_status = MagicMock()
 
-        call_count = 0
-        responses = [ticker_data, facts_data]
-
-        def side_effect(*args, **kwargs):
-            nonlocal call_count
-            mock_resp = MagicMock()
-            mock_resp.json.return_value = responses[min(call_count, len(responses) - 1)]
-            mock_resp.raise_for_status = MagicMock()
-            call_count += 1
-            return mock_resp
-
-        with patch("requests.get", side_effect=side_effect):
-            from quantlab.providers.edgar import fetch_fundamentals
-            snap = fetch_fundamentals("AAPL", metrics=["eps_diluted", "net_income"])
+        # Patch _get_company_tickers directly to bypass the LRU cache so the
+        # single requests.get call goes to the companyfacts URL only.
+        with patch("quantlab.providers.edgar._get_company_tickers", return_value=ticker_data):
+            with patch("requests.get", return_value=mock_facts_resp):
+                from quantlab.providers.edgar import fetch_fundamentals
+                snap = fetch_fundamentals("AAPL", metrics=["eps_diluted", "net_income"])
 
         assert snap.ticker == "AAPL"
         assert snap.cik == "0000320193"
@@ -444,3 +439,174 @@ class TestExecutionMacroIntegration:
         from quantlab.execution import score_conviction
         r = self._base_result(signal=False, macro_regime="stress")
         assert score_conviction(r) == 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EDGAR cache layer
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEdgarCache:
+
+    def test_count_consecutive_beats_all_up(self):
+        from quantlab.providers.edgar import _count_consecutive_beats
+        history = [1.0, 1.1, 1.2, 1.3]
+        assert _count_consecutive_beats(history) == 3
+
+    def test_count_consecutive_beats_none(self):
+        from quantlab.providers.edgar import _count_consecutive_beats
+        history = [1.3, 1.2, 1.1]  # declining
+        assert _count_consecutive_beats(history) == 0
+
+    def test_count_consecutive_beats_partial(self):
+        from quantlab.providers.edgar import _count_consecutive_beats
+        # Last two up, one down before that
+        history = [1.0, 0.9, 1.0, 1.1]
+        assert _count_consecutive_beats(history) == 2
+
+    def test_count_consecutive_beats_empty(self):
+        from quantlab.providers.edgar import _count_consecutive_beats
+        assert _count_consecutive_beats([]) == 0
+
+    def test_get_edgar_acceleration_uses_cache(self):
+        """Cache hit should return without making any HTTP calls."""
+        from quantlab.providers.edgar import get_edgar_acceleration
+
+        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=0.65):
+            with patch("quantlab.providers.edgar.fetch_fundamentals") as mock_fetch:
+                result = get_edgar_acceleration("AAPL")
+
+        assert result == pytest.approx(0.65)
+        mock_fetch.assert_not_called()  # no network call needed
+
+    def test_get_edgar_acceleration_fetches_on_cache_miss(self):
+        """Cache miss should fetch from EDGAR and save result."""
+        from quantlab.providers.edgar import (
+            FundamentalSnapshot, get_edgar_acceleration
+        )
+        snap = FundamentalSnapshot(ticker="AAPL", cik="0000320193", as_of=date(2026, 1, 1))
+        snap.eps_history = [1.0, 1.10, 1.32]  # accelerating
+
+        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=None):
+            with patch("quantlab.providers.edgar.fetch_fundamentals", return_value=snap):
+                with patch("quantlab.providers.edgar._save_edgar_cache") as mock_save:
+                    result = get_edgar_acceleration("AAPL")
+
+        assert result is not None
+        assert result > 0.5  # accelerating
+        mock_save.assert_called_once()
+
+    def test_get_edgar_acceleration_returns_none_on_failure(self):
+        """Network/lookup failure should return None, not raise."""
+        from quantlab.providers.edgar import get_edgar_acceleration
+
+        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=None):
+            with patch(
+                "quantlab.providers.edgar.fetch_fundamentals",
+                side_effect=ValueError("Ticker not found in SEC filing index: ZZZZ"),
+            ):
+                result = get_edgar_acceleration("ZZZZ")
+
+        assert result is None
+
+    def test_cik_lru_cache_hits(self):
+        """Second lookup_cik call should not make a new HTTP request."""
+        from quantlab.providers.edgar import _get_company_tickers, lookup_cik
+
+        mock_data = {
+            "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
+        }
+        # Clear the lru_cache before this test
+        _get_company_tickers.cache_clear()
+
+        with patch("requests.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.json.return_value = mock_data
+            mock_resp.raise_for_status = MagicMock()
+            mock_get.return_value = mock_resp
+
+            lookup_cik("AAPL")
+            lookup_cik("AAPL")  # second call — should use lru_cache
+
+        # company_tickers.json fetched exactly once despite two lookups
+        assert mock_get.call_count == 1
+        _get_company_tickers.cache_clear()  # restore state
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EDGAR / ScanResult integration
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEdgarScanIntegration:
+
+    def _base_result(self, signal: bool = True, **kwargs):
+        from quantlab.execution import ScanResult
+        defaults = dict(
+            symbol="AAPL",
+            scan_date="2026-06-06",
+            signal_type="breakout",
+            signal=signal,
+            entry_close=200.0,
+            indicator_value=199.0,
+            lookback=20,
+            regime_bullish=True,
+        )
+        defaults.update(kwargs)
+        return ScanResult(**defaults)
+
+    def test_scan_result_has_edgar_acceleration_field(self):
+        r = self._base_result()
+        assert hasattr(r, "edgar_acceleration")
+        assert r.edgar_acceleration is None  # unset by default
+
+    def test_score_conviction_prefers_edgar_over_ohlcv(self):
+        """When edgar_acceleration is set, it should override ohlcv inference."""
+        from quantlab.execution import score_conviction
+
+        # OHLCV says below threshold (0.3), EDGAR says above (0.7)
+        r_edgar = self._base_result(
+            earnings_acceleration=0.3,
+            edgar_acceleration=0.7,
+        )
+        # Only OHLCV, below threshold
+        r_ohlcv = self._base_result(
+            earnings_acceleration=0.3,
+            edgar_acceleration=None,
+        )
+
+        assert score_conviction(r_edgar) > score_conviction(r_ohlcv)
+        assert score_conviction(r_edgar) - score_conviction(r_ohlcv) == pytest.approx(0.10)
+
+    def test_score_conviction_falls_back_to_ohlcv_when_no_edgar(self):
+        """With edgar_acceleration=None, should use earnings_acceleration."""
+        from quantlab.execution import score_conviction
+
+        r_high = self._base_result(earnings_acceleration=0.8, edgar_acceleration=None)
+        r_low = self._base_result(earnings_acceleration=0.1, edgar_acceleration=None)
+
+        assert score_conviction(r_high) > score_conviction(r_low)
+        assert score_conviction(r_high) - score_conviction(r_low) == pytest.approx(0.10)
+
+    def test_score_conviction_edgar_below_threshold_no_bonus(self):
+        """EDGAR score below 0.5 means no acceleration bonus."""
+        from quantlab.execution import score_conviction
+
+        r = self._base_result(
+            earnings_acceleration=0.9,  # OHLCV says high
+            edgar_acceleration=0.3,      # EDGAR says low — EDGAR wins
+        )
+        r_no_accel = self._base_result(
+            earnings_acceleration=0.1,
+            edgar_acceleration=0.3,
+        )
+
+        assert score_conviction(r) == score_conviction(r_no_accel)
+
+    def test_score_conviction_edgar_exactly_at_threshold(self):
+        """EDGAR score of exactly 0.5 should trigger the bonus."""
+        from quantlab.execution import score_conviction
+
+        r_on = self._base_result(edgar_acceleration=0.5)
+        r_off = self._base_result(edgar_acceleration=0.49)
+
+        assert score_conviction(r_on) > score_conviction(r_off)
+        assert score_conviction(r_on) - score_conviction(r_off) == pytest.approx(0.10)

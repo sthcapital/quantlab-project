@@ -211,8 +211,11 @@ def main() -> None:
         from quantlab.execution import _SECTOR_ABBREV
         stop_str    = f"  stop={r.atr_stop:.2f}" if r.atr_stop else ""
         rv_str      = f"  rel_vol={r.rel_volume:.2f}x" if r.rel_volume else ""
-        ea_str      = f"  ea={r.earnings_acceleration:.2f}" \
-                      if r.earnings_acceleration > 0 else "  ea=0.00"
+        edgar_accel_str = (
+            f"  edgar_accel={r.edgar_acceleration:.2f}"
+            if r.edgar_acceleration is not None else ""
+        )
+        ohlcv_accel_str = f"  ohlcv_accel={r.earnings_acceleration:.2f}"
         vol_str     = (
             f"  ar={r.accumulation_ratio:.2f}"
             f"  vt={r.volume_trend:.2f}"
@@ -230,7 +233,7 @@ def main() -> None:
             f"signal={r.signal_type}  "
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
-            f"{ea_str}{rs_str}{opt_str}{sector_str}{vol_str}{rv_str}{stop_str}"
+            f"{edgar_accel_str}{ohlcv_accel_str}{rs_str}{opt_str}{sector_str}{vol_str}{rv_str}{stop_str}"
         )
 
     print(f"\n{'='*60}\n")

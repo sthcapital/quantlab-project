@@ -79,9 +79,10 @@ SLEEP_EOD=$(echo    "$_SCHED" | sed -n '2p')
 DUR_MIDDAY=$(echo   "$_SCHED" | sed -n '3p')
 DUR_EOD=$(echo      "$_SCHED" | sed -n '4p')
 
-# ── Step 1: Load breadth tape from DuckDB ─────────────────────────────────────
-echo ""; echo "── [$(et)] Step 1: Breadth tape load ────────────────────────"
+# ── Step 1: Load breadth tape + fetch macro context ───────────────────────────
+echo ""; echo "── [$(et)] Step 1: Breadth tape + macro context ─────────────"
 python scripts/update_breadth.py --no-polygon 2>/dev/null || true
+python scripts/fetch_macro_context.py 2>/dev/null || true
 
 # ── Step 2: Forward return catch-up ───────────────────────────────────────────
 echo ""; echo "── [$(et)] Step 2: Forward return catch-up ──────────────────"
