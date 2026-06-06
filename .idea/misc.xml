@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="Python 3.14 (quantlab-project)" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Python 3.14 (quantlab-project)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="WSL (Ubuntu-22.04): (/home/quantlab/miniconda3/bin/python3)" project-jdk-type="Python SDK" />
 </project>

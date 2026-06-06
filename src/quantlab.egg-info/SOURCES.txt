@@ -29,9 +29,7 @@ src/quantlab/signals/__init__.py
 src/quantlab/storage/__init__.py
 src/quantlab/utils/__init__.py
 tests/test_http_provider.py
-tests/test_ibkr_provider.py
 tests/test_io.py
 tests/test_mock_provider.py
 tests/test_paths.py
-tests/test_provider_factory.py
 tests/test_quantlab.py

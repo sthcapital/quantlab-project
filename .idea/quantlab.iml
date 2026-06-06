@@ -6,7 +6,7 @@
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/.venv313" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.13 (quantlab-project)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="WSL (Ubuntu-22.04): (/home/quantlab/miniconda3/bin/python3)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="TestRunnerService">
