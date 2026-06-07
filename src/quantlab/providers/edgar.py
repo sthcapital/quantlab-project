@@ -64,6 +64,14 @@ class FundamentalSnapshot:
     # Sequential history for earnings acceleration (oldest first)
     eps_history: list[float] = field(default_factory=list)
     net_income_history: list[float] = field(default_factory=list)
+    # YoY same-quarter growth rates (most recent quarter vs same quarter prior year)
+    # These eliminate seasonal bias present in QoQ comparisons.
+    revenue_yoy_pct: Optional[float] = None           # e.g. 0.47 = +47%
+    eps_yoy_pct: Optional[float] = None               # e.g. 0.88 = +88%
+    revenue_yoy_history: list[float] = field(default_factory=list)  # last 4 quarters, oldest-first
+    eps_yoy_history: list[float] = field(default_factory=list)      # last 4 quarters, oldest-first
+    # True when BOTH revenue AND eps YoY growth rates are increasing for 2+ consecutive quarters
+    is_accelerating: bool = False
 
 
 # ── CIK lookup — cached for process lifetime ──────────────────────────────────
@@ -147,6 +155,15 @@ def _save_edgar_cache(
 
         con = duckdb.connect(str(DB_PATH))
         _ensure_edgar_table(con)
+        # Prefer YoY growth rates; fall back to QoQ when unavailable
+        _rev_growth = (
+            snap.revenue_yoy_pct if snap.revenue_yoy_pct is not None
+            else snap.revenue_qoq_growth
+        )
+        _eps_growth = (
+            snap.eps_yoy_pct if snap.eps_yoy_pct is not None
+            else snap.eps_qoq_growth
+        )
         con.execute(
             """
             INSERT OR REPLACE INTO edgar_fundamentals
@@ -158,8 +175,8 @@ def _save_edgar_cache(
                 symbol,
                 date.today().isoformat(),
                 acceleration_score,
-                snap.revenue_qoq_growth,
-                snap.eps_qoq_growth,
+                _rev_growth,
+                _eps_growth,
                 consecutive_beats,
             ],
         )
@@ -210,6 +227,39 @@ def _qoq_growth(history: list[float]) -> Optional[float]:
     return round((curr - prev) / abs(prev), 6)
 
 
+def _yoy_growth_series(history: list[float], max_quarters: int = 4) -> list[float]:
+    """
+    Compute year-over-year (same-quarter) growth rates from quarterly history.
+
+    Requires at least 5 data points (current quarter + same quarter prior year).
+    Skips quarters where the year-ago value is near zero (unreliable denominator).
+
+    Args:
+        history:      Quarterly values oldest-first (from _extract_periods).
+        max_quarters: Maximum number of YoY rates to return.
+
+    Returns:
+        List of YoY growth rates, oldest-first. Empty if insufficient data.
+    """
+    if len(history) < 5:
+        return []
+    rates: list[float] = []
+    for i in range(4, len(history)):
+        prior = history[i - 4]
+        curr = history[i]
+        if abs(prior) < 1e-9:
+            continue
+        rates.append((curr - prior) / abs(prior))
+    return rates[-max_quarters:]
+
+
+def _is_yoy_accelerating(yoy_history: list[float]) -> bool:
+    """True when the YoY growth rate has been increasing for 2+ consecutive quarters."""
+    if len(yoy_history) < 3:
+        return False
+    return yoy_history[-1] > yoy_history[-2] and yoy_history[-2] > yoy_history[-3]
+
+
 def _count_consecutive_beats(history: list[float]) -> int:
     """Count consecutive quarters of positive QoQ growth from the most recent period."""
     count = 0
@@ -231,16 +281,23 @@ def fetch_fundamentals(
     """
     Fetch quarterly fundamentals from the SEC EDGAR companyfacts API.
 
+    Fetches at least `periods` quarters (default 12, ≥ 8 required for YoY metrics).
+    YoY same-quarter comparisons are computed automatically when sufficient history
+    is available, eliminating the seasonal bias in QoQ comparisons.
+
     Args:
         ticker:  Ticker symbol (e.g. "AAPL").
         metrics: Subset of DEFAULT_METRICS to fetch (None = all).
-        periods: Number of quarters to retrieve (default 12).
+        periods: Number of quarters to retrieve (default 12, min 8 for YoY).
 
     Returns:
-        FundamentalSnapshot with latest values and QoQ growth rates.
+        FundamentalSnapshot with latest values, QoQ growth rates, and YoY metrics.
     """
     if metrics is None:
         metrics = DEFAULT_METRICS
+
+    # Ensure enough history for at least one YoY comparison (need 5+ for one YoY point)
+    effective_periods = max(periods, 8)
 
     cik = lookup_cik(ticker)
     url = _FACTS_URL.format(cik=cik)
@@ -251,49 +308,67 @@ def fetch_fundamentals(
     snap = FundamentalSnapshot(ticker=ticker, cik=cik, as_of=date.today())
 
     if "revenue" in metrics:
-        h = _extract_periods(facts, "revenue", periods)
+        h = _extract_periods(facts, "revenue", effective_periods)
         if h:
             snap.revenue = h[-1]
             snap.revenue_qoq_growth = _qoq_growth(h)
+            snap.revenue_yoy_history = _yoy_growth_series(h)
+            snap.revenue_yoy_pct = (
+                snap.revenue_yoy_history[-1] if snap.revenue_yoy_history else None
+            )
 
     if "net_income" in metrics:
-        h = _extract_periods(facts, "net_income", periods)
+        h = _extract_periods(facts, "net_income", effective_periods)
         if h:
             snap.net_income = h[-1]
             snap.net_income_history = h
             snap.net_income_qoq_growth = _qoq_growth(h)
 
     if "eps_diluted" in metrics:
-        h = _extract_periods(facts, "eps_diluted", periods)
+        h = _extract_periods(facts, "eps_diluted", effective_periods)
         if h:
             snap.eps_diluted = h[-1]
             snap.eps_history = h
             snap.eps_qoq_growth = _qoq_growth(h)
+            snap.eps_yoy_history = _yoy_growth_series(h)
+            snap.eps_yoy_pct = (
+                snap.eps_yoy_history[-1] if snap.eps_yoy_history else None
+            )
 
     if "total_assets" in metrics:
-        h = _extract_periods(facts, "total_assets", periods)
+        h = _extract_periods(facts, "total_assets", effective_periods)
         if h:
             snap.total_assets = h[-1]
 
     if "total_debt" in metrics:
-        h = _extract_periods(facts, "total_debt", periods)
+        h = _extract_periods(facts, "total_debt", effective_periods)
         if h:
             snap.total_debt = h[-1]
 
     if "operating_cashflow" in metrics:
-        h = _extract_periods(facts, "operating_cashflow", periods)
+        h = _extract_periods(facts, "operating_cashflow", effective_periods)
         if h:
             snap.operating_cashflow = h[-1]
 
     if "capex" in metrics:
-        h = _extract_periods(facts, "capex", periods)
+        h = _extract_periods(facts, "capex", effective_periods)
         if h:
             snap.capex = h[-1]
 
     if "shares_out" in metrics:
-        h = _extract_periods(facts, "shares_out", periods)
+        h = _extract_periods(facts, "shares_out", effective_periods)
         if h:
             snap.shares_out = h[-1]
+
+    # is_accelerating: both revenue AND eps YoY growth rates increasing for 2+ quarters.
+    # Falls back to net_income YoY when eps data is unavailable.
+    _eps_yoy = snap.eps_yoy_history or _yoy_growth_series(snap.net_income_history)
+    _rev_yoy = snap.revenue_yoy_history
+    snap.is_accelerating = (
+        bool(_rev_yoy) and bool(_eps_yoy)
+        and _is_yoy_accelerating(_rev_yoy)
+        and _is_yoy_accelerating(_eps_yoy)
+    )
 
     return snap
 
@@ -564,19 +639,39 @@ def get_last_earnings_result(
 
 def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     """
-    Score 0-1 reflecting EPS (or net income) growth acceleration.
+    Score 0.0–1.0 reflecting year-over-year earnings growth and acceleration trend.
 
-    Uses the most recent 3 periods of EPS history (falls back to NI history).
-    Returns 0.5 (neutral) when fewer than 3 data points are available.
+    Uses YoY same-quarter comparison (eliminates seasonal QoQ bias).
+    Falls back to the legacy QoQ acceleration method when fewer than 5 quarters
+    of history are available (e.g. recently-listed companies).
+
+    Scoring (YoY path):
+        magnitude: YoY growth  0–100%   →  0.00–0.50  (linear)
+                   YoY growth >100%     →  0.50–1.00  (linear, capped)
+        acceleration bonus: +0.30 when snap.is_accelerating is True
+                            (requires BOTH revenue AND eps YoY rates increasing
+                            for 2+ consecutive quarters)
+        result clamped to [0.0, 1.0]
 
     Interpretation:
-        > 0.5: growth rate is accelerating
-        = 0.5: neutral / stable
-        < 0.5: growth rate is decelerating
-
-    Replaces the bar-based earnings_acceleration placeholder in conviction scoring
-    when EDGAR fundamental data is available.
+        ≥ 0.50  — meaningful growth (≥50% YoY or accelerating at lower rates)
+        ≥ 0.80  — strong growth + acceleration present
+        < 0.50  — weak, zero, or negative YoY growth; no conviction contribution
     """
+    # ── YoY path (preferred when ≥ 5 quarters of data available) ─────────────
+    yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
+    if yoy_history:
+        latest_yoy = yoy_history[-1]
+        if latest_yoy <= 0:
+            mag = 0.0
+        elif latest_yoy <= 1.0:
+            mag = latest_yoy * 0.5                          # 0–100%  → 0.00–0.50
+        else:
+            mag = 0.5 + min(0.5, (latest_yoy - 1.0) * 0.5) # >100%   → 0.50–1.00
+        bonus = 0.30 if snap.is_accelerating else 0.0
+        return round(min(1.0, max(0.0, mag + bonus)), 4)
+
+    # ── Legacy QoQ fallback (< 5 quarters of data) ───────────────────────────
     history = snap.eps_history if len(snap.eps_history) >= 3 else snap.net_income_history
     if len(history) < 3:
         return 0.5
@@ -589,6 +684,5 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     recent_growth = (c - b) / abs(b)
     acceleration = recent_growth - prior_growth
 
-    # Clip to [-2, 2] and normalize to [0, 1]
     clipped = max(-2.0, min(2.0, acceleration))
     return round((clipped + 2.0) / 4.0, 4)

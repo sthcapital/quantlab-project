@@ -5234,3 +5234,210 @@ class TestEarningsCalendar:
         result = _edgar.get_last_earnings_result("AAPL")
         assert result == (last_d, True)
         assert len(fetch_called) == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YoY same-quarter metrics (quantlab.providers.edgar)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEdgarYoYMetrics:
+    """Tests for YoY growth rate computation, acceleration detection, and scoring.
+    All tests use synthetic data — no network access required.
+    """
+
+    @staticmethod
+    def _snap(**kwargs):
+        """Build a minimal FundamentalSnapshot with given overrides."""
+        from quantlab.providers.edgar import FundamentalSnapshot
+        return FundamentalSnapshot(ticker="TEST", cik="0", as_of=date.today(), **kwargs)
+
+    # ── _yoy_growth_series ────────────────────────────────────────────────────
+
+    def test_yoy_series_correct_calculation(self):
+        from quantlab.providers.edgar import _yoy_growth_series
+        # Q1-Q4 all = 100, Q5 = 120 → YoY = (120-100)/100 = 0.20
+        h = [100.0, 100.0, 100.0, 100.0, 120.0]
+        series = _yoy_growth_series(h)
+        assert len(series) == 1
+        assert series[0] == pytest.approx(0.20, abs=1e-9)
+
+    def test_yoy_series_four_quarters(self):
+        from quantlab.providers.edgar import _yoy_growth_series
+        # 8 quarters: YoY for Q5-Q8 vs Q1-Q4
+        h = [100.0, 100.0, 100.0, 100.0, 110.0, 125.0, 145.0, 170.0]
+        series = _yoy_growth_series(h)
+        assert len(series) == 4
+        assert series[0] == pytest.approx(0.10, abs=1e-9)  # Q5 vs Q1: 110/100 - 1
+        assert series[3] == pytest.approx(0.70, abs=1e-9)  # Q8 vs Q4: 170/100 - 1
+
+    def test_yoy_series_insufficient_data_returns_empty(self):
+        from quantlab.providers.edgar import _yoy_growth_series
+        assert _yoy_growth_series([1.0, 2.0, 3.0]) == []  # only 3 quarters
+        assert _yoy_growth_series([]) == []
+
+    def test_yoy_series_skips_zero_prior(self):
+        from quantlab.providers.edgar import _yoy_growth_series
+        # Q1 = 0 → Q5 vs Q1 should be skipped (zero denominator)
+        h = [0.0, 100.0, 100.0, 100.0, 120.0, 130.0, 140.0, 150.0]
+        series = _yoy_growth_series(h)
+        # Q5 vs Q1 skipped; Q6 vs Q2, Q7 vs Q3, Q8 vs Q4 kept = 3 rates
+        assert len(series) == 3
+        assert series[0] == pytest.approx(0.30, abs=1e-9)  # Q6 vs Q2: 130/100-1
+
+    def test_yoy_series_capped_at_max_quarters(self):
+        from quantlab.providers.edgar import _yoy_growth_series
+        # 12 quarters → 8 YoY rates → capped at max_quarters=4
+        # Q9-Q12 vs Q5-Q8 (NOT Q1-Q4) for the last 4 rates
+        h = [100.0] * 4 + [110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 180.0]
+        series = _yoy_growth_series(h, max_quarters=4)
+        assert len(series) == 4
+        # Last rate: h[11] vs h[7] = 180/140 - 1 ≈ 0.2857
+        assert series[-1] == pytest.approx(180.0 / 140.0 - 1.0, abs=1e-9)
+
+    # ── _is_yoy_accelerating ──────────────────────────────────────────────────
+
+    def test_is_accelerating_true_on_strictly_increasing(self):
+        from quantlab.providers.edgar import _is_yoy_accelerating
+        assert _is_yoy_accelerating([0.10, 0.20, 0.35]) is True
+
+    def test_is_accelerating_false_on_flat(self):
+        from quantlab.providers.edgar import _is_yoy_accelerating
+        assert _is_yoy_accelerating([0.20, 0.20, 0.20]) is False
+
+    def test_is_accelerating_false_when_last_dips(self):
+        from quantlab.providers.edgar import _is_yoy_accelerating
+        assert _is_yoy_accelerating([0.10, 0.30, 0.25]) is False
+
+    def test_is_accelerating_false_insufficient_data(self):
+        from quantlab.providers.edgar import _is_yoy_accelerating
+        assert _is_yoy_accelerating([0.20, 0.30]) is False  # need 3 points
+
+    # ── FundamentalSnapshot new fields ────────────────────────────────────────
+
+    def test_snapshot_new_fields_default_none_and_empty(self):
+        from quantlab.providers.edgar import FundamentalSnapshot
+        snap = FundamentalSnapshot(ticker="X", cik="0", as_of=date.today())
+        assert snap.revenue_yoy_pct is None
+        assert snap.eps_yoy_pct is None
+        assert snap.revenue_yoy_history == []
+        assert snap.eps_yoy_history == []
+        assert snap.is_accelerating is False
+
+    # ── compute_earnings_acceleration YoY path ────────────────────────────────
+
+    def test_high_yoy_growth_with_acceleration(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # 70% YoY eps growth + accelerating → 0.35 mag + 0.30 bonus = 0.65
+        snap = self._snap(
+            eps_yoy_history=[0.30, 0.50, 0.70],
+            eps_yoy_pct=0.70,
+            is_accelerating=True,
+        )
+        score = compute_earnings_acceleration(snap)
+        assert score == pytest.approx(0.65, abs=1e-4)
+
+    def test_over_100pct_yoy_growth_maps_above_0_5(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # 200% YoY eps → mag = 0.5 + min(0.5, (2.0-1.0)*0.5) = 0.5 + 0.5 = 1.0
+        snap = self._snap(eps_yoy_history=[0.5, 1.0, 2.0], eps_yoy_pct=2.0)
+        score = compute_earnings_acceleration(snap)
+        assert score == pytest.approx(1.0, abs=1e-4)
+
+    def test_zero_yoy_growth_no_acceleration_returns_zero(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        snap = self._snap(eps_yoy_history=[0.0, 0.0, 0.0], eps_yoy_pct=0.0)
+        assert compute_earnings_acceleration(snap) == pytest.approx(0.0, abs=1e-4)
+
+    def test_negative_yoy_growth_returns_zero(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        snap = self._snap(eps_yoy_history=[-0.3, -0.2, -0.1], eps_yoy_pct=-0.10)
+        assert compute_earnings_acceleration(snap) == pytest.approx(0.0, abs=1e-4)
+
+    def test_acceleration_bonus_adds_030(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # same growth rate, different is_accelerating flag
+        base_snap = self._snap(eps_yoy_history=[0.20, 0.30, 0.40], eps_yoy_pct=0.40)
+        accel_snap = self._snap(
+            eps_yoy_history=[0.20, 0.30, 0.40], eps_yoy_pct=0.40, is_accelerating=True
+        )
+        diff = compute_earnings_acceleration(accel_snap) - compute_earnings_acceleration(base_snap)
+        assert diff == pytest.approx(0.30, abs=1e-4)
+
+    def test_score_clamped_at_1_0(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # 200% YoY + accelerating → would be > 1.0 without clamp
+        snap = self._snap(
+            eps_yoy_history=[0.5, 1.2, 2.0], eps_yoy_pct=2.0, is_accelerating=True
+        )
+        assert compute_earnings_acceleration(snap) == pytest.approx(1.0, abs=1e-4)
+
+    def test_score_clamped_at_0_0(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        snap = self._snap(eps_yoy_history=[-1.0, -0.5, -0.2], eps_yoy_pct=-0.20)
+        assert compute_earnings_acceleration(snap) == pytest.approx(0.0, abs=1e-4)
+
+    def test_revenue_yoy_used_when_eps_yoy_empty(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # eps_yoy_history is empty; revenue_yoy_history has data
+        snap = self._snap(
+            revenue_yoy_history=[0.20, 0.35, 0.50],
+            revenue_yoy_pct=0.50,
+        )
+        score = compute_earnings_acceleration(snap)
+        # 50% YoY → mag = 0.50 * 0.5 = 0.25, no acceleration bonus
+        assert score == pytest.approx(0.25, abs=1e-4)
+
+    # ── Legacy QoQ fallback ───────────────────────────────────────────────────
+
+    def test_legacy_fallback_when_no_yoy_data(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # Only 3 quarters available — no YoY possible; falls back to QoQ method
+        snap = self._snap(eps_history=[1.0, 1.2, 1.5])  # accelerating QoQ
+        score = compute_earnings_acceleration(snap)
+        assert score > 0.5  # QoQ acceleration → above neutral
+
+    def test_legacy_fallback_neutral_when_too_few_quarters(self):
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # Only 2 quarters — can't do QoQ either
+        snap = self._snap(eps_history=[1.0, 1.2])
+        assert compute_earnings_acceleration(snap) == pytest.approx(0.5, abs=1e-4)
+
+    # ── fetch_fundamentals populates YoY fields ───────────────────────────────
+
+    def test_fetch_fundamentals_populates_yoy_from_rich_history(self, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+
+        # Build a fake EDGAR companyfacts response with 8 quarters of EPS and revenue
+        eps_vals = [1.0, 1.0, 1.0, 1.0, 1.3, 1.5, 1.75, 2.1]
+        rev_vals = [1e9 * v for v in eps_vals]
+
+        fake_eps_obs = [
+            {"form": "10-Q", "end": f"202{i//4+3}-{(i%4)*3+1:02d}-31", "filed": "x", "val": v}
+            for i, v in enumerate(eps_vals)
+        ]
+        fake_rev_obs = [
+            {"form": "10-Q", "end": f"202{i//4+3}-{(i%4)*3+1:02d}-31", "filed": "x", "val": v}
+            for i, v in enumerate(rev_vals)
+        ]
+
+        monkeypatch.setattr(_edgar, "lookup_cik", lambda t: "0000320193")
+        import requests as _req
+
+        class MockResp:
+            def raise_for_status(self): pass
+            def json(self):
+                return {"facts": {"us-gaap": {
+                    "EarningsPerShareDiluted": {"units": {"USD": fake_eps_obs}},
+                    "Revenues": {"units": {"USD": fake_rev_obs}},
+                }}}
+
+        monkeypatch.setattr(_req, "get", lambda url, headers, timeout: MockResp())
+
+        snap = _edgar.fetch_fundamentals("AAPL", metrics=["eps_diluted", "revenue"])
+        assert snap.eps_yoy_history != []
+        assert snap.revenue_yoy_history != []
+        assert snap.eps_yoy_pct is not None
+        assert snap.revenue_yoy_pct is not None
+        # All YoY rates should be positive (growth in every quarter)
+        assert all(r > 0 for r in snap.eps_yoy_history)
+        assert all(r > 0 for r in snap.revenue_yoy_history)

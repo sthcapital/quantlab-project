@@ -118,16 +118,33 @@ def print_dashboard(
         def _pct(v: float | None) -> str:
             return f"{v*100:+.1f}%" if v is not None else "--"
 
+        def _accel_flag(yoy_hist: list) -> str:
+            if len(yoy_hist) >= 3 and yoy_hist[-1] > yoy_hist[-2] > yoy_hist[-3]:
+                return " — accelerating ↑"
+            if len(yoy_hist) >= 2 and yoy_hist[-1] > yoy_hist[-2]:
+                return " — improving"
+            return ""
+
         print(f"\nFUNDAMENTALS  (SEC EDGAR — {fs.ticker}  CIK {fs.cik})")
         print(f"  Revenue        : {_mm(fs.revenue)}  ({_pct(fs.revenue_qoq_growth)} QoQ)")
         print(f"  Net income     : {_mm(fs.net_income)}  ({_pct(fs.net_income_qoq_growth)} QoQ)")
         print(f"  EPS diluted    : {_fmt(fs.eps_diluted, '.4f')}  ({_pct(fs.eps_qoq_growth)} QoQ)")
+        # YoY same-quarter metrics (more meaningful than QoQ for seasonal businesses)
+        if fs.revenue_yoy_pct is not None:
+            print(f"  Revenue YoY    : {_pct(fs.revenue_yoy_pct)}{_accel_flag(fs.revenue_yoy_history)}")
+        if fs.eps_yoy_pct is not None:
+            print(f"  EPS YoY        : {_pct(fs.eps_yoy_pct)}{_accel_flag(fs.eps_yoy_history)}")
         print(f"  Total assets   : {_mm(fs.total_assets)}")
         print(f"  Total debt     : {_mm(fs.total_debt)}")
         print(f"  Op. cash flow  : {_mm(fs.operating_cashflow)}")
         print(f"  CapEx          : {_mm(fs.capex)}")
         print(f"  Shares out     : {_mm(fs.shares_out)}")
-        print(f"  Earnings accel : {accel:.2f}  ({'accelerating' if accel > 0.55 else 'decelerating' if accel < 0.45 else 'neutral'})")
+        accel_label = (
+            "accelerating ↑" if fs.is_accelerating
+            else "decelerating" if accel < 0.45
+            else "neutral"
+        )
+        print(f"  Earnings accel : {accel:.2f}  ({accel_label})")
 
     print()
 
