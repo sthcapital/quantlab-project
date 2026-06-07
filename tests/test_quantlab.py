@@ -4999,3 +4999,238 @@ class TestUniverseManager:
         )
         assert stats.date == prev.isoformat()
         assert stats.date != today.isoformat()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Earnings calendar awareness (quantlab.providers.edgar + execution)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEarningsCalendar:
+    """Tests for earnings calendar functions and proximity-based conviction adjustments.
+    All network and DuckDB calls are mocked — no internet access required.
+    """
+
+    # ── count_trading_days ────────────────────────────────────────────────────
+
+    def test_count_trading_days_weekdays_only(self):
+        from quantlab.providers.edgar import count_trading_days
+        # Mon 2026-06-01 → Mon 2026-06-08: Mon+Tue+Wed+Thu+Fri+Mon = 6 trading days
+        result = count_trading_days(date(2026, 6, 1), date(2026, 6, 8))
+        assert result == 5  # Tue Wed Thu Fri Mon (5 days, Mon excluded as start)
+
+    def test_count_trading_days_same_day_returns_zero(self):
+        from quantlab.providers.edgar import count_trading_days
+        assert count_trading_days(date(2026, 6, 5), date(2026, 6, 5)) == 0
+
+    def test_count_trading_days_end_before_start_returns_zero(self):
+        from quantlab.providers.edgar import count_trading_days
+        assert count_trading_days(date(2026, 6, 10), date(2026, 6, 8)) == 0
+
+    def test_count_trading_days_skips_weekend(self):
+        from quantlab.providers.edgar import count_trading_days
+        # Fri → Mon: only Mon counts
+        assert count_trading_days(date(2026, 6, 5), date(2026, 6, 8)) == 1
+
+    def test_count_trading_days_one_week(self):
+        from quantlab.providers.edgar import count_trading_days
+        # Mon → following Mon = 5 trading days (Tue-Sat, only Tue-Fri=4? no: Tue Wed Thu Fri Mon)
+        # Mon 2026-06-08 → Mon 2026-06-15: Tue Wed Thu Fri Mon = 5
+        assert count_trading_days(date(2026, 6, 8), date(2026, 6, 15)) == 5
+
+    # ── ScanResult default ────────────────────────────────────────────────────
+
+    def test_scan_result_earnings_proximity_defaults_neutral(self):
+        r = ScanResult(
+            symbol="AAPL", scan_date="2026-06-07",
+            signal_type="breakout", signal=True,
+            entry_close=200.0, indicator_value=None, lookback=20,
+        )
+        assert r.earnings_proximity == "neutral"
+
+    # ── score_conviction earnings proximity adjustments ───────────────────────
+
+    @staticmethod
+    def _base(earnings_proximity: str = "neutral") -> ScanResult:
+        return ScanResult(
+            "AAPL", "2026-06-07", "breakout", True, 200.0, None, 20,
+            regime_bullish=False,
+            earnings_proximity=earnings_proximity,
+        )
+
+    def test_pre_earnings_reduces_conviction_by_010(self):
+        neutral = score_conviction(self._base("neutral"))
+        pre     = score_conviction(self._base("pre_earnings"))
+        assert neutral - pre == pytest.approx(0.10, abs=1e-9)
+
+    def test_post_earnings_beat_boosts_conviction_by_010(self):
+        neutral = score_conviction(self._base("neutral"))
+        beat    = score_conviction(self._base("post_earnings_beat"))
+        assert beat - neutral == pytest.approx(0.10, abs=1e-9)
+
+    def test_post_earnings_miss_reduces_conviction_by_005(self):
+        neutral = score_conviction(self._base("neutral"))
+        miss    = score_conviction(self._base("post_earnings_miss"))
+        assert neutral - miss == pytest.approx(0.05, abs=1e-9)
+
+    def test_neutral_proximity_no_change(self):
+        neutral = score_conviction(self._base("neutral"))
+        # signal=True, regime_bullish=False → 0.30 base only
+        assert neutral == pytest.approx(0.30, abs=1e-9)
+
+    def test_pre_earnings_penalty_clamped_at_zero(self):
+        # No signal → score_conviction returns 0.0 regardless
+        r = ScanResult("X", "2026-06-07", "breakout", False, 100.0, None, 5,
+                       earnings_proximity="pre_earnings")
+        assert score_conviction(r) == 0.0
+
+    def test_post_earnings_beat_score_clamped_at_one(self):
+        r = ScanResult(
+            "AAPL", "2026-06-07", "breakout", True, 200.0, None, 20,
+            regime_bullish=True,
+            news_count=1, news_category="earnings", news_c_score=0.9, rel_volume=2.0,
+            absorption=0.8, volume_character=0.8, wyckoff_spring=True,
+            earnings_proximity="post_earnings_beat",
+        )
+        assert score_conviction(r) == pytest.approx(1.0, abs=1e-9)
+
+    def test_proximity_ordering(self):
+        # beat > neutral > miss > pre
+        beat    = score_conviction(self._base("post_earnings_beat"))
+        neutral = score_conviction(self._base("neutral"))
+        miss    = score_conviction(self._base("post_earnings_miss"))
+        pre     = score_conviction(self._base("pre_earnings"))
+        assert beat > neutral > miss > pre
+
+    # ── get_next_earnings_date with mocked network ────────────────────────────
+
+    def test_get_next_earnings_date_returns_future_date(self, tmp_path, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+        from datetime import timedelta
+
+        today = date.today()
+        # Simulate 4 recent 10-Q filing dates at ~91-day intervals
+        filing_dates = [
+            today - timedelta(days=30),   # most recent
+            today - timedelta(days=121),
+            today - timedelta(days=212),
+            today - timedelta(days=303),
+        ]
+
+        monkeypatch.setattr(_edgar, "lookup_cik", lambda sym: "0000320193")
+        monkeypatch.setattr(_edgar, "_fetch_quarterly_filing_dates",
+                            lambda cik, limit=6: filing_dates[:limit])
+        monkeypatch.setattr(_edgar, "_load_earnings_calendar_cache",
+                            lambda sym, max_age_days=7: None)
+        monkeypatch.setattr(_edgar, "_save_earnings_calendar_cache",
+                            lambda *a, **kw: None)
+        monkeypatch.setattr(_edgar, "fetch_fundamentals",
+                            lambda sym, metrics=None, periods=12: _edgar.FundamentalSnapshot(
+                                ticker=sym, cik="0000320193", as_of=today,
+                                eps_history=[1.0, 1.2],
+                            ))
+
+        result = _edgar.get_next_earnings_date("AAPL")
+        assert result is not None
+        next_date, days_until = result
+        assert next_date > today
+        assert days_until >= 0
+
+    def test_get_next_earnings_date_returns_none_on_network_error(self, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+
+        monkeypatch.setattr(_edgar, "_load_earnings_calendar_cache",
+                            lambda sym, max_age_days=7: None)
+        monkeypatch.setattr(_edgar, "lookup_cik",
+                            lambda sym: (_ for _ in ()).throw(ValueError("not found")))
+
+        result = _edgar.get_next_earnings_date("XXXX")
+        assert result is None
+
+    def test_get_next_earnings_date_uses_cache(self, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+        from datetime import timedelta
+
+        today = date.today()
+        future = today + timedelta(days=45)
+
+        monkeypatch.setattr(_edgar, "_load_earnings_calendar_cache",
+                            lambda sym, max_age_days=7: (today - timedelta(days=30), future, True))
+        # _fetch_quarterly_filing_dates should NOT be called when cache is hit
+        fetch_called = []
+        monkeypatch.setattr(_edgar, "_fetch_quarterly_filing_dates",
+                            lambda cik, limit=6: fetch_called.append(1) or [])
+
+        result = _edgar.get_next_earnings_date("AAPL")
+        assert result is not None
+        assert result[0] == future
+        assert len(fetch_called) == 0  # network not hit
+
+    # ── get_last_earnings_result with mocked network ──────────────────────────
+
+    def test_get_last_earnings_result_beat(self, tmp_path, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+        from datetime import timedelta
+
+        today = date.today()
+        last_filing = today - timedelta(days=10)
+
+        monkeypatch.setattr(_edgar, "_load_earnings_calendar_cache",
+                            lambda sym, max_age_days=7: None)
+        monkeypatch.setattr(_edgar, "lookup_cik", lambda sym: "0000320193")
+        monkeypatch.setattr(_edgar, "_fetch_quarterly_filing_dates",
+                            lambda cik, limit=2: [last_filing])
+        monkeypatch.setattr(_edgar, "_save_earnings_calendar_cache",
+                            lambda *a, **kw: None)
+        monkeypatch.setattr(_edgar, "fetch_fundamentals",
+                            lambda sym, metrics=None, periods=12: _edgar.FundamentalSnapshot(
+                                ticker=sym, cik="0000320193", as_of=today,
+                                eps_history=[1.0, 1.5],  # 1.5 > 1.0 → beat
+                            ))
+
+        result = _edgar.get_last_earnings_result("AAPL")
+        assert result is not None
+        last_date, was_beat = result
+        assert last_date == last_filing
+        assert was_beat is True
+
+    def test_get_last_earnings_result_miss(self, tmp_path, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+        from datetime import timedelta
+
+        today = date.today()
+        last_filing = today - timedelta(days=8)
+
+        monkeypatch.setattr(_edgar, "_load_earnings_calendar_cache",
+                            lambda sym, max_age_days=7: None)
+        monkeypatch.setattr(_edgar, "lookup_cik", lambda sym: "0000MSFT")
+        monkeypatch.setattr(_edgar, "_fetch_quarterly_filing_dates",
+                            lambda cik, limit=2: [last_filing])
+        monkeypatch.setattr(_edgar, "_save_earnings_calendar_cache",
+                            lambda *a, **kw: None)
+        monkeypatch.setattr(_edgar, "fetch_fundamentals",
+                            lambda sym, metrics=None, periods=12: _edgar.FundamentalSnapshot(
+                                ticker=sym, cik="0000MSFT", as_of=today,
+                                eps_history=[2.0, 1.8],  # 1.8 < 2.0 → miss
+                            ))
+
+        result = _edgar.get_last_earnings_result("MSFT")
+        assert result is not None
+        _, was_beat = result
+        assert was_beat is False
+
+    def test_get_last_earnings_result_uses_cache(self, monkeypatch):
+        import quantlab.providers.edgar as _edgar
+        from datetime import timedelta
+
+        today = date.today()
+        last_d = today - timedelta(days=3)
+
+        monkeypatch.setattr(_edgar, "_load_earnings_calendar_cache",
+                            lambda sym, max_age_days=7: (last_d, today + timedelta(days=88), True))
+        fetch_called = []
+        monkeypatch.setattr(_edgar, "_fetch_quarterly_filing_dates",
+                            lambda cik, limit=2: fetch_called.append(1) or [])
+
+        result = _edgar.get_last_earnings_result("AAPL")
+        assert result == (last_d, True)
+        assert len(fetch_called) == 0

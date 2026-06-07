@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 _HEADERS = {"User-Agent": "QuantLab Research quantlab@sthcapital.com"}
 
 DEFAULT_METRICS = [
@@ -334,6 +335,232 @@ def get_edgar_acceleration(symbol: str, max_age_days: int = 7) -> Optional[float
 
 
 # ── Scoring ───────────────────────────────────────────────────────────────────
+
+# ── Earnings calendar helpers ─────────────────────────────────────────────────
+
+def count_trading_days(start: date, end: date) -> int:
+    """Count Mon–Fri trading days from start (exclusive) to end (inclusive)."""
+    if end <= start:
+        return 0
+    count = 0
+    current = start + timedelta(days=1)
+    while current <= end:
+        if current.weekday() < 5:
+            count += 1
+        current += timedelta(days=1)
+    return count
+
+
+def _ensure_earnings_calendar_table(con) -> None:
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS earnings_calendar (
+            symbol VARCHAR PRIMARY KEY,
+            last_earnings_date DATE,
+            next_earnings_date DATE,
+            was_beat BOOLEAN,
+            fetch_date DATE
+        )
+    """)
+
+
+def _load_earnings_calendar_cache(
+    symbol: str, max_age_days: int = 7
+) -> Optional[tuple]:
+    """Return (last_earnings_date, next_earnings_date, was_beat) if fresh, else None."""
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+
+        cutoff = (date.today() - timedelta(days=max_age_days)).isoformat()
+        con = duckdb.connect(str(DB_PATH))
+        _ensure_earnings_calendar_table(con)
+        row = con.execute(
+            """
+            SELECT last_earnings_date, next_earnings_date, was_beat
+            FROM earnings_calendar
+            WHERE symbol = ? AND fetch_date >= ?
+            """,
+            [symbol, cutoff],
+        ).fetchone()
+        con.close()
+        if row is None:
+            return None
+        last_d = date.fromisoformat(str(row[0])) if row[0] else None
+        next_d = date.fromisoformat(str(row[1])) if row[1] else None
+        was_beat = bool(row[2]) if row[2] is not None else None
+        return (last_d, next_d, was_beat)
+    except Exception as exc:
+        logger.debug("earnings_calendar cache lookup failed for %s: %s", symbol, exc)
+        return None
+
+
+def _save_earnings_calendar_cache(
+    symbol: str,
+    last_earnings_date: Optional[date],
+    next_earnings_date: Optional[date],
+    was_beat: Optional[bool],
+) -> None:
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+
+        con = duckdb.connect(str(DB_PATH))
+        _ensure_earnings_calendar_table(con)
+        con.execute(
+            """
+            INSERT OR REPLACE INTO earnings_calendar
+                (symbol, last_earnings_date, next_earnings_date, was_beat, fetch_date)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                symbol,
+                last_earnings_date.isoformat() if last_earnings_date else None,
+                next_earnings_date.isoformat() if next_earnings_date else None,
+                was_beat,
+                date.today().isoformat(),
+            ],
+        )
+        con.close()
+    except Exception as exc:
+        logger.warning("earnings_calendar cache write failed for %s: %s", symbol, exc)
+
+
+def _fetch_quarterly_filing_dates(cik: str, limit: int = 6) -> list[date]:
+    """Fetch dates of recent 10-Q and 10-K filings from SEC EDGAR submissions."""
+    url = _SUBMISSIONS_URL.format(cik=cik)
+    resp = requests.get(url, headers=_HEADERS, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+
+    recent = data.get("filings", {}).get("recent", {})
+    forms = recent.get("form", [])
+    filed_dates = recent.get("filingDate", [])
+
+    dates: list[date] = []
+    for form, filed in zip(forms, filed_dates):
+        if form in ("10-Q", "10-K"):
+            try:
+                dates.append(date.fromisoformat(filed))
+            except Exception:
+                pass
+
+    return sorted(set(dates), reverse=True)[:limit]
+
+
+def get_next_earnings_date(
+    symbol: str, max_age_days: int = 7
+) -> Optional[tuple[date, int]]:
+    """
+    Estimate next earnings date from SEC EDGAR 10-Q/10-K filing history.
+
+    Uses the quarterly cadence of recent 10-Q/10-K filings to project the
+    next reporting date. Results are cached in DuckDB for max_age_days.
+
+    Returns:
+        (estimated_date, trading_days_until) or None when unavailable.
+    """
+    cached = _load_earnings_calendar_cache(symbol, max_age_days)
+    if cached is not None:
+        _, next_d, _ = cached
+        if next_d is not None:
+            return (next_d, count_trading_days(date.today(), next_d))
+        return None
+
+    try:
+        cik = lookup_cik(symbol)
+        filing_dates = _fetch_quarterly_filing_dates(cik)
+
+        if not filing_dates:
+            return None
+
+        # Average interval from recent consecutive filings
+        if len(filing_dates) >= 2:
+            intervals = [
+                (filing_dates[i] - filing_dates[i + 1]).days
+                for i in range(min(3, len(filing_dates) - 1))
+            ]
+            avg_interval = round(sum(intervals) / len(intervals))
+        else:
+            avg_interval = 91
+
+        last_filing = filing_dates[0]
+        next_date = last_filing + timedelta(days=avg_interval)
+        today = date.today()
+
+        # Advance until the projected date is in the future
+        while next_date < today:
+            next_date += timedelta(days=avg_interval)
+
+        # Determine was_beat from EPS/NI history for the shared cache entry
+        was_beat: Optional[bool] = None
+        try:
+            snap = fetch_fundamentals(symbol, metrics=["eps_diluted", "net_income"])
+            history = snap.eps_history if snap.eps_history else snap.net_income_history
+            if len(history) >= 2:
+                was_beat = history[-1] > history[-2]
+        except Exception:
+            pass
+
+        _save_earnings_calendar_cache(symbol, last_filing, next_date, was_beat)
+        logger.debug(
+            "%s: next_earnings=%s  was_beat=%s  interval=%dd",
+            symbol, next_date, was_beat, avg_interval,
+        )
+        return (next_date, count_trading_days(today, next_date))
+
+    except Exception as exc:
+        logger.debug("get_next_earnings_date failed for %s: %s", symbol, exc)
+        return None
+
+
+def get_last_earnings_result(
+    symbol: str, max_age_days: int = 7
+) -> Optional[tuple[date, bool]]:
+    """
+    Return (last_earnings_date, was_beat) from most recent SEC EDGAR 10-Q/10-K.
+
+    Shares the earnings_calendar DuckDB cache with get_next_earnings_date —
+    calling either function first populates the cache for the other.
+
+    Returns:
+        (last_earnings_date, was_beat) or None when unavailable.
+    """
+    cached = _load_earnings_calendar_cache(symbol, max_age_days)
+    if cached is not None:
+        last_d, _, was_beat = cached
+        if last_d is not None and was_beat is not None:
+            return (last_d, was_beat)
+
+    try:
+        cik = lookup_cik(symbol)
+        filing_dates = _fetch_quarterly_filing_dates(cik, limit=2)
+
+        if not filing_dates:
+            return None
+
+        last_filing = filing_dates[0]
+
+        was_beat = None
+        try:
+            snap = fetch_fundamentals(symbol, metrics=["eps_diluted", "net_income"])
+            history = snap.eps_history if snap.eps_history else snap.net_income_history
+            if len(history) >= 2:
+                was_beat = history[-1] > history[-2]
+        except Exception:
+            pass
+
+        if was_beat is None:
+            return None
+
+        # Estimate next date for cache completeness
+        next_date = last_filing + timedelta(days=91)
+        _save_earnings_calendar_cache(symbol, last_filing, next_date, was_beat)
+        return (last_filing, was_beat)
+
+    except Exception as exc:
+        logger.debug("get_last_earnings_result failed for %s: %s", symbol, exc)
+        return None
+
 
 def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     """

@@ -134,6 +134,13 @@ class ScanResult:
     macro_regime: str = "risk_on"   # "risk_on" | "risk_off" | "stress"
     vix_regime: str = "low"         # "low" | "elevated" | "high" | "extreme"
 
+    # Earnings calendar proximity (set by run_universe_scan via EDGAR)
+    # "pre_earnings"        — next earnings within 5 trading days  (risk: gap risk)
+    # "post_earnings_beat"  — last earnings within 5 trading days, beat  (momentum)
+    # "post_earnings_miss"  — last earnings within 5 trading days, miss  (headwind)
+    # "neutral"             — no near-term earnings event
+    earnings_proximity: str = "neutral"
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -265,6 +272,14 @@ def score_conviction(result: ScanResult) -> float:
         score -= 0.10
     elif result.macro_regime == "risk_off":
         score -= 0.05
+
+    # Earnings calendar proximity adjustment
+    if result.earnings_proximity == "pre_earnings":
+        score -= 0.10   # gap risk — avoid entering before earnings
+    elif result.earnings_proximity == "post_earnings_beat":
+        score += 0.10   # momentum continuation after beat
+    elif result.earnings_proximity == "post_earnings_miss":
+        score -= 0.05   # headwind after miss
 
     return max(0.0, min(score, 1.0))
 
@@ -784,11 +799,19 @@ def run_universe_scan(
         except Exception as _fred_err:
             logger.debug("FRED macro context failed: %s", _fred_err)
 
-        # Import EDGAR helper once before the per-symbol loop.
+        # Import EDGAR helpers once before the per-symbol loop.
         try:
-            from quantlab.providers.edgar import get_edgar_acceleration as _get_edgar_accel
+            from quantlab.providers.edgar import (
+                get_edgar_acceleration as _get_edgar_accel,
+                get_next_earnings_date as _get_next_earnings,
+                get_last_earnings_result as _get_last_earnings,
+                count_trading_days as _count_trading_days,
+            )
         except Exception:
-            _get_edgar_accel = None  # type: ignore[assignment]
+            _get_edgar_accel = None       # type: ignore[assignment]
+            _get_next_earnings = None     # type: ignore[assignment]
+            _get_last_earnings = None     # type: ignore[assignment]
+            _count_trading_days = None    # type: ignore[assignment]
 
         # Fetch SPY bars once for regime filter and RS calculation.
         # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
@@ -851,6 +874,36 @@ def run_universe_scan(
                     result.macro_regime        = _macro_regime
                     result.vix_regime          = _vix_regime
                     result.edgar_acceleration  = edgar_accel
+
+                    # Earnings calendar proximity
+                    if _get_next_earnings is not None and _get_last_earnings is not None:
+                        try:
+                            _proximity = "neutral"
+                            _next = _get_next_earnings(symbol)
+                            if _next:
+                                _next_date, _days_until = _next
+                                if 0 <= _days_until <= 5:
+                                    _proximity = "pre_earnings"
+                            if _proximity == "neutral" and _count_trading_days is not None:
+                                _last = _get_last_earnings(symbol)
+                                if _last:
+                                    _last_date, _was_beat = _last
+                                    _days_since = _count_trading_days(_last_date, end_date)
+                                    if 0 <= _days_since <= 5:
+                                        _proximity = (
+                                            "post_earnings_beat"
+                                            if _was_beat else "post_earnings_miss"
+                                        )
+                            result.earnings_proximity = _proximity
+                            if _proximity != "neutral":
+                                logger.info(
+                                    "%s: earnings_proximity=%s", symbol, _proximity
+                                )
+                        except Exception as _ep_err:
+                            logger.debug(
+                                "%s: earnings_proximity unavailable: %s", symbol, _ep_err
+                            )
+
                     result.conviction_score    = score_conviction(result)
                     if edgar_accel is not None:
                         logger.debug(

@@ -233,6 +233,18 @@ def main() -> None:
         sector_abbr = _SECTOR_ABBREV.get(r.sector, r.sector[:6]) if r.sector else "?"
         sector_str  = f"  [{sector_abbr}{'⚑' if r.sector_cluster else ''}]"
         rs_str      = f"  rs={r.rs_score:.2f}" if r.rs_score > 0 else "  rs=--"
+        # Earnings info: earnings=2026-07-16(41d) [neutral]
+        earnings_str = ""
+        try:
+            from quantlab.providers.edgar import get_next_earnings_date as _gned
+            _next = _gned(r.symbol)
+            if _next:
+                _nd, _tdays = _next
+                earnings_str = f"  earnings={_nd.isoformat()}({_tdays}d) [{r.earnings_proximity}]"
+            elif r.earnings_proximity != "neutral":
+                earnings_str = f"  [{r.earnings_proximity}]"
+        except Exception:
+            pass
         print(
             f"  {i:2d}. {r.symbol:<8} "
             f"conviction={r.conviction_score:.2f}{multi_str}  "
@@ -241,6 +253,7 @@ def main() -> None:
             f"regime={'bull' if r.regime_bullish else 'bear'}  "
             f"news={r.news_category}({r.news_count})"
             f"{edgar_accel_str}{ohlcv_accel_str}{rs_str}{opt_str}{sector_str}{vol_str}{rv_str}{stop_str}"
+            f"{earnings_str}"
         )
 
     print(f"\n{'='*60}\n")
