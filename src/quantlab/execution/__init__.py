@@ -813,6 +813,14 @@ def run_universe_scan(
             _get_last_earnings = None     # type: ignore[assignment]
             _count_trading_days = None    # type: ignore[assignment]
 
+        # Import real-time earnings press release checker (highest priority proximity source).
+        try:
+            from quantlab.news.earnings_parser import (
+                get_recent_earnings_result as _get_recent_earn_result,
+            )
+        except Exception:
+            _get_recent_earn_result = None  # type: ignore[assignment]
+
         # Fetch SPY bars once for regime filter and RS calculation.
         # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
         spy_bars = None
@@ -876,33 +884,59 @@ def run_universe_scan(
                     result.edgar_acceleration  = edgar_accel
 
                     # Earnings calendar proximity
-                    if _get_next_earnings is not None and _get_last_earnings is not None:
-                        try:
-                            _proximity = "neutral"
-                            _next = _get_next_earnings(symbol)
-                            if _next:
-                                _next_date, _days_until = _next
-                                if 0 <= _days_until <= 5:
-                                    _proximity = "pre_earnings"
-                            if _proximity == "neutral" and _count_trading_days is not None:
+                    # Priority 1: real-time press release beat/miss (most authoritative)
+                    # Priority 2: EDGAR filing-based historical estimate (fallback)
+                    try:
+                        _proximity = "neutral"
+                        _used_real_time = False
+
+                        if _get_recent_earn_result is not None:
+                            _press = _get_recent_earn_result(symbol, max_days=5)
+                            if _press is not None:
+                                _used_real_time = True
+                                if _press.beat_score >= 0.7:
+                                    _proximity = "post_earnings_beat"
+                                elif _press.beat_score <= 0.3:
+                                    _proximity = "post_earnings_miss"
+                                # 0.3 < score < 0.7 → neutral (mixed signals)
+                                logger.debug(
+                                    "%s: press-release beat_score=%.2f → %s",
+                                    symbol, _press.beat_score, _proximity,
+                                )
+
+                        if not _used_real_time:
+                            # EDGAR fallback: pre-earnings proximity + historical beat
+                            if _get_next_earnings is not None:
+                                _next = _get_next_earnings(symbol)
+                                if _next:
+                                    _next_date, _days_until = _next
+                                    if 0 <= _days_until <= 5:
+                                        _proximity = "pre_earnings"
+                            if _proximity == "neutral" and (
+                                _get_last_earnings is not None
+                                and _count_trading_days is not None
+                            ):
                                 _last = _get_last_earnings(symbol)
                                 if _last:
                                     _last_date, _was_beat = _last
-                                    _days_since = _count_trading_days(_last_date, end_date)
+                                    _days_since = _count_trading_days(
+                                        _last_date, end_date
+                                    )
                                     if 0 <= _days_since <= 5:
                                         _proximity = (
                                             "post_earnings_beat"
                                             if _was_beat else "post_earnings_miss"
                                         )
-                            result.earnings_proximity = _proximity
-                            if _proximity != "neutral":
-                                logger.info(
-                                    "%s: earnings_proximity=%s", symbol, _proximity
-                                )
-                        except Exception as _ep_err:
-                            logger.debug(
-                                "%s: earnings_proximity unavailable: %s", symbol, _ep_err
+
+                        result.earnings_proximity = _proximity
+                        if _proximity != "neutral":
+                            logger.info(
+                                "%s: earnings_proximity=%s", symbol, _proximity
                             )
+                    except Exception as _ep_err:
+                        logger.debug(
+                            "%s: earnings_proximity unavailable: %s", symbol, _ep_err
+                        )
 
                     result.conviction_score    = score_conviction(result)
                     if edgar_accel is not None:

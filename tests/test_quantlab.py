@@ -5525,3 +5525,301 @@ class TestEdgarYoYMetrics:
         assert _score(0.999) == pytest.approx(0.6,  abs=1e-4)   # just below 100%
         assert _score(1.00)  == pytest.approx(0.9,  abs=1e-4)   # exactly 100%
         assert _score(5.00)  == pytest.approx(0.9,  abs=1e-4)   # way above 100%
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IBKR earnings headline parser (quantlab.news.earnings_parser)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEarningsHeadlineParser:
+    """Tests for earnings_parser — no network or DuckDB connection required."""
+
+    # ── is_earnings_headline ─────────────────────────────────────────────────
+
+    def test_is_earnings_headline_quarterly_results(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Apple Reports Quarterly Results") is True
+
+    def test_is_earnings_headline_eps_word(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("NVDA Reports Q2 EPS $5.98 vs $5.59 Estimate") is True
+
+    def test_is_earnings_headline_per_share(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Earned $2.01 per share in Q2") is True
+
+    def test_is_earnings_headline_q_earnings(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Meta Q3 earnings release") is True
+
+    def test_is_earnings_headline_fiscal_q(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Reports fiscal Q2 results") is True
+
+    def test_is_earnings_headline_beats_estimates(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Company beats estimates on strong demand") is True
+
+    def test_is_earnings_headline_false_upgrade(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Goldman Sachs raises AAPL to Buy") is False
+
+    def test_is_earnings_headline_false_generic_news(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("CEO John Smith joins the board of directors") is False
+
+    def test_is_earnings_headline_false_analyst_reco(self):
+        from quantlab.news.earnings_parser import is_earnings_headline
+        assert is_earnings_headline("Analyst reiterates Outperform on NVDA") is False
+
+    # ── parse_earnings_headline — EPS extraction ─────────────────────────────
+
+    def test_parse_eps_vs_estimate(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Reports Q2 EPS $2.01 vs $1.88 Estimate")
+        assert p.eps_actual  == pytest.approx(2.01)
+        assert p.eps_estimate == pytest.approx(1.88)
+        assert p.eps_beat is True
+        assert p.quarter == "Q2"
+
+    def test_parse_eps_beats_keyword(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Q3 Earnings: EPS $1.52 Beats $1.44 Estimate")
+        assert p.eps_actual  == pytest.approx(1.52)
+        assert p.eps_estimate == pytest.approx(1.44)
+        assert p.eps_beat is True
+        assert p.quarter == "Q3"
+
+    def test_parse_eps_misses_keyword(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("CELH Q1 EPS $0.42 Misses $0.51 Estimate")
+        assert p.eps_actual  == pytest.approx(0.42)
+        assert p.eps_estimate == pytest.approx(0.51)
+        assert p.eps_beat is False
+        assert p.quarter == "Q1"
+
+    def test_parse_eps_no_estimate_gives_none_beat(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Reports fiscal Q2 results: EPS $2.01")
+        assert p.eps_actual  == pytest.approx(2.01)
+        assert p.eps_estimate is None
+        assert p.eps_beat is None
+
+    def test_parse_eps_estimate_of_form(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("EPS $1.80 vs estimate of $1.75")
+        assert p.eps_actual  == pytest.approx(1.80)
+        assert p.eps_estimate == pytest.approx(1.75)
+        assert p.eps_beat is True
+
+    # ── parse_earnings_headline — Revenue extraction ──────────────────────────
+
+    def test_parse_revenue_vs_billions(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Revenue $94.9B vs $94.1B Expected")
+        assert p.revenue_actual   == pytest.approx(94_900.0)
+        assert p.revenue_estimate == pytest.approx(94_100.0)
+        assert p.revenue_beat is True
+
+    def test_parse_revenue_vs_millions(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Revenue $450.2M vs $430.0M Expected")
+        assert p.revenue_actual   == pytest.approx(450.2)
+        assert p.revenue_estimate == pytest.approx(430.0)
+        assert p.revenue_beat is True
+
+    def test_parse_revenue_miss_when_below(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Sales $88.5B vs $89.3B Expected")
+        assert p.revenue_beat is False
+
+    def test_parse_revenue_only_no_comparison(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Reports fiscal Q2 results: EPS $2.01, Revenue $94.9B")
+        assert p.revenue_actual   == pytest.approx(94_900.0)
+        assert p.revenue_estimate is None
+        assert p.revenue_beat is None
+
+    # ── parse_earnings_headline — combined and metadata ───────────────────────
+
+    def test_parse_combined_eps_and_revenue(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        h = "NVDA Q4: EPS $0.52 Beats $0.45 Estimate; Revenue $22.1B vs $20.6B Expected"
+        p = parse_earnings_headline(h)
+        assert p.eps_actual  == pytest.approx(0.52)
+        assert p.eps_beat is True
+        assert p.revenue_actual   == pytest.approx(22_100.0)
+        assert p.revenue_estimate == pytest.approx(20_600.0)
+        assert p.revenue_beat is True
+        assert p.quarter == "Q4"
+
+    def test_parse_quarter_all_four(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        for q in range(1, 5):
+            p = parse_earnings_headline(f"Company Reports Q{q} 2026 EPS $1.00 vs $0.90")
+            assert p.quarter == f"Q{q}", f"Failed for Q{q}"
+
+    def test_parse_fiscal_year_extracted(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Reports Q1 2025 EPS $1.50 vs $1.40 Estimate")
+        assert p.fiscal_year == 2025
+
+    def test_parse_non_earnings_headline_returns_none_fields(self):
+        from quantlab.news.earnings_parser import parse_earnings_headline
+        p = parse_earnings_headline("Goldman Sachs raises price target on AAPL")
+        assert p.eps_actual is None
+        assert p.revenue_actual is None
+        assert p.quarter is None
+
+    # ── compute_beat_score ────────────────────────────────────────────────────
+
+    def test_beat_score_both_beat(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(True, True) == pytest.approx(1.0)
+
+    def test_beat_score_both_miss(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(False, False) == pytest.approx(0.0)
+
+    def test_beat_score_eps_beat_revenue_unknown(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(True, None) == pytest.approx(0.7)
+
+    def test_beat_score_revenue_beat_eps_unknown(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(None, True) == pytest.approx(0.5)
+
+    def test_beat_score_eps_beat_revenue_miss(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(True, False) == pytest.approx(0.3)
+
+    def test_beat_score_eps_miss_revenue_beat(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(False, True) == pytest.approx(0.3)
+
+    def test_beat_score_eps_miss_only(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(False, None) == pytest.approx(0.3)
+
+    def test_beat_score_revenue_miss_only(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(None, False) == pytest.approx(0.3)
+
+    def test_beat_score_insufficient_data(self):
+        from quantlab.news.earnings_parser import compute_beat_score
+        assert compute_beat_score(None, None) == pytest.approx(0.5)
+
+    # ── EarningsResult dataclass ──────────────────────────────────────────────
+
+    def test_earnings_result_fields(self):
+        from quantlab.news.earnings_parser import EarningsResult
+        r = EarningsResult(
+            symbol="AAPL", report_date="2026-06-07", quarter="Q2",
+            fiscal_year=2026, eps_actual=2.01, eps_estimate=1.88,
+            eps_beat=True, revenue_actual=94_900.0, revenue_estimate=94_100.0,
+            revenue_beat=True, beat_score=1.0,
+            headline_source="Reports Q2 EPS $2.01 vs $1.88",
+        )
+        assert r.symbol == "AAPL"
+        assert r.beat_score == pytest.approx(1.0)
+        assert r.eps_beat is True
+        assert r.quarter == "Q2"
+
+    def test_make_earnings_result_eps_beat_only(self):
+        from quantlab.news.earnings_parser import make_earnings_result
+        r = make_earnings_result(
+            "AAPL", "Reports Q2 EPS $2.01 vs $1.88 Estimate", "2026-06-07"
+        )
+        assert r is not None
+        assert r.symbol == "AAPL"
+        assert r.eps_actual  == pytest.approx(2.01)
+        assert r.eps_beat is True
+        assert r.beat_score  == pytest.approx(0.7)   # eps beat only (no revenue)
+
+    def test_make_earnings_result_both_beat(self):
+        from quantlab.news.earnings_parser import make_earnings_result
+        h = "NVDA Q4 EPS $0.52 Beats $0.45 Estimate; Revenue $22.1B vs $20.6B Expected"
+        r = make_earnings_result("NVDA", h, "2026-06-07")
+        assert r is not None
+        assert r.beat_score == pytest.approx(1.0)
+        assert r.eps_beat is True
+        assert r.revenue_beat is True
+
+    def test_make_earnings_result_non_earnings_returns_none(self):
+        from quantlab.news.earnings_parser import make_earnings_result
+        r = make_earnings_result("AAPL", "Goldman Sachs upgrades AAPL to Buy")
+        assert r is None
+
+    # ── DuckDB store and retrieve ─────────────────────────────────────────────
+
+    def test_store_and_retrieve_round_trip(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test.duckdb")
+
+        from quantlab.news.earnings_parser import (
+            EarningsResult, store_earnings_result, get_recent_earnings_result,
+        )
+        r = EarningsResult(
+            symbol="NVDA", report_date=date.today().isoformat(),
+            quarter="Q2", fiscal_year=2026,
+            eps_actual=5.98, eps_estimate=5.59, eps_beat=True,
+            revenue_actual=22_100.0, revenue_estimate=20_600.0, revenue_beat=True,
+            beat_score=1.0, headline_source="test headline",
+        )
+        store_earnings_result(r)
+        retrieved = get_recent_earnings_result("NVDA", max_days=5)
+        assert retrieved is not None
+        assert retrieved.symbol == "NVDA"
+        assert retrieved.beat_score == pytest.approx(1.0)
+        assert retrieved.eps_beat is True
+        assert retrieved.revenue_beat is True
+        assert retrieved.eps_actual == pytest.approx(5.98)
+
+    def test_retrieve_respects_max_days(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        from datetime import timedelta
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test2.duckdb")
+
+        from quantlab.news.earnings_parser import (
+            EarningsResult, store_earnings_result, get_recent_earnings_result,
+        )
+        # Store a result from 20 calendar days ago (~14 trading days — clearly outside window)
+        old_date = (date.today() - timedelta(days=20)).isoformat()
+        r = EarningsResult(
+            symbol="TSLA", report_date=old_date,
+            quarter="Q1", fiscal_year=2026,
+            eps_actual=1.50, eps_estimate=1.40, eps_beat=True,
+            revenue_actual=None, revenue_estimate=None, revenue_beat=None,
+            beat_score=0.7, headline_source="stale test",
+        )
+        store_earnings_result(r)
+        result = get_recent_earnings_result("TSLA", max_days=5)
+        assert result is None  # outside 5-trading-day window
+
+    def test_retrieve_returns_none_for_unknown_symbol(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test3.duckdb")
+
+        from quantlab.news.earnings_parser import get_recent_earnings_result
+        assert get_recent_earnings_result("ZZZZZ", max_days=5) is None
+
+    def test_missing_beat_fields_preserved_as_none(self, tmp_path, monkeypatch):
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DB_PATH", tmp_path / "test4.duckdb")
+
+        from quantlab.news.earnings_parser import (
+            EarningsResult, store_earnings_result, get_recent_earnings_result,
+        )
+        r = EarningsResult(
+            symbol="CELH", report_date=date.today().isoformat(),
+            quarter="Q2", fiscal_year=2026,
+            eps_actual=0.42, eps_estimate=None, eps_beat=None,
+            revenue_actual=None, revenue_estimate=None, revenue_beat=None,
+            beat_score=0.5, headline_source="no estimate headline",
+        )
+        store_earnings_result(r)
+        out = get_recent_earnings_result("CELH", max_days=5)
+        assert out is not None
+        assert out.eps_beat is None
+        assert out.revenue_beat is None
+        assert out.beat_score == pytest.approx(0.5)
