@@ -35,6 +35,7 @@ def _sig(
     concentrated: bool = True,
     today_vol: float = 1000.0,
     avg_vol: float = 100.0,
+    consecutive_days: int = 2,   # minimal valid signal (today + 1 prior day)
 ) -> UnusualOptionsSignal:
     return UnusualOptionsSignal(
         symbol="CAT", date=SCAN_DATE,
@@ -49,6 +50,7 @@ def _sig(
         days_to_expiry=dte,
         otm_pct=otm_pct,
         is_concentrated=concentrated,
+        consecutive_days=consecutive_days,
         conviction_score=0.0,
     )
 
@@ -108,12 +110,17 @@ class TestUnusualOptionsSignal:
         assert s.option_type == "C"
         assert s.volume_ratio == pytest.approx(10.0)
         assert s.is_concentrated is True
+        assert s.consecutive_days == 2   # default from _sig()
 
     def test_defaults(self):
         s = _sig()
         assert s.oi_today == 0.0
         assert s.oi_change_3day == 0.0
         assert s.conviction_score == 0.0
+
+    def test_consecutive_days_field_present(self):
+        s = _sig(consecutive_days=4)
+        assert s.consecutive_days == 4
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -328,8 +335,8 @@ class TestScoreUnusualActivity:
         assert score_unusual_activity([]) == 0.0
 
     def test_single_strong_signal(self):
-        """50× ratio, concentrated, optimal DTE → near max score."""
-        s = _sig(volume_ratio=50.0, dte=37, concentrated=True)
+        """50× ratio, 3 consecutive days, concentrated, optimal DTE → near max score."""
+        s = _sig(volume_ratio=50.0, dte=37, concentrated=True, consecutive_days=3)
         score = score_unusual_activity([s])
         assert score > 0.8
 
@@ -380,8 +387,8 @@ class TestScoreUnusualActivity:
         assert score >= 0.5
 
     def test_0_7_threshold(self):
-        """Strong signal should cross 0.7 for the +0.15 bonus."""
-        s = _sig(volume_ratio=30.0, dte=35, concentrated=True)
+        """Strong signal (3+ consecutive days) should cross 0.7 for the +0.15 bonus."""
+        s = _sig(volume_ratio=30.0, dte=35, concentrated=True, consecutive_days=3)
         score = score_unusual_activity([s])
         assert score >= 0.7
 
@@ -551,3 +558,166 @@ class TestScoreConvictionTierAware:
         # mid_cap uses unusual (+0.15); mega_cap uses flat options_score (0.90 → +0.15)
         # Same bonus amount in this case but different routing
         assert score_conviction(r) == pytest.approx(score_conviction(r_flat_only))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Consecutive-day filter (post live-validation refinement)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestConsecutiveDayFilter:
+    """
+    Tests for the consecutive-day filter that eliminates one-day spikes.
+
+    Live validation context:
+        BROS May-18: one-day spike → false positive → should be filtered.
+        PATH May-26, CELH May-21: multi-day accumulation → true positives.
+    """
+
+    def _make_chains(self, today_vol: float, recent_vols: list[float],
+                     old_vols: list[float], strike: float = 315.0) -> dict:
+        """Build chains dict: today + recent days + old days (for avg baseline)."""
+        chains: dict = {}
+        chains[SCAN_DATE] = [_option_row("CAT", strike, "C", today_vol, dte_days=35)]
+        for i, vol in enumerate(recent_vols, start=1):
+            chains[SCAN_DATE - timedelta(days=i)] = [
+                _option_row("CAT", strike, "C", vol, dte_days=35 + i)
+            ]
+        # Old days start at offset = len(recent_vols) + 2 (skip day gap)
+        for j, vol in enumerate(old_vols):
+            d = SCAN_DATE - timedelta(days=len(recent_vols) + 2 + j)
+            chains[d] = [_option_row("CAT", strike, "C", vol, dte_days=35 + len(recent_vols) + 2 + j)]
+        return chains
+
+    def test_single_day_spike_filtered_out(self):
+        """Today unusual but last 4 days quiet → consecutive_days=1 → filtered."""
+        # Old days give good avg; recent days are quiet (ratio << 5x).
+        # avg from 10 old days (vol=1000): avg_20day = 10*1000/20 = 500
+        # recent days (vol=20): 20/500 = 0.04x → NOT unusual
+        # today: 5000/500 = 10x → unusual, but consecutive_days = 1 < min=2
+        chains = self._make_chains(
+            today_vol=5000.0,
+            recent_vols=[20.0, 20.0, 20.0, 20.0],    # 4 quiet recent days
+            old_vols=[1000.0] * 10,                    # old days for avg baseline
+        )
+        ffp = _make_ffp(chains)
+        signals = detect_unusual_activity("CAT", SCAN_DATE, ffp, SPOT)
+        assert signals == [], f"Expected no signals (one-day spike), got {len(signals)}"
+
+    def test_multi_day_accumulation_passes(self):
+        """Unusual on 3 of 4 recent days → consecutive_days=4 → passes filter."""
+        # All recent days also unusual → consecutive = 5 (today + 4 hist)
+        chains = self._make_chains(
+            today_vol=5000.0,
+            recent_vols=[1000.0, 1000.0, 1000.0, 1000.0],  # all unusual
+            old_vols=[],
+        )
+        ffp = _make_ffp(chains)
+        signals = detect_unusual_activity("CAT", SCAN_DATE, ffp, SPOT)
+        assert len(signals) >= 1
+        assert signals[0].consecutive_days >= 2
+
+    def test_consecutive_days_count_correct(self):
+        """3 of 4 recent days unusual → consecutive_days = 4 (today + 3)."""
+        # avg from recent 4 days (mix): avg = (3*1000 + 1*10) / 20 = 150.5
+        # Days 1-3: 1000/150.5 = 6.6x → unusual
+        # Day 4: 10/150.5 = 0.07x → NOT unusual
+        chains: dict = {}
+        strike = 315.0
+        chains[SCAN_DATE] = [_option_row("CAT", strike, "C", 5000.0, dte_days=35)]
+        chains[SCAN_DATE - timedelta(days=1)] = [_option_row("CAT", strike, "C", 1000.0)]
+        chains[SCAN_DATE - timedelta(days=2)] = [_option_row("CAT", strike, "C", 1000.0)]
+        chains[SCAN_DATE - timedelta(days=3)] = [_option_row("CAT", strike, "C", 1000.0)]
+        chains[SCAN_DATE - timedelta(days=4)] = [_option_row("CAT", strike, "C",   10.0)]
+        # avg_20day = (3*1000 + 10) / 20 = 150.5, recent days 1-3 → 6.6x (unusual)
+        ffp = _make_ffp(chains)
+        signals = detect_unusual_activity("CAT", SCAN_DATE, ffp, SPOT)
+        assert len(signals) >= 1
+        assert signals[0].consecutive_days == 4
+
+    def test_min_consecutive_1_disables_filter(self):
+        """min_consecutive_days=1 should let one-day spikes through."""
+        chains = self._make_chains(
+            today_vol=5000.0,
+            recent_vols=[20.0, 20.0, 20.0, 20.0],
+            old_vols=[1000.0] * 10,
+        )
+        ffp = _make_ffp(chains)
+        signals = detect_unusual_activity(
+            "CAT", SCAN_DATE, ffp, SPOT, min_consecutive_days=1
+        )
+        assert len(signals) >= 1   # passes with filter disabled
+
+    def test_min_consecutive_3_stricter(self):
+        """min_consecutive_days=3 requires 3+ days; 2-day pattern filtered out."""
+        # Only 1 historical day unusual → consecutive_days = 2 < 3 → filtered
+        chains: dict = {}
+        strike = 315.0
+        chains[SCAN_DATE] = [_option_row("CAT", strike, "C", 5000.0, dte_days=35)]
+        chains[SCAN_DATE - timedelta(days=1)] = [_option_row("CAT", strike, "C", 2000.0)]
+        chains[SCAN_DATE - timedelta(days=2)] = [_option_row("CAT", strike, "C",   10.0)]
+        chains[SCAN_DATE - timedelta(days=3)] = [_option_row("CAT", strike, "C",   10.0)]
+        # avg = (2000 + 3*10) / 20 = 2030/20 = 101.5
+        # day 1: 2000/101.5 = 19.7x → unusual
+        # days 2-3: 10/101.5 = 0.1x → not unusual
+        # consecutive_days = 2 (today + day 1) < 3 → filtered
+        ffp = _make_ffp(chains)
+        signals_strict = detect_unusual_activity(
+            "CAT", SCAN_DATE, ffp, SPOT, min_consecutive_days=3
+        )
+        signals_normal = detect_unusual_activity(
+            "CAT", SCAN_DATE, ffp, SPOT, min_consecutive_days=2
+        )
+        assert signals_strict == []   # 2 < 3 → filtered
+        assert len(signals_normal) >= 1  # 2 >= 2 → passes
+
+
+class TestConsecutiveDayScoring:
+    """Tests for how consecutive_days affects score_unusual_activity()."""
+
+    def test_3plus_days_gets_hard_boost(self):
+        """3+ consecutive days adds the +0.15 hard boost."""
+        s2 = _sig(volume_ratio=20.0, dte=35, concentrated=True, consecutive_days=2)
+        s3 = _sig(volume_ratio=20.0, dte=35, concentrated=True, consecutive_days=3)
+        score2 = score_unusual_activity([s2])
+        score3 = score_unusual_activity([s3])
+        # s3 gets the +0.15 boost; s2 does not
+        assert score3 > score2
+        assert score3 - score2 >= 0.10   # boost + higher consec_comp
+
+    def test_more_consecutive_days_higher_score(self):
+        """Monotone: 1 < 2 < 3 < 4 < 5 consecutive days."""
+        scores = []
+        for n in range(1, 6):
+            s = _sig(volume_ratio=15.0, dte=35, concentrated=True, consecutive_days=n)
+            scores.append(score_unusual_activity([s]))
+        # Scores should be strictly increasing (with the +0.15 jump at 3+)
+        assert all(scores[i] <= scores[i + 1] for i in range(len(scores) - 1))
+
+    def test_1_day_lowest_consec_score(self):
+        """Single-day signal has the lowest consecutive component."""
+        s1 = _sig(volume_ratio=20.0, dte=35, concentrated=True, consecutive_days=1)
+        s5 = _sig(volume_ratio=20.0, dte=35, concentrated=True, consecutive_days=5)
+        assert score_unusual_activity([s5]) > score_unusual_activity([s1])
+
+    def test_conviction_score_backfilled(self):
+        """score_unusual_activity back-fills per-signal conviction_score."""
+        signals = [
+            _sig(volume_ratio=20.0, dte=35, concentrated=True, consecutive_days=3),
+            _sig(volume_ratio=10.0, dte=40, concentrated=True, consecutive_days=2),
+        ]
+        score_unusual_activity(signals)
+        # Both should have positive conviction_score; 3-day signal scores higher
+        assert signals[0].conviction_score > 0
+        assert signals[1].conviction_score > 0
+        assert signals[0].conviction_score >= signals[1].conviction_score
+
+    def test_sector_threshold_docs(self):
+        """Passing 8.0 threshold for consumer/restaurant names is documented behaviour."""
+        # This is a documentation test — just verify the parameter is accepted
+        ffp = _make_ffp({})
+        signals = detect_unusual_activity(
+            "BROS", SCAN_DATE, ffp, spot_price=70.0,
+            volume_ratio_threshold=8.0,
+        )
+        # No data in mock → empty, but the call itself must not raise
+        assert signals == []

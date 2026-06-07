@@ -10,6 +10,12 @@ Data source: Massive S3 flat files via FlatFileProvider (no API key required).
 The 20-day historical baseline uses cached Parquet files only — dates that
 haven't been synced are silently skipped.
 
+Key refinement (post live-validation):
+    Consecutive-day filter: requires the same strike to show unusual activity
+    on 2+ of the last 5 trading days.  This eliminates one-day spikes (which
+    were false positives in live testing — BROS May-18) while keeping genuine
+    multi-day institutional accumulation (PATH May-26, CELH May-21).
+
 Usage::
 
     from quantlab.providers.flat_files import FlatFileProvider
@@ -34,6 +40,16 @@ logger = logging.getLogger(__name__)
 # contracts look like enormous multiples of effectively-zero baseline.
 _MIN_AVG_VOL: float = 10.0
 
+# Consecutive-day scoring lookup: days of unusual activity → component score.
+# Today always counts as 1; prior days add to the count.
+_CONSEC_SCORE: dict[int, float] = {
+    1: 0.10,   # only today — weak (likely noise); usually filtered by min_consecutive_days
+    2: 0.45,   # today + 1 prior day — possible accumulation
+    3: 0.75,   # today + 2 prior days — probable institutional
+    4: 0.90,   # strong accumulation pattern
+    5: 1.00,   # maximum — strike active all 5 days
+}
+
 
 # ── Data structure ─────────────────────────────────────────────────────────────
 
@@ -54,6 +70,8 @@ class UnusualOptionsSignal:
     days_to_expiry: int
     otm_pct: float                # (strike − spot) / spot; positive = OTM call
     is_concentrated: bool         # True when top-3 strikes hold >60% of unusual vol
+    consecutive_days: int         # unusual-activity days out of last 5 trading days
+                                  # (today counts as 1; prior days add to total)
     conviction_score: float       # 0.0–1.0 from score_unusual_activity()
 
 
@@ -73,6 +91,9 @@ def compute_20day_avg_volume(
     Dates without a cached options file are silently skipped.  The denominator
     is ``trading_days`` (not just active days) so rarely-traded strikes produce
     conservative (low) averages.
+
+    Key: ``(strike, option_type)`` tuple — aggregates volume across all expiries
+    at the same strike so new expiry series inherit the established baseline.
 
     Returns:
         ``{(strike, option_type): avg_daily_volume}``
@@ -114,6 +135,42 @@ def compute_20day_avg_volume(
     }
 
 
+def _load_recent_days(
+    symbol: str,
+    as_of: date,
+    flat_file_provider,
+    n_days: int = 4,
+) -> list[dict[tuple[float, str], float]]:
+    """
+    Load volume snapshots for the ``n_days`` cached trading days before ``as_of``.
+
+    Returns a list (oldest first) of dicts mapping ``(strike, option_type)`` →
+    volume.  Non-cached dates are silently skipped.  Used for the consecutive-day
+    count without triggering new S3 downloads.
+    """
+    snapshots: list[dict[tuple[float, str], float]] = []
+    current = as_of - timedelta(days=1)
+    limit = as_of - timedelta(days=n_days * 3)   # buffer for weekends/holidays
+
+    while len(snapshots) < n_days and current >= limit:
+        try:
+            cache = flat_file_provider.options_cache_path(current)
+            if not cache.exists():
+                current -= timedelta(days=1)
+                continue
+            records = flat_file_provider.get_options_chain_from_flatfile(symbol, current)
+            snapshots.append({
+                (float(r["strike"]), str(r["option_type"])): float(r["volume"])
+                for r in records
+            })
+        except Exception:
+            pass
+        current -= timedelta(days=1)
+
+    snapshots.reverse()   # oldest first
+    return snapshots
+
+
 # ── Detection ──────────────────────────────────────────────────────────────────
 
 def detect_unusual_activity(
@@ -127,17 +184,27 @@ def detect_unusual_activity(
     otm_pct_max: float = 0.20,
     dte_min: int = 10,
     dte_max: int = 60,
+    min_consecutive_days: int = 2,
 ) -> list[UnusualOptionsSignal]:
     """
     Detect unusual institutional call activity for ``symbol`` on ``as_of``.
 
-    All five filters must pass:
+    All five filters must pass today:
 
-    1. ``option_type == "C"``                  calls only (long signals)
-    2. ``volume_ratio >= volume_ratio_threshold``  today 5× the 20-day avg
-    3. ``avg_20day_volume >= min_avg_volume``   strike is normally tradeable
-    4. ``otm_pct in [0.03, 0.20]``             OTM positioning, not ATM hedging
-    5. ``days_to_expiry in [10, 60]``           no weeklies, no LEAPs
+    1. ``option_type == "C"``                   calls only (long signals)
+    2. ``volume_ratio >= volume_ratio_threshold`` today 5× the 20-day avg
+       (pass 8.0 for consumer/restaurant names, 5.0 for software/biotech)
+    3. ``avg_20day_volume >= min_avg_volume``    strike is normally tradeable
+    4. ``otm_pct in [0.03, 0.20]``              OTM positioning, not ATM hedging
+    5. ``days_to_expiry in [10, 60]``            no weeklies, no LEAPs
+
+    Consecutive-day filter (post-validation):
+
+        Only keeps strikes where the same unusual activity appeared on
+        ``min_consecutive_days`` or more of the last 5 trading days
+        (today counts as day 1).  Default min is 2 — this eliminates
+        one-day spikes (false positives like BROS May-18) while keeping
+        multi-day accumulation patterns (PATH May-26, CELH May-21).
 
     Concentration flag: ``is_concentrated=True`` when the top-3 strikes by
     today's volume account for > 60% of all unusual-call volume.
@@ -145,10 +212,13 @@ def detect_unusual_activity(
     Args:
         symbol:                  Underlying ticker.
         as_of:                   Scan date.
-        flat_file_provider:      FlatFileProvider (cached reads only for 20-day avg).
+        flat_file_provider:      FlatFileProvider (cached reads only).
         spot_price:              Current price for OTM % calculation.
-        volume_ratio_threshold:  Minimum volume multiple (5.0 for mid-cap,
-                                 3.0 for large-cap).
+        volume_ratio_threshold:  Minimum volume multiple.  Use 8.0 for
+                                 consumer/restaurant names and 5.0 for
+                                 software/biotech mid-caps.
+        min_consecutive_days:    Minimum unusual-activity days out of last 5
+                                 (including today).  Set to 1 to disable.
 
     Returns:
         List sorted by volume_ratio descending.  Empty when no signal passes.
@@ -169,7 +239,7 @@ def detect_unusual_activity(
     # 20-day baseline (cache-only reads)
     avg_vol = compute_20day_avg_volume(symbol, as_of, flat_file_provider)
 
-    # Apply filters
+    # Apply per-contract filters for today
     candidates: list[dict] = []
     for rec in today_chain:
         if rec.get("option_type") != "C":
@@ -214,7 +284,29 @@ def detect_unusual_activity(
     if not candidates:
         return []
 
-    # Concentration check: top-3 strikes > 60% of total unusual volume
+    # ── Consecutive-day filter ─────────────────────────────────────────────────
+    # Load the last 4 cached trading days (today is day 1; these are days 2–5).
+    # One read per day regardless of number of candidates.
+    recent_snapshots = _load_recent_days(symbol, as_of, flat_file_provider, n_days=4)
+
+    for c in candidates:
+        strike = c["strike"]
+        avg = c["avg_20day_volume"]
+        # Today always counts as 1
+        count = 1
+        for snap in recent_snapshots:
+            vol = snap.get((strike, "C"), 0.0)
+            if avg > 0 and vol / avg >= volume_ratio_threshold:
+                count += 1
+        c["consecutive_days"] = count
+
+    if min_consecutive_days > 1:
+        candidates = [c for c in candidates if c["consecutive_days"] >= min_consecutive_days]
+
+    if not candidates:
+        return []
+
+    # ── Concentration check ────────────────────────────────────────────────────
     total_vol = sum(c["today_volume"] for c in candidates)
     top3_vol = sum(
         c["today_volume"]
@@ -231,13 +323,14 @@ def detect_unusual_activity(
             today_volume=c["today_volume"],
             avg_20day_volume=c["avg_20day_volume"],
             volume_ratio=c["volume_ratio"],
-            oi_today=0.0,           # flat file has no OI column
-            oi_change_3day=0.0,     # flat file has no OI column
+            oi_today=0.0,
+            oi_change_3day=0.0,
             expiry=c["expiry"],
             days_to_expiry=c["dte"],
             otm_pct=c["otm_pct"],
             is_concentrated=concentrated,
-            conviction_score=0.0,   # filled in by score_unusual_activity
+            consecutive_days=c["consecutive_days"],
+            conviction_score=0.0,
         )
         for c in candidates
     ]
@@ -251,25 +344,31 @@ def score_unusual_activity(signals: list[UnusualOptionsSignal]) -> float:
     """
     Composite 0.0–1.0 score for a list of unusual options signals.
 
-    Components and weights:
-        Volume ratio magnitude  (50%): log-normalised; 5×→0.0, 10×→0.30, 50×→1.0
-        Strike concentration    (25%): top-3 > 60% of vol → 1.0, else 0.4
-        DTE quality             (25%): tent function peaking at 30–45 DTE
+    Components and weights (post live-validation):
+        Consecutive days    (35%): persistence is the primary institutional tell
+        Volume ratio        (35%): magnitude of the spike above baseline
+        Strike concentration(15%): top-3 > 60% of vol → focused positioning
+        DTE quality         (15%): tent function peaking at 30–45 DTE
+
+    Hard boost: 3+ consecutive days adds +0.15 to the final score (capped at 1.0).
 
     Returns 0.0 when ``signals`` is empty.
     """
     if not signals:
         return 0.0
 
-    # Volume ratio: log(ratio/5) / log(10)
-    #   ratio=5  → 0.00   ratio=10 → 0.30   ratio=50 → 1.00
+    # Consecutive days component
+    max_consec = max(s.consecutive_days for s in signals)
+    consec_comp = _CONSEC_SCORE.get(max_consec, 1.0)
+
+    # Volume ratio: log-normalised (5×→0.0, 10×→0.30, 50×→1.0)
     max_ratio = max(s.volume_ratio for s in signals)
     ratio_comp = min(1.0, math.log(max(1.0, max_ratio / 5.0)) / math.log(10.0))
 
     # Concentration
     conc_comp = 1.0 if any(s.is_concentrated for s in signals) else 0.4
 
-    # DTE quality: tent peaked at 37 days (midpoint of 10–60 range biased toward 30-45)
+    # DTE quality: tent peaked at 37 days
     def _dte_q(dte: int) -> float:
         if dte <= 10 or dte >= 60:
             return 0.0
@@ -279,14 +378,31 @@ def score_unusual_activity(signals: list[UnusualOptionsSignal]) -> float:
 
     dte_comp = max(_dte_q(s.days_to_expiry) for s in signals)
 
-    raw = ratio_comp * 0.50 + conc_comp * 0.25 + dte_comp * 0.25
+    raw = (
+        consec_comp * 0.35
+        + ratio_comp  * 0.35
+        + conc_comp   * 0.15
+        + dte_comp    * 0.15
+    )
+
+    # Hard boost for strong multi-day accumulation
+    if max_consec >= 3:
+        raw = min(1.0, raw + 0.15)
+
     final = round(min(1.0, raw), 4)
 
-    # Back-fill conviction_score on each signal
+    # Back-fill per-signal conviction_score
     for s in signals:
+        per_consec = _CONSEC_SCORE.get(s.consecutive_days, 1.0)
         per_ratio = min(1.0, math.log(max(1.0, s.volume_ratio / 5.0)) / math.log(10.0))
-        s.conviction_score = round(
-            per_ratio * 0.50 + conc_comp * 0.25 + _dte_q(s.days_to_expiry) * 0.25, 4
+        base = (
+            per_consec * 0.35
+            + per_ratio  * 0.35
+            + conc_comp  * 0.15
+            + _dte_q(s.days_to_expiry) * 0.15
         )
+        if s.consecutive_days >= 3:
+            base = min(1.0, base + 0.15)
+        s.conviction_score = round(min(1.0, base), 4)
 
     return final
