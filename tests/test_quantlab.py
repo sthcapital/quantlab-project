@@ -5308,9 +5308,14 @@ class TestEdgarYoYMetrics:
         from quantlab.providers.edgar import _is_yoy_accelerating
         assert _is_yoy_accelerating([0.10, 0.30, 0.25]) is False
 
+    def test_is_accelerating_true_with_two_points(self):
+        from quantlab.providers.edgar import _is_yoy_accelerating
+        assert _is_yoy_accelerating([0.20, 0.30]) is True  # 2 points is enough
+
     def test_is_accelerating_false_insufficient_data(self):
         from quantlab.providers.edgar import _is_yoy_accelerating
-        assert _is_yoy_accelerating([0.20, 0.30]) is False  # need 3 points
+        assert _is_yoy_accelerating([0.20]) is False  # need at least 2 points
+        assert _is_yoy_accelerating([]) is False
 
     # ── FundamentalSnapshot new fields ────────────────────────────────────────
 
@@ -5327,21 +5332,21 @@ class TestEdgarYoYMetrics:
 
     def test_high_yoy_growth_with_acceleration(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
-        # 70% YoY eps growth + accelerating → 0.35 mag + 0.30 bonus = 0.65
+        # 70% YoY eps growth is in 50-100% band → base=0.6, + accel bonus=0.1 → 0.70
         snap = self._snap(
             eps_yoy_history=[0.30, 0.50, 0.70],
             eps_yoy_pct=0.70,
             is_accelerating=True,
         )
         score = compute_earnings_acceleration(snap)
-        assert score == pytest.approx(0.65, abs=1e-4)
+        assert score == pytest.approx(0.70, abs=1e-4)
 
     def test_over_100pct_yoy_growth_maps_above_0_5(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
-        # 200% YoY eps → mag = 0.5 + min(0.5, (2.0-1.0)*0.5) = 0.5 + 0.5 = 1.0
+        # 200% YoY eps → >100% band → base = 0.9; no accel → score = 0.9
         snap = self._snap(eps_yoy_history=[0.5, 1.0, 2.0], eps_yoy_pct=2.0)
         score = compute_earnings_acceleration(snap)
-        assert score == pytest.approx(1.0, abs=1e-4)
+        assert score == pytest.approx(0.9, abs=1e-4)
 
     def test_zero_yoy_growth_no_acceleration_returns_zero(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
@@ -5353,15 +5358,15 @@ class TestEdgarYoYMetrics:
         snap = self._snap(eps_yoy_history=[-0.3, -0.2, -0.1], eps_yoy_pct=-0.10)
         assert compute_earnings_acceleration(snap) == pytest.approx(0.0, abs=1e-4)
 
-    def test_acceleration_bonus_adds_030(self):
+    def test_acceleration_bonus_adds_010(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
-        # same growth rate, different is_accelerating flag
+        # same growth rate, different is_accelerating flag — bonus is exactly +0.10
         base_snap = self._snap(eps_yoy_history=[0.20, 0.30, 0.40], eps_yoy_pct=0.40)
         accel_snap = self._snap(
             eps_yoy_history=[0.20, 0.30, 0.40], eps_yoy_pct=0.40, is_accelerating=True
         )
         diff = compute_earnings_acceleration(accel_snap) - compute_earnings_acceleration(base_snap)
-        assert diff == pytest.approx(0.30, abs=1e-4)
+        assert diff == pytest.approx(0.10, abs=1e-4)
 
     def test_score_clamped_at_1_0(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
@@ -5384,8 +5389,8 @@ class TestEdgarYoYMetrics:
             revenue_yoy_pct=0.50,
         )
         score = compute_earnings_acceleration(snap)
-        # 50% YoY → mag = 0.50 * 0.5 = 0.25, no acceleration bonus
-        assert score == pytest.approx(0.25, abs=1e-4)
+        # 50% YoY is exactly at the ≥50% threshold → 50-100% band → base=0.6, no accel bonus
+        assert score == pytest.approx(0.60, abs=1e-4)
 
     # ── Legacy QoQ fallback ───────────────────────────────────────────────────
 
@@ -5441,3 +5446,82 @@ class TestEdgarYoYMetrics:
         # All YoY rates should be positive (growth in every quarter)
         assert all(r > 0 for r in snap.eps_yoy_history)
         assert all(r > 0 for r in snap.revenue_yoy_history)
+
+    # ── format_yoy_summary + AAPL / NVDA / CELH demo ─────────────────────────
+
+    def test_format_yoy_summary_structure(self):
+        from quantlab.providers.edgar import FundamentalSnapshot, format_yoy_summary, compute_earnings_acceleration
+        snap = FundamentalSnapshot(ticker="AAPL", cik="0000320193", as_of=date.today())
+        snap.revenue_yoy_pct = 0.17    # +17%
+        snap.eps_yoy_pct     = 0.22    # +22%
+        snap.revenue_yoy_history = [0.12, 0.15, 0.17]
+        snap.eps_yoy_history     = [0.16, 0.19, 0.22]
+        snap.is_accelerating = True
+        score = compute_earnings_acceleration(snap)
+        summary = format_yoy_summary(snap, score)
+        assert summary.startswith("AAPL:")
+        assert "revenue_yoy=+17%" in summary
+        assert "eps_yoy=+22%" in summary
+        assert "accelerating=True" in summary
+        assert "score=" in summary
+
+    def test_aapl_like_modest_growth_scores_low_band(self):
+        """AAPL-like: mid-teens YoY growth → 0-50% band → 0.3 base."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration, format_yoy_summary
+        snap = FundamentalSnapshot(ticker="AAPL", cik="0000320193", as_of=date.today())
+        snap.revenue_yoy_pct = 0.17
+        snap.eps_yoy_pct     = 0.22
+        snap.revenue_yoy_history = [0.12, 0.15, 0.17]
+        snap.eps_yoy_history     = [0.16, 0.19, 0.22]
+        snap.is_accelerating = True   # eps 0.22 > 0.19; rev 0.17 > 0.15 → both improving
+        score = compute_earnings_acceleration(snap)
+        # 22% in 0-50% band → 0.3 + 0.1 accel = 0.4
+        assert score == pytest.approx(0.40, abs=1e-4)
+        print(format_yoy_summary(snap, score))  # shows: AAPL: revenue_yoy=+17% eps_yoy=+22% ...
+
+    def test_nvda_like_hypergrowth_scores_high_band(self):
+        """NVDA-like: hypergrowth EPS → >100% band → 0.9 + accel bonus = 1.0."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration, format_yoy_summary
+        snap = FundamentalSnapshot(ticker="NVDA", cik="0001045810", as_of=date.today())
+        snap.revenue_yoy_pct = 0.69    # +69%
+        snap.eps_yoy_pct     = 1.52    # +152%
+        snap.revenue_yoy_history = [0.40, 0.55, 0.69]
+        snap.eps_yoy_history     = [0.80, 1.20, 1.52]
+        snap.is_accelerating = True   # both rev and eps improving quarter-over-quarter
+        score = compute_earnings_acceleration(snap)
+        # EPS 152% → >100% band → 0.9 + 0.1 accel = 1.0 (capped)
+        assert score == pytest.approx(1.0, abs=1e-4)
+        print(format_yoy_summary(snap, score))  # NVDA: revenue_yoy=+69% eps_yoy=+152% ...
+
+    def test_celh_like_growth_deceleration_scores_without_bonus(self):
+        """CELH-like: strong growth but decelerating → no accel bonus."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration, format_yoy_summary
+        snap = FundamentalSnapshot(ticker="CELH", cik="0001370109", as_of=date.today())
+        snap.revenue_yoy_pct = 0.37    # +37% (slowing from prior highs)
+        snap.eps_yoy_pct     = 0.45    # +45%
+        snap.revenue_yoy_history = [0.90, 0.60, 0.37]  # decelerating
+        snap.eps_yoy_history     = [1.20, 0.80, 0.45]  # decelerating
+        snap.is_accelerating = False   # both rates falling
+        score = compute_earnings_acceleration(snap)
+        # 45% in 0-50% band → 0.3, no accel bonus
+        assert score == pytest.approx(0.30, abs=1e-4)
+        print(format_yoy_summary(snap, score))  # CELH: ... accelerating=False score=0.30
+
+    def test_scoring_band_boundaries(self):
+        """Verify each band boundary is handled correctly."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
+
+        def _score(yoy_pct):
+            snap = FundamentalSnapshot(ticker="X", cik="0", as_of=date.today())
+            snap.eps_yoy_history = [yoy_pct]
+            snap.eps_yoy_pct = yoy_pct
+            return compute_earnings_acceleration(snap)
+
+        assert _score(-0.01) == pytest.approx(0.0,  abs=1e-4)   # negative
+        assert _score(0.00)  == pytest.approx(0.0,  abs=1e-4)   # zero
+        assert _score(0.01)  == pytest.approx(0.3,  abs=1e-4)   # just above 0%
+        assert _score(0.499) == pytest.approx(0.3,  abs=1e-4)   # just below 50%
+        assert _score(0.50)  == pytest.approx(0.6,  abs=1e-4)   # exactly 50%
+        assert _score(0.999) == pytest.approx(0.6,  abs=1e-4)   # just below 100%
+        assert _score(1.00)  == pytest.approx(0.9,  abs=1e-4)   # exactly 100%
+        assert _score(5.00)  == pytest.approx(0.9,  abs=1e-4)   # way above 100%

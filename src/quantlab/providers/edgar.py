@@ -254,10 +254,10 @@ def _yoy_growth_series(history: list[float], max_quarters: int = 4) -> list[floa
 
 
 def _is_yoy_accelerating(yoy_history: list[float]) -> bool:
-    """True when the YoY growth rate has been increasing for 2+ consecutive quarters."""
-    if len(yoy_history) < 3:
+    """True when the most recent YoY growth rate exceeds the prior quarter's rate."""
+    if len(yoy_history) < 2:
         return False
-    return yoy_history[-1] > yoy_history[-2] and yoy_history[-2] > yoy_history[-3]
+    return yoy_history[-1] > yoy_history[-2]
 
 
 def _count_consecutive_beats(history: list[float]) -> int:
@@ -637,6 +637,23 @@ def get_last_earnings_result(
         return None
 
 
+def format_yoy_summary(snap: FundamentalSnapshot, score: float) -> str:
+    """Return a one-line YoY summary for display in scripts and demo output.
+
+    Example: "AAPL: revenue_yoy=+17% eps_yoy=+22% accelerating=True score=0.48"
+    """
+    def _pct(v: Optional[float]) -> str:
+        return f"{v * 100:+.0f}%" if v is not None else "N/A"
+
+    return (
+        f"{snap.ticker}: "
+        f"revenue_yoy={_pct(snap.revenue_yoy_pct)} "
+        f"eps_yoy={_pct(snap.eps_yoy_pct)} "
+        f"accelerating={snap.is_accelerating} "
+        f"score={score:.2f}"
+    )
+
+
 def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     """
     Score 0.0–1.0 reflecting year-over-year earnings growth and acceleration trend.
@@ -646,30 +663,37 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     of history are available (e.g. recently-listed companies).
 
     Scoring (YoY path):
-        magnitude: YoY growth  0–100%   →  0.00–0.50  (linear)
-                   YoY growth >100%     →  0.50–1.00  (linear, capped)
-        acceleration bonus: +0.30 when snap.is_accelerating is True
-                            (requires BOTH revenue AND eps YoY rates increasing
-                            for 2+ consecutive quarters)
+        base from YoY magnitude:
+            growth ≤ 0        →  0.0  (shrinking or flat)
+            0  < growth < 50% →  0.3
+            50% ≤ growth < 100% → 0.6
+            growth ≥ 100%     →  0.9
+        acceleration bonus: +0.10 when snap.is_accelerating is True
+                            (latest YoY rate > prior quarter YoY rate,
+                            for BOTH revenue AND eps)
         result clamped to [0.0, 1.0]
 
     Interpretation:
-        ≥ 0.50  — meaningful growth (≥50% YoY or accelerating at lower rates)
-        ≥ 0.80  — strong growth + acceleration present
-        < 0.50  — weak, zero, or negative YoY growth; no conviction contribution
+        0.0   — negative or zero growth; no contribution to conviction
+        0.3   — modest positive growth (< 50% YoY)
+        0.6   — strong growth (50–100% YoY)
+        0.9   — hypergrowth (> 100% YoY)
+        +0.1  — acceleration trend on top of the above bands
     """
     # ── YoY path (preferred when ≥ 5 quarters of data available) ─────────────
     yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
     if yoy_history:
         latest_yoy = yoy_history[-1]
         if latest_yoy <= 0:
-            mag = 0.0
-        elif latest_yoy <= 1.0:
-            mag = latest_yoy * 0.5                          # 0–100%  → 0.00–0.50
+            base = 0.0
+        elif latest_yoy < 0.50:
+            base = 0.3   # 0–50%
+        elif latest_yoy < 1.00:
+            base = 0.6   # 50–100%
         else:
-            mag = 0.5 + min(0.5, (latest_yoy - 1.0) * 0.5) # >100%   → 0.50–1.00
-        bonus = 0.30 if snap.is_accelerating else 0.0
-        return round(min(1.0, max(0.0, mag + bonus)), 4)
+            base = 0.9   # >100%
+        bonus = 0.10 if snap.is_accelerating else 0.0
+        return round(min(1.0, max(0.0, base + bonus)), 4)
 
     # ── Legacy QoQ fallback (< 5 quarters of data) ───────────────────────────
     history = snap.eps_history if len(snap.eps_history) >= 3 else snap.net_income_history
