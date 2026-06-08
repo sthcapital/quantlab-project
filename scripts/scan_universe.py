@@ -356,7 +356,41 @@ def main() -> None:
         append_scan_results(scan_id, results)
         print(f"db  → {len(results)} scan result(s) stored (scan_id={scan_id})")
 
-    # ── Watchlist ──────────────────────────────────────────────────────────────
+    # ── Institutional watchlist — persistent multi-day candidate tracking ────────
+    try:
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist()
+
+        # Upsert every result returned by the scanner (all have conviction >= min)
+        # The min threshold is already >= 0.4, capturing pre-breakout interest.
+        for r in results:
+            iwl.upsert(r.symbol, r)
+
+        # Identify PRIORITY candidates: conviction >= 0.70 AND 2+ consecutive days
+        priority_entries = [
+            e for e in iwl.get_multi_day(min_days=2)
+            if e["conviction_score"] >= 0.70
+        ]
+        if priority_entries:
+            print(f"\n  ⭐ PRIORITY candidates ({len(priority_entries)}):")
+            for e in priority_entries:
+                opts = "✓" if e["options_signal"] else "–"
+                vdu  = "✓" if e["volume_dry_up"]  else "–"
+                print(
+                    f"     {e['symbol']:<8}  day={e['consecutive_days']}  "
+                    f"conv={e['conviction_score']:.2f}  "
+                    f"stage={e['stage']}  opts={opts}  vdu={vdu}  "
+                    f"tape={e['tape']}"
+                )
+
+        # Housekeeping: remove symbols absent for more than 5 trading days
+        removed = iwl.remove_stale(max_days_inactive=5)
+        if removed > 0:
+            print(f"  institutional_watchlist: removed {removed} stale entry/entries")
+    except Exception as _iwl_err:
+        print(f"  WARNING: institutional watchlist update failed: {_iwl_err}")
+
+    # ── Legacy signal-threshold watchlist ─────────────────────────────────────
     if args.add_to_watchlist:
         from quantlab.watchlist import add_to_watchlist
         added = sum(1 for r in results if add_to_watchlist(r))

@@ -340,6 +340,232 @@ def update_forward_return(
         print(f"[watchlist] forward return update failed ({watch_id}, {horizon_days}d): {e}")
 
 
+# ── Institutional pre-breakout watchlist ──────────────────────────────────────
+
+_IWL_COLS = [
+    "symbol", "first_seen", "last_seen", "consecutive_days", "stage",
+    "conviction_score", "entry_price", "options_signal", "volume_dry_up",
+    "earnings_score", "peg_score", "breakout_volume_score", "tape", "notes",
+    "updated_at",
+]
+
+
+class InstitutionalWatchlist:
+    """
+    Persistent multi-day tracking of pre-breakout candidates.
+
+    Backed by the DuckDB `institutional_watchlist` table.  Each symbol is
+    keyed once (PRIMARY KEY symbol) and updated in place — `consecutive_days`
+    tracks how many daily scans the symbol has appeared in consecutively.
+
+    Conviction bonus: +0.05 per consecutive day, capped at +0.20.
+
+    Usage::
+
+        iwl = InstitutionalWatchlist()
+        iwl.upsert("NVDA", scan_result)
+        for entry in iwl.get_multi_day(min_days=2):
+            print(entry["symbol"], entry["consecutive_days"])
+        iwl.remove_stale(max_days_inactive=5)
+    """
+
+    def __init__(self, db_path: str | None = None) -> None:
+        import duckdb
+        from quantlab.storage import _ensure_schema
+        self._path = str(db_path) if db_path else str(DB_PATH)
+        # Ensure schema exists on construction
+        con = duckdb.connect(self._path)
+        _ensure_schema(con)
+        con.close()
+
+    def _con(self):
+        import duckdb
+        from quantlab.storage import _ensure_schema
+        con = duckdb.connect(self._path)
+        _ensure_schema(con)
+        return con
+
+    # ── upsert ─────────────────────────────────────────────────────────────────
+
+    def upsert(self, symbol: str, scan_result) -> dict:
+        """
+        Insert a new entry or update an existing one.
+
+        If `symbol` is new: consecutive_days=1, first_seen=today.
+        If `symbol` exists and last_seen < today: consecutive_days += 1.
+        If `symbol` exists and last_seen == today: scores updated, days unchanged.
+
+        Returns a dict with the final stored values.
+        """
+        today = date.today()
+        today_str = today.isoformat()
+
+        base_conviction = getattr(scan_result, "conviction_score", 0.0)
+        stage           = getattr(scan_result, "stage", 0)
+        entry_price     = getattr(scan_result, "entry_close", None)
+        earnings_score  = (
+            getattr(scan_result, "edgar_acceleration", None)
+            or getattr(scan_result, "earnings_acceleration", 0.0)
+        )
+        peg_score       = getattr(scan_result, "peg_score", 0.0)
+        bvs             = getattr(scan_result, "breakout_volume_score", 0.0)
+        # Volume dry-up proxy: low volume_trend + decent absorption signals drying
+        vol_trend       = getattr(scan_result, "volume_trend", 1.0)
+        absorption      = getattr(scan_result, "absorption", 0.0)
+        volume_dry_up   = vol_trend < 0.4 and absorption >= 0.3
+        options_signal  = (
+            getattr(scan_result, "unusual_options_score", 0.0) >= 0.5
+            or getattr(scan_result, "options_score", 0.0) >= 0.6
+        )
+
+        tape = ""
+        try:
+            from quantlab.signals.breadth import get_latest_snapshot
+            snap = get_latest_snapshot()
+            if snap:
+                tape = snap.tape
+        except Exception:
+            pass
+
+        try:
+            con = self._con()
+            row = con.execute(
+                "SELECT consecutive_days, last_seen FROM institutional_watchlist WHERE symbol = ?",
+                [symbol],
+            ).fetchone()
+
+            if row is None:
+                consecutive_days = 1
+                stored_conviction = min(1.0, base_conviction + 0.05 * consecutive_days)
+                con.execute(
+                    """
+                    INSERT INTO institutional_watchlist
+                        (symbol, first_seen, last_seen, consecutive_days, stage,
+                         conviction_score, entry_price, options_signal, volume_dry_up,
+                         earnings_score, peg_score, breakout_volume_score, tape, notes,
+                         updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', CURRENT_TIMESTAMP)
+                    """,
+                    [
+                        symbol, today_str, today_str, consecutive_days, stage,
+                        stored_conviction, entry_price, options_signal, volume_dry_up,
+                        earnings_score, peg_score, bvs, tape,
+                    ],
+                )
+            else:
+                prev_days, last_seen = row
+                if isinstance(last_seen, str):
+                    last_seen = date.fromisoformat(last_seen)
+                elif hasattr(last_seen, "date"):
+                    last_seen = last_seen.date()
+                # Increment only when appearing on a new trading day
+                consecutive_days = prev_days + 1 if last_seen < today else prev_days
+                bonus = min(0.20, 0.05 * consecutive_days)
+                stored_conviction = min(1.0, base_conviction + bonus)
+                con.execute(
+                    """
+                    UPDATE institutional_watchlist SET
+                        last_seen=?, consecutive_days=?, stage=?,
+                        conviction_score=?, entry_price=?, options_signal=?,
+                        volume_dry_up=?, earnings_score=?, peg_score=?,
+                        breakout_volume_score=?, tape=?, updated_at=CURRENT_TIMESTAMP
+                    WHERE symbol=?
+                    """,
+                    [
+                        today_str, consecutive_days, stage,
+                        stored_conviction, entry_price, options_signal,
+                        volume_dry_up, earnings_score, peg_score, bvs, tape,
+                        symbol,
+                    ],
+                )
+            con.close()
+        except Exception as exc:
+            print(f"[institutional_watchlist] upsert failed for {symbol}: {exc}")
+            consecutive_days = 1
+            stored_conviction = base_conviction
+
+        return {
+            "symbol": symbol,
+            "consecutive_days": consecutive_days,
+            "conviction_score": stored_conviction,
+        }
+
+    # ── queries ────────────────────────────────────────────────────────────────
+
+    def get_candidates(self, min_consecutive_days: int = 1) -> list[dict]:
+        """All entries with consecutive_days >= threshold, sorted by days then conviction."""
+        try:
+            con = self._con()
+            rows = con.execute(
+                f"SELECT {', '.join(_IWL_COLS)} FROM institutional_watchlist "
+                "WHERE consecutive_days >= ? "
+                "ORDER BY consecutive_days DESC, conviction_score DESC",
+                [min_consecutive_days],
+            ).fetchall()
+            con.close()
+            return [dict(zip(_IWL_COLS, r)) for r in rows]
+        except Exception as exc:
+            print(f"[institutional_watchlist] get_candidates failed: {exc}")
+            return []
+
+    def get_multi_day(self, min_days: int = 2) -> list[dict]:
+        """Candidates appearing on min_days+ consecutive scans (highest priority)."""
+        return self.get_candidates(min_consecutive_days=min_days)
+
+    def remove_stale(self, max_days_inactive: int = 5) -> int:
+        """
+        Remove symbols not seen in max_days_inactive trading days.
+        Returns the count of removed rows.
+        """
+        today = date.today()
+        try:
+            con = self._con()
+            rows = con.execute(
+                "SELECT symbol, last_seen FROM institutional_watchlist"
+            ).fetchall()
+            to_remove: list[str] = []
+            for sym, last_seen in rows:
+                if isinstance(last_seen, str):
+                    last_seen = date.fromisoformat(last_seen)
+                elif hasattr(last_seen, "date"):
+                    last_seen = last_seen.date()
+                if _trading_days_elapsed(last_seen, today) > max_days_inactive:
+                    to_remove.append(sym)
+            for sym in to_remove:
+                con.execute(
+                    "DELETE FROM institutional_watchlist WHERE symbol = ?", [sym]
+                )
+            con.close()
+            return len(to_remove)
+        except Exception as exc:
+            print(f"[institutional_watchlist] remove_stale failed: {exc}")
+            return 0
+
+    def set_options_signal(self, symbol: str, bonus: float = 0.08) -> None:
+        """Flag a symbol as having unusual options activity and add a conviction bonus."""
+        try:
+            con = self._con()
+            con.execute(
+                """
+                UPDATE institutional_watchlist SET
+                    options_signal=TRUE,
+                    conviction_score=MIN(1.0, conviction_score + ?),
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE symbol=?
+                """,
+                [bonus, symbol],
+            )
+            con.close()
+        except Exception as exc:
+            print(f"[institutional_watchlist] set_options_signal failed for {symbol}: {exc}")
+
+    def to_dataframe(self):
+        """Return the full watchlist as a pandas DataFrame."""
+        import pandas as pd
+        rows = self.get_candidates()
+        return pd.DataFrame(rows) if rows else pd.DataFrame(columns=_IWL_COLS)
+
+
 def get_watchlist_summary(db_path: str | None = None) -> dict[str, Any]:
     """
     Aggregate statistics on the watchlist — hit rates, avg returns by horizon.

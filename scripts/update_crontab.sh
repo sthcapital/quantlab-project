@@ -38,6 +38,7 @@ import sys
 sys.path.insert(0, "src")
 from quantlab.market_calendar import cron_schedule_for_date
 from datetime import date
+import pytz
 s = cron_schedule_for_date(date.today())
 print(f"{s['scan_cron']}")
 print(f"{s['eod_cron']}")
@@ -45,20 +46,30 @@ print(f"{s['tz_name']}")
 print(f"{s['utc_offset']}")
 print(f"{s['scan_utc']}")
 print(f"{s['eod_utc']}")
+# Options monitor window: 9:00 AM – 4:30 PM ET in UTC
+# utc_offset is e.g. "-0400" (EDT) or "-0500" (EST)
+offset_hours = abs(int(s['utc_offset'][:3]))   # 4 for EDT, 5 for EST
+opt_start = 9  + offset_hours   # 9 AM ET in UTC = 13 (EDT) or 14 (EST)
+opt_end   = 17 + offset_hours   # 5 PM ET in UTC (generous window) = 21 (EDT) or 22 (EST)
+print(f"{opt_start}")
+print(f"{opt_end}")
 PYEOF
 )"
 
-SCAN_CRON=$(echo "$SCHED" | sed -n '1p')
-EOD_CRON=$(echo  "$SCHED" | sed -n '2p')
-TZ_NAME=$(echo   "$SCHED" | sed -n '3p')
+SCAN_CRON=$(echo  "$SCHED" | sed -n '1p')
+EOD_CRON=$(echo   "$SCHED" | sed -n '2p')
+TZ_NAME=$(echo    "$SCHED" | sed -n '3p')
 UTC_OFFSET=$(echo "$SCHED" | sed -n '4p')
-SCAN_UTC=$(echo  "$SCHED" | sed -n '5p')
-EOD_UTC=$(echo   "$SCHED" | sed -n '6p')
+SCAN_UTC=$(echo   "$SCHED" | sed -n '5p')
+EOD_UTC=$(echo    "$SCHED" | sed -n '6p')
+OPT_START=$(echo  "$SCHED" | sed -n '7p')
+OPT_END=$(echo    "$SCHED" | sed -n '8p')
 
 echo "[$(ts)] update_crontab.sh"
 echo "  Timezone : ${TZ_NAME} (UTC${UTC_OFFSET})"
 echo "  Scan     : 09:00 AM ET  =  ${SCAN_UTC}   (cron: ${SCAN_CRON} * * 1-5)"
 echo "  EOD      : 04:30 PM ET  =  ${EOD_UTC}   (cron: ${EOD_CRON} * * 1-5)"
+echo "  Options  : 9:00 AM – 5:00 PM ET every 30 min  (cron: */30 ${OPT_START}-${OPT_END} * * 1-5)"
 
 # ── Build new crontab content ──────────────────────────────────────────────────
 NEW_CRONTAB="# QuantLab automated trading schedule
@@ -72,6 +83,11 @@ ${SCAN_CRON} * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh 
 
 # ── End-of-day forward return tracker (04:30 PM ET, Mon–Fri) ─────────────────
 ${EOD_CRON} * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && python scripts/track_forward_returns.py' >> ${LOG_FILE} 2>&1
+
+# ── Intraday options monitor (every 30 min, 9:00 AM – 5:00 PM ET, Mon–Fri) ────
+# Script self-checks market hours (9:30 AM – 4:00 PM) and exits early if outside.
+# Wide UTC window (${OPT_START}–${OPT_END}) handles EDT/EST drift automatically.
+*/30 ${OPT_START}-${OPT_END} * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && [[ -f .env ]] && set -a && source .env && set +a; python scripts/monitor_options.py' >> ${LOG_FILE} 2>&1
 
 # ── Daily health check (05:15 PM ET, Mon–Fri) ────────────────────────────────
 # Runs after all other jobs complete; exits 1 if any critical job is missing.

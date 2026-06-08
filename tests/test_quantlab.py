@@ -6076,3 +6076,272 @@ class TestEarningsHeadlineParser:
         assert out.eps_beat is None
         assert out.revenue_beat is None
         assert out.beat_score == pytest.approx(0.5)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# InstitutionalWatchlist — persistent multi-day pre-breakout tracking
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestInstitutionalWatchlist:
+    """Tests for InstitutionalWatchlist — all use a tmp DuckDB path."""
+
+    @staticmethod
+    def _make_result(symbol="TEST", conviction=0.55, stage=2, entry_close=100.0):
+        """Build a minimal ScanResult-like object."""
+        return ScanResult(
+            symbol=symbol, scan_date=date.today().isoformat(),
+            signal_type="breakout", signal=True,
+            entry_close=entry_close, indicator_value=None, lookback=5,
+            conviction_score=conviction, stage=stage,
+        )
+
+    # ── upsert ────────────────────────────────────────────────────────────────
+
+    def test_upsert_new_entry_consecutive_days_1(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        result = iwl.upsert("NVDA", self._make_result("NVDA", conviction=0.60))
+        assert result["consecutive_days"] == 1
+        assert result["symbol"] == "NVDA"
+
+    def test_upsert_same_symbol_today_does_not_double_increment(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        iwl.upsert("AAPL", self._make_result("AAPL"))
+        r2 = iwl.upsert("AAPL", self._make_result("AAPL"))
+        # Same day: consecutive_days should stay 1
+        assert r2["consecutive_days"] == 1
+
+    def test_upsert_previous_day_increments_consecutive_days(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+
+        # Manually insert entry with last_seen = yesterday
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        con = duckdb.connect(str(db))
+        con.execute(
+            """
+            INSERT INTO institutional_watchlist
+                (symbol, first_seen, last_seen, consecutive_days, stage,
+                 conviction_score, entry_price, options_signal, volume_dry_up,
+                 earnings_score, peg_score, breakout_volume_score, tape, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+            """,
+            ["TSLA", yesterday, yesterday, 1, 2, 0.60, 250.0],
+        )
+        con.close()
+
+        # Upsert today — should increment consecutive_days to 2
+        r = iwl.upsert("TSLA", self._make_result("TSLA", conviction=0.65))
+        assert r["consecutive_days"] == 2
+
+    def test_upsert_conviction_bonus_applied(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        base_conviction = 0.50
+        r = iwl.upsert("META", self._make_result("META", conviction=base_conviction))
+        # Day 1: bonus = 0.05 * 1 = 0.05 → stored = 0.55
+        assert r["conviction_score"] == pytest.approx(base_conviction + 0.05, abs=1e-4)
+
+    def test_conviction_bonus_capped_at_020(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+
+        # Manually insert entry with 4+ consecutive days already
+        old = (date.today() - timedelta(days=1)).isoformat()
+        con = duckdb.connect(str(db))
+        con.execute(
+            """
+            INSERT INTO institutional_watchlist
+                (symbol, first_seen, last_seen, consecutive_days, stage,
+                 conviction_score, entry_price, options_signal, volume_dry_up,
+                 earnings_score, peg_score, breakout_volume_score, tape, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+            """,
+            ["CELH", old, old, 10, 2, 0.70, 80.0],  # already 10 days
+        )
+        con.close()
+
+        base = 0.50
+        r = iwl.upsert("CELH", self._make_result("CELH", conviction=base))
+        # consecutive_days = 11, bonus = min(0.20, 0.05*11) = 0.20
+        assert r["conviction_score"] == pytest.approx(base + 0.20, abs=1e-4)
+
+    # ── get_candidates / get_multi_day ────────────────────────────────────────
+
+    def test_get_candidates_returns_all_entries(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        iwl.upsert("A", self._make_result("A", conviction=0.60))
+        iwl.upsert("B", self._make_result("B", conviction=0.70))
+        candidates = iwl.get_candidates()
+        syms = [c["symbol"] for c in candidates]
+        assert "A" in syms and "B" in syms
+
+    def test_get_multi_day_filters_correctly(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+
+        # Single-day entry
+        iwl.upsert("SINGLE", self._make_result("SINGLE"))
+
+        # Multi-day entry (manually set consecutive_days=3)
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        con = duckdb.connect(str(db))
+        con.execute(
+            """
+            INSERT INTO institutional_watchlist
+                (symbol, first_seen, last_seen, consecutive_days, stage,
+                 conviction_score, entry_price, options_signal, volume_dry_up,
+                 earnings_score, peg_score, breakout_volume_score, tape, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+            """,
+            ["MULTI", yesterday, yesterday, 3, 2, 0.75, 200.0],
+        )
+        con.close()
+
+        multi = iwl.get_multi_day(min_days=2)
+        syms = [c["symbol"] for c in multi]
+        assert "MULTI" in syms
+        assert "SINGLE" not in syms
+
+    def test_get_multi_day_sorted_by_days_then_conviction(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        con = duckdb.connect(str(db))
+        for sym, days, conv in [("HIGH", 4, 0.80), ("LOW", 2, 0.55)]:
+            con.execute(
+                """
+                INSERT INTO institutional_watchlist
+                    (symbol, first_seen, last_seen, consecutive_days, stage,
+                     conviction_score, entry_price, options_signal, volume_dry_up,
+                     earnings_score, peg_score, breakout_volume_score, tape, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+                """,
+                [sym, yesterday, yesterday, days, 2, conv, 100.0],
+            )
+        con.close()
+        multi = iwl.get_multi_day(min_days=2)
+        assert multi[0]["symbol"] == "HIGH"  # higher days first
+
+    # ── remove_stale ──────────────────────────────────────────────────────────
+
+    def test_remove_stale_removes_old_entries(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+
+        # Insert an entry from 15 calendar days ago (~ 10 trading days)
+        old_date = (date.today() - timedelta(days=15)).isoformat()
+        con = duckdb.connect(str(db))
+        con.execute(
+            """
+            INSERT INTO institutional_watchlist
+                (symbol, first_seen, last_seen, consecutive_days, stage,
+                 conviction_score, entry_price, options_signal, volume_dry_up,
+                 earnings_score, peg_score, breakout_volume_score, tape, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+            """,
+            ["STALE", old_date, old_date, 2, 2, 0.60, 50.0],
+        )
+        con.close()
+
+        removed = iwl.remove_stale(max_days_inactive=5)
+        assert removed >= 1
+        remaining = [c["symbol"] for c in iwl.get_candidates()]
+        assert "STALE" not in remaining
+
+    def test_remove_stale_keeps_recent_entries(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        # Today's entry — should NOT be removed
+        iwl.upsert("FRESH", self._make_result("FRESH"))
+        removed = iwl.remove_stale(max_days_inactive=5)
+        assert removed == 0
+        remaining = [c["symbol"] for c in iwl.get_candidates()]
+        assert "FRESH" in remaining
+
+    def test_remove_stale_returns_count(self, tmp_path):
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+        old = (date.today() - timedelta(days=20)).isoformat()
+        con = duckdb.connect(str(db))
+        for sym in ["X1", "X2", "X3"]:
+            con.execute(
+                """
+                INSERT INTO institutional_watchlist
+                    (symbol, first_seen, last_seen, consecutive_days, stage,
+                     conviction_score, entry_price, options_signal, volume_dry_up,
+                     earnings_score, peg_score, breakout_volume_score, tape, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+                """,
+                [sym, old, old, 1, 2, 0.50, 100.0],
+            )
+        con.close()
+        assert iwl.remove_stale(max_days_inactive=5) == 3
+
+    # ── generate_report ───────────────────────────────────────────────────────
+
+    def test_generate_report_creates_file(self, tmp_path, monkeypatch):
+        import importlib, sys
+        # Add scripts/ to path so generate_report can be imported
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+
+        from quantlab.watchlist import InstitutionalWatchlist
+        import generate_report as _gr
+
+        db = tmp_path / "test.duckdb"
+        reports = tmp_path / "reports"
+        iwl = InstitutionalWatchlist(db_path=db)
+        iwl.upsert("AAPL", self._make_result("AAPL", conviction=0.75, stage=2))
+
+        html_path = _gr.generate(
+            report_date=date.today(),
+            reports_dir=reports,
+            db_path=str(db),
+        )
+        assert html_path.exists()
+        content = html_path.read_text()
+        assert "QuantLab Institutional Pre-Breakout Watchlist" in content
+        assert "AAPL" in content
+
+    def test_generate_report_daily_reports_row_written(self, tmp_path):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+
+        from quantlab.watchlist import InstitutionalWatchlist
+        import generate_report as _gr
+        import duckdb
+
+        db = tmp_path / "test2.duckdb"
+        reports = tmp_path / "reports2"
+        iwl = InstitutionalWatchlist(db_path=db)
+        _gr.generate(report_date=date.today(), reports_dir=reports, db_path=str(db))
+
+        con = duckdb.connect(str(db))
+        row = con.execute("SELECT date, candidates FROM daily_reports").fetchone()
+        con.close()
+        assert row is not None
+        assert str(row[0]) == date.today().isoformat()

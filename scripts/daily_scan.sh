@@ -27,7 +27,7 @@ LOG_FILE="$HOME/quantlab-scan.log"
 IBKR_HOST="172.23.208.1"
 IBKR_PORT="7497"
 
-UNIVERSE="sp500_sample"            # sp500_sample (50) | tradeable (~2300) | tradeable_no_options
+UNIVERSE="tradeable"               # sp500_sample (50) | tradeable (~2300) | tradeable_no_options
 
 # ── Environment secrets ────────────────────────────────────────────────────────
 if [[ -f "$PROJECT_DIR/.env" ]]; then
@@ -87,6 +87,34 @@ cd "$PROJECT_DIR"
     echo "  Backtest  : $BACKTEST_START → $BACKTEST_END  (2-year window)"
     sep
 } | tee -a "$LOG_FILE"
+
+# ── Tradeable universe build ────────────────────────────────────────────────────
+# Ensures today's universe parquet cache exists before the scan.
+# If the cache is already present (same-day re-run), this completes instantly.
+# Non-fatal: scan falls back to the most recent cached universe on failure.
+{
+    echo ""
+    echo "══ [$(ts)] Universe build — $(date +%Y-%m-%d) ════════════════════════"
+} | tee -a "$LOG_FILE"
+
+python -c "
+from datetime import date
+from quantlab.universe import UniverseManager, load_universe_cache
+from quantlab.providers.polygon import PolygonProvider
+import os, sys
+today = date.today()
+if load_universe_cache(today):
+    print(f'  Universe cache hit for {today} — skipping rebuild')
+    sys.exit(0)
+api_key = os.environ.get('POLYGON_API_KEY', '')
+if not api_key:
+    print('  WARNING: POLYGON_API_KEY not set — will use most recent cached universe')
+    sys.exit(0)
+polygon = PolygonProvider(api_key=api_key)
+mgr = UniverseManager()
+syms, stats = mgr.build_tradeable_universe(today, polygon, ib=None, optionable_only=False)
+print(f'  {stats.summary()}')
+" 2>&1 | tee -a "$LOG_FILE" || log "WARNING: universe build failed — scan will use cached data"
 
 # ── Breadth update ──────────────────────────────────────────────────────────────
 # Runs before scan_universe.py so the tape condition (BEAR/BULL) and the
@@ -204,6 +232,13 @@ python scripts/track_forward_returns.py \
     --host "$IBKR_HOST" \
     --port "$IBKR_PORT" \
     2>&1 | tee -a "$LOG_FILE" || log "WARNING: forward return tracking failed"
+
+# ── Daily report ─────────────────────────────────────────────────────────────────
+# Generates data/reports/YYYY-MM-DD_watchlist.html and updates daily_reports DuckDB.
+# Non-fatal — scan results are already stored even if report generation fails.
+log "Generating daily institutional watchlist report ..."
+python scripts/generate_report.py 2>&1 | tee -a "$LOG_FILE" \
+    || log "WARNING: report generation failed"
 
 # ── Footer ───────────────────────────────────────────────────────────────────────
 {
