@@ -12,8 +12,8 @@
 #   0 12 * * 1-5 /home/quantlab/projects/quantlab-project/scripts/daily_scan.sh
 #
 # Usage:
-#   bash scripts/daily_scan.sh                # price-only scan (~7 min)
-#   bash scripts/daily_scan.sh --with-news    # include news tagging (~10 min)
+#   bash scripts/daily_scan.sh                # price-only scan (<5 min, flatfile bars)
+#   bash scripts/daily_scan.sh --with-news    # include news tagging via IBKR
 # =============================================================================
 
 set -euo pipefail
@@ -158,7 +158,7 @@ SCAN_ARGS=(
     --signal            "$SIGNAL"
     --lookback          "$LOOKBACK"
     --min-conviction    "$MIN_CONVICTION"
-    --provider          ibkr
+    --provider          flatfile
     --host              "$IBKR_HOST"
     --port              "$IBKR_PORT"
     --multi-lookback

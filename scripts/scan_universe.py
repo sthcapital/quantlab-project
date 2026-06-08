@@ -93,7 +93,7 @@ def main() -> None:
         from quantlab.universe import UniverseManager
         from datetime import date as _today_date
         today = _today_date.today()
-        if args.provider in ("polygon", "ibkr"):
+        if args.provider in ("polygon", "ibkr", "flatfile"):
             from quantlab.providers.polygon import PolygonProvider
             pg  = PolygonProvider()
             mgr = UniverseManager()
@@ -114,13 +114,16 @@ def main() -> None:
             else:
                 print(f"\n  {universe_stats.summary()}")
         else:
-            print("  Falling back to sp500_sample. Use --provider polygon to build.")
+            print("  Falling back to sp500_sample. Use --provider polygon or flatfile to build.")
             symbols = load_universe("sp500_sample")
     else:
         symbols = load_universe(args.universe)
 
     start_date = parse_date(args.start)
     end_date = parse_date(args.end)
+
+    # news_client_id is needed regardless of bar provider (IBKR used for news)
+    news_client_id = get_config("ibkr").get("news_client_id", args.client_id + 40)
 
     provider_kwargs = {}
     if args.provider == "ibkr":
@@ -130,13 +133,13 @@ def main() -> None:
                 f"\nTWS / IB Gateway is not reachable at {args.host}:{args.port}.\n"
                 "Start TWS or IB Gateway, enable API access, and try again."
             )
-        news_client_id = get_config("ibkr").get("news_client_id", args.client_id + 40)
         provider_kwargs = {"host": args.host, "port": args.port, "client_id": args.client_id}
     provider = create_market_data_provider(args.provider, **provider_kwargs)
 
-    # Connect IBKR for news if not skipped
+    # Connect IBKR for news when requested — works with any bar provider.
+    # For flatfile scans, bars come from local Parquet; news still uses IBKR.
     ibkr_conn = None
-    if not args.no_news and args.provider == "ibkr":
+    if not args.no_news:
         try:
             from ib_insync import IB
             ibkr_conn = IB()

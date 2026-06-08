@@ -18,13 +18,17 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
     Create and return a market data provider by name.
 
     Supported names:
-        "ibkr"                          — Interactive Brokers TWS
+        "ibkr"                          — Interactive Brokers TWS (live data)
+        "flatfile" / "flat_file"        — S3 flat files + local Parquet cache
+                                          (bulk-loads the date range once;
+                                           fastest for universe scans)
         "alpha_vantage" / "http"        — Alpha Vantage HTTP API
         "mock"                          — Deterministic mock for testing
+        "polygon"                       — Polygon.io REST API
 
     Example::
 
-        provider = create_market_data_provider("ibkr", host="127.0.0.1", port=7497, client_id=1)
+        provider = create_market_data_provider("flatfile")
         bars = provider.get_daily_bars("AAPL", start_date, end_date)
     """
     normalized = name.strip().lower()
@@ -35,6 +39,10 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
                 "ib_insync is not installed. Run: pip install ib_insync"
             )
         return IbkrProvider(**kwargs)
+
+    if normalized in {"flatfile", "flat_file", "flat-file"}:
+        from quantlab.providers.flat_files import FlatFileMarketDataProvider
+        return FlatFileMarketDataProvider(**kwargs)
 
     if normalized in {"alpha_vantage", "alphavantage", "http"}:
         return HttpMarketDataProvider(**kwargs)
@@ -52,7 +60,7 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
 
     raise ValueError(
         f"Unknown market data provider: '{name}'. "
-        f"Valid choices: ibkr, alpha_vantage, mock, polygon, factset"
+        f"Valid choices: ibkr, flatfile, alpha_vantage, mock, polygon, factset"
     )
 
 

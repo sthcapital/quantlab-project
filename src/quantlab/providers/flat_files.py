@@ -359,3 +359,103 @@ def _fmt_size(n_bytes: int) -> str:
             return f"{n_bytes:.1f} {unit}"
         n_bytes //= 1024
     return f"{n_bytes:.1f} GB"
+
+
+# ── MarketDataProvider adapter ─────────────────────────────────────────────────
+
+class FlatFileMarketDataProvider:
+    """
+    MarketDataProvider adapter backed by FlatFileProvider (S3 flat files +
+    local Parquet cache).
+
+    Performance model
+    -----------------
+    Naïvely calling get_stocks_bars(symbol, ...) for each symbol in a
+    2,325-symbol scan reads the same day-file once per symbol — O(symbols ×
+    days) disk reads.  This class avoids that by bulk-loading every trading
+    day in the requested date range exactly once, building a
+    {symbol → list[Bar]} cache in memory.  Subsequent get_daily_bars() calls
+    are O(1) dict lookups.
+
+    Typical cost for a 1-year scan window (~252 trading days, ~11 k symbols):
+        Bulk load : ~252 Parquet reads ≈ 3–10 s (all from local cache)
+        Per symbol: <0.1 ms dict lookup
+
+    Usage (as context manager — clears cache on exit):
+        with FlatFileMarketDataProvider() as provider:
+            bars = provider.get_daily_bars("AAPL", start, end)
+    """
+
+    def __init__(self, **kwargs) -> None:
+        self._ff = FlatFileProvider(**kwargs)
+        self._cache: dict[str, list[Bar]] = {}
+        self._cache_start: date | None = None
+        self._cache_end:   date | None = None
+
+    # ── Context manager ────────────────────────────────────────────────────────
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args) -> None:
+        self._cache.clear()
+
+    # ── Cache management ───────────────────────────────────────────────────────
+
+    def _ensure_cache(self, start_date: date, end_date: date) -> None:
+        if self._cache_start == start_date and self._cache_end == end_date:
+            return
+        self._bulk_load(start_date, end_date)
+
+    def _bulk_load(self, start_date: date, end_date: date) -> None:
+        """
+        Read every trading day in [start_date, end_date] once and build the
+        symbol → bars cache.  Uses is_market_open() to skip weekends and
+        holidays so we never attempt S3 fetches for non-trading days.
+        """
+        from datetime import timedelta
+
+        try:
+            from quantlab.market_calendar import is_market_open as _is_open
+        except ImportError:
+            _is_open = lambda d: d.weekday() < 5  # type: ignore[assignment]
+
+        self._cache = {}
+        self._cache_start = start_date
+        self._cache_end   = end_date
+
+        current    = start_date
+        loaded     = 0
+        total_days = 0
+
+        while current <= end_date:
+            if _is_open(current):
+                total_days += 1
+                try:
+                    day_data = self._ff.get_grouped_daily(current)
+                    for sym, bar in day_data.items():
+                        if sym not in self._cache:
+                            self._cache[sym] = []
+                        self._cache[sym].append(bar)
+                    loaded += 1
+                except Exception:
+                    pass  # missing flat file for this day — skip silently
+            current += timedelta(days=1)
+
+        logger.info(
+            "FlatFileProvider bulk-loaded %d/%d trading days → %d symbols cached",
+            loaded, total_days, len(self._cache),
+        )
+
+    # ── MarketDataProvider interface ───────────────────────────────────────────
+
+    def get_daily_bars(
+        self, symbol: str, start_date: date, end_date: date
+    ) -> list[Bar]:
+        """Return cached daily bars for symbol; triggers bulk load on first call."""
+        self._ensure_cache(start_date, end_date)
+        return self._cache.get(symbol, [])
+
+    def get_spot_price(self, symbol: str) -> float | None:
+        bars = self._cache.get(symbol)
+        return bars[-1].close if bars else None
