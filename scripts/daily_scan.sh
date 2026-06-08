@@ -28,6 +28,11 @@ IBKR_HOST="172.23.208.1"
 IBKR_PORT="7497"
 
 UNIVERSE="sp500_sample"            # sp500_sample (50) | tradeable (~2300) | tradeable_no_options
+
+# ── Environment secrets ────────────────────────────────────────────────────────
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    set -a; source "$PROJECT_DIR/.env"; set +a
+fi
 SIGNAL="breakout"
 LOOKBACK="5"
 SECONDARY_LOOKBACK="20"         # secondary lookback for multi-confirmation (lb=5 + lb=20)
