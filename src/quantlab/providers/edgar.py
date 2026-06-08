@@ -163,14 +163,15 @@ def _save_edgar_cache(
 
         con = duckdb.connect(str(DB_PATH))
         _ensure_edgar_table(con)
-        # Prefer YoY growth rates; fall back to QoQ when unavailable
+        # Prefer YoY growth rates; fall back to QoQ; store 0.0 (not NULL) when
+        # only one quarter of data is available so the scorer never fails silently.
         _rev_growth = (
             snap.revenue_yoy_pct if snap.revenue_yoy_pct is not None
-            else snap.revenue_qoq_growth
+            else (snap.revenue_qoq_growth if snap.revenue_qoq_growth is not None else 0.0)
         )
         _eps_growth = (
             snap.eps_yoy_pct if snap.eps_yoy_pct is not None
-            else snap.eps_qoq_growth
+            else (snap.eps_qoq_growth if snap.eps_qoq_growth is not None else 0.0)
         )
         con.execute(
             """

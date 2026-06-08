@@ -142,6 +142,20 @@ else
     log "WARNING: breadth update failed — scan will use last cached reading."
 fi
 
+# ── Weekly EDGAR fundamentals refresh (Mondays only) ───────────────────────────
+# EDGAR filings update quarterly; once-a-week refresh is more than sufficient.
+# Runs before the scan so the scanner sees fresh acceleration scores.
+# Non-fatal: if EDGAR is unreachable the scan uses the last cached DuckDB values.
+if [[ "$(date +%u)" == "1" ]]; then
+    {
+        echo ""
+        echo "══ [$(ts)] EDGAR fundamentals fetch (weekly, Monday) ═══════════"
+    } | tee -a "$LOG_FILE"
+
+    python scripts/fetch_edgar_universe.py 2>&1 | tee -a "$LOG_FILE" \
+        || log "WARNING: EDGAR fundamentals fetch failed — scan will use cached data"
+fi
+
 # ── Pre-flight: TWS reachability ────────────────────────────────────────────────
 log "Pre-flight: checking TWS at $IBKR_HOST:$IBKR_PORT ..."
 
