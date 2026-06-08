@@ -88,6 +88,23 @@ cd "$PROJECT_DIR"
     sep
 } | tee -a "$LOG_FILE"
 
+# ── Breadth update ──────────────────────────────────────────────────────────────
+# Runs before scan_universe.py so the tape condition (BEAR/BULL) and the
+# McClellan-based breadth_override flag are current when conviction is scored.
+# POLYGON_API_KEY is available via the .env loaded above.
+# Non-fatal: if Polygon is unreachable the scan falls back to the last cached
+# breadth reading stored in DuckDB.
+{
+    echo ""
+    echo "══ [$(ts)] Breadth update — $(date +%Y-%m-%d) ════════════════════════"
+} | tee -a "$LOG_FILE"
+
+if python scripts/update_breadth.py 2>&1 | tee -a "$LOG_FILE"; then
+    log "Breadth update complete."
+else
+    log "WARNING: breadth update failed — scan will use last cached reading."
+fi
+
 # ── Pre-flight: TWS reachability ────────────────────────────────────────────────
 log "Pre-flight: checking TWS at $IBKR_HOST:$IBKR_PORT ..."
 
