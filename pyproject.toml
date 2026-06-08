@@ -78,6 +78,9 @@ dependencies = [
     "plotly>=5.18",
     "matplotlib>=3.8",
 
+    # Reporting
+    "reportlab>=4.0",
+
     # Timezone
     "pytz>=2024.1",
 ]

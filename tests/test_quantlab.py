@@ -6315,15 +6315,17 @@ class TestInstitutionalWatchlist:
         iwl = InstitutionalWatchlist(db_path=db)
         iwl.upsert("AAPL", self._make_result("AAPL", conviction=0.75, stage=2))
 
-        html_path = _gr.generate(
+        pdf_path = _gr.generate(
             report_date=date.today(),
             reports_dir=reports,
             db_path=str(db),
         )
-        assert html_path.exists()
-        content = html_path.read_text()
-        assert "QuantLab Institutional Pre-Breakout Watchlist" in content
-        assert "AAPL" in content
+        assert pdf_path.exists()
+        assert pdf_path.suffix == ".pdf"
+        content = pdf_path.read_bytes()
+        assert content[:4] == b"%PDF"
+        assert b"STH Capital" in content   # title metadata stored uncompressed
+        assert pdf_path.stat().st_size > 2000
 
     def test_generate_report_daily_reports_row_written(self, tmp_path):
         import sys
