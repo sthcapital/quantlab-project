@@ -48,9 +48,13 @@ def fetch_and_store(
     """
     Fetch today's grouped daily from Polygon, compute breadth, store to DuckDB.
 
-    When flat_file_provider is supplied, loads 200 days of per-symbol bar
-    history from S3 flat files (cached as local Parquet) and passes it to
-    compute_market_breadth() so that pct_above_20/50/200sma are populated.
+    When flat_file_provider is supplied, loads up to 215 trading days of
+    per-symbol bar history from S3 flat files (cached as local Parquet) using
+    a 400-calendar-day lookback window.  The extra 15-day buffer over the
+    200-bar minimum absorbs flat-file S3 publish lag (last 2-3 days) and
+    any other calendar misses, ensuring symbols accumulate 200+ bars for
+    the 200-SMA computation.  Passes history_data to compute_market_breadth()
+    so that pct_above_20/50/200sma are populated.
 
     Returns the populated BreadthSnapshot (rolling fields added separately).
     """
@@ -77,13 +81,17 @@ def fetch_and_store(
     # Build history_data for SMA participation metrics via S3 flat files.
     # get_grouped_daily() reads local Parquet cache when available — only older
     # dates hit S3. Log progress every 20 days so the operator can monitor.
+    # 400 calendar days → ~276 trading days before the [-200:] cap; the extra
+    # buffer absorbs weekends, ~10 US holidays/year, and occasional S3 misses.
     history_data: dict = {}
     if flat_file_provider is not None:
-        hist_start = trade_date - timedelta(days=300)  # ~200 trading days of buffer
+        hist_start = trade_date - timedelta(days=400)  # ~276 trading days of buffer
         hist_end   = trade_date - timedelta(days=1)    # exclude today
 
         trading_days = _trading_days_between(hist_start, hist_end)
-        days_to_load = trading_days[-200:]             # cap at 200 trading days
+        # Cap at 215 trading days: 200 needed for 200-SMA + ~15-day buffer for
+        # flat-file S3 publish lag (last 2-3 days) and any other misses.
+        days_to_load = trading_days[-215:]
         total_days   = len(days_to_load)
 
         print(f"  Loading {total_days} days of history for SMA participation ...")
@@ -102,8 +110,11 @@ def fetch_and_store(
             except Exception:
                 continue  # non-trading day or S3 miss — skip silently
         history_data = symbol_bars
+        n_200plus = sum(1 for bars in history_data.values() if len(bars) >= 200)
         print(f"  History loaded: {loaded}/{total_days} days  "
               f"{len(history_data):,} symbols with bar history")
+        print(f"  History: {n_200plus:,} symbols with 200+ bars "
+              f"(of {len(history_data):,} total)")
 
     snapshot = compute_market_breadth(
         trade_date   = trade_date,
