@@ -42,10 +42,15 @@ def _prev_trading_day(d: date) -> date:
 def fetch_and_store(
     trade_date: date,
     polygon_provider,
+    flat_file_provider=None,
     use_prev: bool = True,
 ) -> BreadthSnapshot | None:
     """
     Fetch today's grouped daily from Polygon, compute breadth, store to DuckDB.
+
+    When flat_file_provider is supplied, loads 200 days of per-symbol bar
+    history from S3 flat files (cached as local Parquet) and passes it to
+    compute_market_breadth() so that pct_above_20/50/200sma are populated.
 
     Returns the populated BreadthSnapshot (rolling fields added separately).
     """
@@ -69,11 +74,56 @@ def fetch_and_store(
         except Exception:
             pass  # falls back to intraday returns
 
+    # Build history_data for SMA participation metrics via S3 flat files.
+    # get_grouped_daily() reads local Parquet cache when available — only older
+    # dates hit S3. Log progress every 20 days so the operator can monitor.
+    history_data: dict = {}
+    if flat_file_provider is not None:
+        hist_start = trade_date - timedelta(days=300)  # ~200 trading days of buffer
+        hist_end   = trade_date - timedelta(days=1)    # exclude today
+
+        trading_days = _trading_days_between(hist_start, hist_end)
+        days_to_load = trading_days[-200:]             # cap at 200 trading days
+        total_days   = len(days_to_load)
+
+        print(f"  Loading {total_days} days of history for SMA participation ...")
+        symbol_bars: dict[str, list] = {}
+        loaded = 0
+        for i, d in enumerate(days_to_load):
+            if i > 0 and i % 20 == 0:
+                print(f"    [{i}/{total_days}] history days loaded ...")
+            try:
+                day_data = flat_file_provider.get_grouped_daily(d)
+                for sym, bar in day_data.items():
+                    if sym not in symbol_bars:
+                        symbol_bars[sym] = []
+                    symbol_bars[sym].append(bar)
+                loaded += 1
+            except Exception:
+                continue  # non-trading day or S3 miss — skip silently
+        history_data = symbol_bars
+        print(f"  History loaded: {loaded}/{total_days} days  "
+              f"{len(history_data):,} symbols with bar history")
+
     snapshot = compute_market_breadth(
-        trade_date  = trade_date,
-        today_data  = today_data,
-        prev_data   = prev_data,
+        trade_date   = trade_date,
+        today_data   = today_data,
+        prev_data    = prev_data,
+        history_data = history_data if history_data else None,
     )
+
+    # Compute SPY 200 SMA and slope from history_data
+    if history_data and "SPY" in history_data and len(history_data["SPY"]) >= 200:
+        spy_bars   = history_data["SPY"]
+        spy_closes = [b.close for b in spy_bars[-200:]]
+        spy_sma200 = sum(spy_closes) / 200
+        spy_today  = today_data.get("SPY")
+        if spy_today:
+            snapshot.spy_above_200sma = spy_today.close > spy_sma200
+            if len(spy_bars) >= 220:
+                spy_sma200_20d_ago = sum(b.close for b in spy_bars[-220:-20]) / 200
+                snapshot.spy_200sma_slope = round(spy_sma200 - spy_sma200_20d_ago, 4)
+
     return snapshot
 
 
@@ -169,8 +219,11 @@ def main() -> None:
             args.no_polygon = True
         else:
             from quantlab.providers.polygon import PolygonProvider
-            provider = PolygonProvider(api_key=api_key)
-            snap = fetch_and_store(trade_date, provider)
+            from quantlab.providers.flat_files import FlatFileProvider
+            provider     = PolygonProvider(api_key=api_key)
+            flat_provider = FlatFileProvider()   # reads S3 creds from env
+            snap = fetch_and_store(trade_date, provider,
+                                   flat_file_provider=flat_provider)
             if snap:
                 print(f"  Raw:  A={snap.advances} D={snap.declines}  "
                       f"up4%={snap.up_4pct_count} dn4%={snap.down_4pct_count}  "

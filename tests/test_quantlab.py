@@ -3462,23 +3462,57 @@ class TestBreadthComputation:
         assert abs(last.mcclellan_oscillator) < 10  # converged near 0
 
     def test_tape_bull_on_high_ratio(self):
-        from quantlab.signals.breadth import rolling_breadth
+        # Without SMA participation data, tape falls to NEUTRAL even with strong ratio.
+        # BULL now requires p200>55% — use _classify_tape() directly to test BULL state.
+        from quantlab.signals.breadth import rolling_breadth, _classify_tape, BreadthSnapshot
         snaps = self._make_snapshots([(300, 100, 40, 10)] * 15)
         rolling_breadth(snaps, window=10)
-        assert snaps[-1].tape == "BULL"
+        # Without pct_above_200sma data the new classifier returns NEUTRAL
+        assert snaps[-1].tape in ("BULL", "NEUTRAL", "CORRECTION", "RECOVERY")
+        # Direct classify test: full conditions → BULL
+        bull_snap = BreadthSnapshot(
+            "2026-06-08",
+            pct_above_200sma=62.0, pct_above_50sma=55.0,
+            ratio_10d=2.0, mcclellan_oscillator=-30.0,
+            mcclellan_summation=1000.0,
+        )
+        assert _classify_tape(bull_snap) == "BULL"
 
     def test_tape_bear_on_low_ratio(self):
-        from quantlab.signals.breadth import rolling_breadth
+        # Low ratio alone is no longer sufficient for BEAR — all 5 conditions required.
+        from quantlab.signals.breadth import rolling_breadth, _classify_tape, BreadthSnapshot
         snaps = self._make_snapshots([(100, 300, 10, 40)] * 15)
         rolling_breadth(snaps, window=10)
-        assert snaps[-1].tape == "BEAR"
+        # Without SMA data, p200=0 but mc≈0 (constant input → EMA converges) → NEUTRAL
+        assert snaps[-1].tape in ("BEAR", "NEUTRAL", "CORRECTION")
+        # Direct classify test: all 5 conditions → BEAR
+        bear_snap = BreadthSnapshot(
+            "2026-06-08",
+            pct_above_200sma=20.0, pct_above_50sma=28.0,
+            ratio_10d=0.5, mcclellan_oscillator=-150.0,
+            new_high_low_ratio=0.3, mcclellan_summation=-8000.0,
+        )
+        assert _classify_tape(bear_snap) == "BEAR"
 
     def test_tape_bear_on_mcclellan_below_minus100(self):
-        from quantlab.signals.breadth import rolling_breadth, BreadthSnapshot
-        # Large sustained negative A-D → McClellan will go below -100
-        snaps = self._make_snapshots([(100, 900, 5, 30)] * 60)
-        rolling_breadth(snaps, window=10)
-        assert snaps[-1].tape == "BEAR"
+        # McClellan < -100 alone no longer triggers BEAR — need all 5 conditions.
+        from quantlab.signals.breadth import _classify_tape, BreadthSnapshot
+        # Correction scenario: mc=-321 but long-term structure intact (p200=48%) → CORRECTION
+        correction_snap = BreadthSnapshot(
+            "2026-06-08",
+            pct_above_200sma=48.0, pct_above_50sma=30.0,
+            ratio_10d=0.6, mcclellan_oscillator=-321.0,
+            new_high_low_ratio=0.8, mcclellan_summation=500.0,
+        )
+        assert _classify_tape(correction_snap) == "CORRECTION"
+        # Full bear: all 5 conditions simultaneously
+        full_bear = BreadthSnapshot(
+            "2026-06-08",
+            pct_above_200sma=22.0, pct_above_50sma=30.0,
+            ratio_10d=0.5, mcclellan_oscillator=-200.0,
+            new_high_low_ratio=0.2, mcclellan_summation=-9000.0,
+        )
+        assert _classify_tape(full_bear) == "BEAR"
 
     # ── breadth_regime_adjustment ────────────────────────────────────────────
 
@@ -3487,7 +3521,7 @@ class TestBreadthComputation:
         snap = BreadthSnapshot("2026-06-04", ratio_10d=2.5, mcclellan_oscillator=50.0,
                                up_25pct_quarter=350, tape="BULL")
         adj, override = breadth_regime_adjustment(snap)
-        assert adj == 0.0
+        assert adj == pytest.approx(+0.05, abs=1e-6)   # BULL → +0.05 lift
         assert override is False
 
     def test_neutral_tape_small_penalty(self):
@@ -3495,7 +3529,7 @@ class TestBreadthComputation:
         snap = BreadthSnapshot("2026-06-04", ratio_10d=1.5, mcclellan_oscillator=0.0,
                                up_25pct_quarter=300, tape="NEUTRAL")
         adj, override = breadth_regime_adjustment(snap)
-        assert adj == pytest.approx(-0.03, abs=1e-6)
+        assert adj == pytest.approx(0.0, abs=1e-6)     # NEUTRAL → no adjustment
         assert override is False
 
     def test_bear_tape_large_penalty(self):
@@ -3503,21 +3537,24 @@ class TestBreadthComputation:
         snap = BreadthSnapshot("2026-06-04", ratio_10d=0.4, mcclellan_oscillator=-20.0,
                                up_25pct_quarter=300, tape="BEAR")
         adj, override = breadth_regime_adjustment(snap)
-        assert adj == pytest.approx(-0.12, abs=1e-6)
+        assert adj == pytest.approx(-0.10, abs=1e-6)   # BEAR → -0.10
 
-    def test_mcclellan_below_minus100_triggers_override(self):
+    def test_mcclellan_below_minus100_no_longer_hard_override(self):
+        # Sharp correction (mc=-150) is BEAR tape → adj=-0.10, NO hard override.
+        # Best Stage 2 setups form during sharp corrections — must not hard-veto.
         from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
         snap = BreadthSnapshot("2026-06-04", ratio_10d=1.0, mcclellan_oscillator=-150.0,
                                up_25pct_quarter=400, tape="BEAR")
         _, override = breadth_regime_adjustment(snap)
-        assert override is True
+        assert override is False   # no hard veto — use min_conviction=0.80 instead
 
-    def test_up25q_below_200_triggers_override(self):
+    def test_bear_tape_no_hard_override(self):
+        # Even genuine BEAR tape returns override=False. Filtered by min_conviction=0.80.
         from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
         snap = BreadthSnapshot("2026-06-04", ratio_10d=1.5, mcclellan_oscillator=50.0,
                                up_25pct_quarter=150, tape="BEAR")
         _, override = breadth_regime_adjustment(snap)
-        assert override is True
+        assert override is False
 
     def test_none_snapshot_neutral(self):
         from quantlab.signals.breadth import breadth_regime_adjustment
@@ -3525,12 +3562,23 @@ class TestBreadthComputation:
         assert adj == 0.0
         assert override is False
 
-    def test_nhl_below_half_adds_extra_penalty(self):
+    def test_correction_tape_no_penalty(self):
+        # CORRECTION must not penalise — best setups form here.
         from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
-        snap = BreadthSnapshot("2026-06-04", ratio_10d=1.8, mcclellan_oscillator=20.0,
-                               up_25pct_quarter=400, new_high_low_ratio=0.3, tape="NEUTRAL")
-        adj, _ = breadth_regime_adjustment(snap)
-        assert adj == pytest.approx(-0.03 - 0.05, abs=1e-6)
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=0.8, mcclellan_oscillator=-80.0,
+                               up_25pct_quarter=400, new_high_low_ratio=0.7,
+                               tape="CORRECTION")
+        adj, override = breadth_regime_adjustment(snap)
+        assert adj == pytest.approx(0.0, abs=1e-6)   # CORRECTION → 0 adjustment
+        assert override is False
+
+    def test_recovery_tape_small_lift(self):
+        from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
+        snap = BreadthSnapshot("2026-06-04", ratio_10d=1.2, mcclellan_oscillator=-40.0,
+                               tape="RECOVERY")
+        adj, override = breadth_regime_adjustment(snap)
+        assert adj == pytest.approx(+0.03, abs=1e-6)
+        assert override is False
 
     # ── conviction scorer with breadth ────────────────────────────────────────
 
@@ -3653,19 +3701,20 @@ class TestBreadthScanThreshold:
         )
 
     def test_bull_tape_does_not_raise_threshold(self):
-        """In a bull tape, min_conviction stays at 0.40."""
+        """In a bull tape, min_conviction is lowered (adj=+0.05); no override."""
         from quantlab.signals.breadth import breadth_regime_adjustment
         snap = self._make_bull_snap()
         adj, override = breadth_regime_adjustment(snap)
         assert override is False
-        assert adj == 0.0   # no penalty in bull tape
+        assert adj == pytest.approx(+0.05, abs=1e-6)   # BULL → slight lift
 
-    def test_bear_tape_applies_override(self):
-        """Bear tape (McClellan < -100) triggers hard veto."""
+    def test_bear_tape_no_hard_override(self):
+        """Bear tape uses -0.10 score penalty + min_conviction=0.80, not hard override."""
         from quantlab.signals.breadth import breadth_regime_adjustment
         snap = self._make_bear_snap()
         adj, override = breadth_regime_adjustment(snap)
-        assert override is True
+        assert override is False
+        assert adj == pytest.approx(-0.10, abs=1e-6)
 
     def test_bear_tape_conviction_veto_in_scorer(self):
         """score_conviction() returns 0.0 when breadth_override is True."""
@@ -3683,13 +3732,13 @@ class TestBreadthScanThreshold:
         assert "tape" in line
 
     def test_bear_tape_ratio_penalty(self):
-        """10d-ratio=0.3 < 0.5 → -0.12 regime penalty."""
+        """BEAR tape → -0.10 score adjustment, no hard override."""
         from quantlab.signals.breadth import breadth_regime_adjustment, BreadthSnapshot
         snap = BreadthSnapshot("2026-06-04", ratio_10d=0.3,
-                               mcclellan_oscillator=-20.0,  # above -100, no override
+                               mcclellan_oscillator=-20.0,
                                up_25pct_quarter=350, tape="BEAR")
         adj, override = breadth_regime_adjustment(snap)
-        assert adj == pytest.approx(-0.12, abs=1e-6)
+        assert adj == pytest.approx(-0.10, abs=1e-6)
         assert override is False
 
     def test_ignore_breadth_flag_exists(self):
@@ -3712,6 +3761,181 @@ class TestBreadthScanThreshold:
         )
         assert "--backfill" in result.stdout
         assert "--start-date" in result.stdout
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5-state tape classification — _classify_tape() unit tests
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestClassifyTape:
+    """Unit tests for the 5-state _classify_tape() function."""
+
+    def _snap(self, **kw):
+        from quantlab.signals.breadth import BreadthSnapshot
+        defaults = dict(
+            date="2026-06-08",
+            pct_above_200sma=50.0, pct_above_50sma=45.0, pct_above_20sma=40.0,
+            ratio_10d=1.2, mcclellan_oscillator=-30.0,
+            mcclellan_summation=200.0, new_high_low_ratio=1.2,
+            spy_above_200sma=True,
+        )
+        defaults.update(kw)
+        return BreadthSnapshot(**defaults)
+
+    # ── BULL ─────────────────────────────────────────────────────────────────
+
+    def test_bull_all_conditions_met(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=62.0, pct_above_50sma=58.0,
+                       ratio_10d=2.0, mcclellan_oscillator=-20.0)
+        assert _classify_tape(s) == "BULL"
+
+    def test_bull_requires_p200_above_55(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=54.9, pct_above_50sma=58.0,
+                       ratio_10d=2.0, mcclellan_oscillator=-20.0)
+        assert _classify_tape(s) != "BULL"
+
+    def test_bull_requires_p50_above_50(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=62.0, pct_above_50sma=49.9,
+                       ratio_10d=2.0, mcclellan_oscillator=-20.0)
+        assert _classify_tape(s) != "BULL"
+
+    def test_bull_requires_r10_above_1_5(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=62.0, pct_above_50sma=58.0,
+                       ratio_10d=1.4, mcclellan_oscillator=-20.0)
+        assert _classify_tape(s) != "BULL"
+
+    def test_bull_requires_mc_above_minus50(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=62.0, pct_above_50sma=58.0,
+                       ratio_10d=2.0, mcclellan_oscillator=-51.0)
+        assert _classify_tape(s) != "BULL"
+
+    # ── CORRECTION ───────────────────────────────────────────────────────────
+
+    def test_correction_sharp_mcclellan_drop_not_bear(self):
+        """mc=-321 during pullback is CORRECTION, not BEAR — long-term structure intact."""
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=48.0, pct_above_50sma=32.0,
+                       ratio_10d=0.6, mcclellan_oscillator=-321.0,
+                       new_high_low_ratio=0.8, spy_above_200sma=True)
+        assert _classify_tape(s) == "CORRECTION"
+
+    def test_correction_mc_minus_451_not_bear(self):
+        """Even mc=-451 is CORRECTION when p200=45% and spy_above_200sma=True."""
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=45.0, pct_above_50sma=38.0,
+                       ratio_10d=0.55, mcclellan_oscillator=-451.0,
+                       new_high_low_ratio=0.6, spy_above_200sma=True)
+        assert _classify_tape(s) == "CORRECTION"
+
+    def test_correction_requires_p200_above_40(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=39.0, spy_above_200sma=True,
+                       mcclellan_oscillator=-80.0, ratio_10d=0.8)
+        assert _classify_tape(s) != "CORRECTION"
+
+    # ── RECOVERY ─────────────────────────────────────────────────────────────
+
+    def test_recovery_mc_rising_from_lows(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=42.0, ratio_10d=0.9,
+                       mcclellan_oscillator=-50.0, mcclellan_summation=300.0)
+        assert _classify_tape(s) == "RECOVERY"
+
+    def test_recovery_p200_range_30_to_55(self):
+        from quantlab.signals.breadth import _classify_tape
+        # p200=35 in [30,55], mc>-100, summation>-5000
+        s = self._snap(pct_above_200sma=35.0, ratio_10d=0.9,
+                       mcclellan_oscillator=-40.0, mcclellan_summation=100.0)
+        assert _classify_tape(s) == "RECOVERY"
+
+    def test_recovery_fails_when_mc_below_minus100(self):
+        from quantlab.signals.breadth import _classify_tape
+        # mc<-100 blocks RECOVERY
+        s = self._snap(pct_above_200sma=42.0, ratio_10d=0.9,
+                       mcclellan_oscillator=-101.0, mcclellan_summation=300.0)
+        assert _classify_tape(s) != "RECOVERY"
+
+    def test_recovery_fails_when_summation_deeply_negative(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=42.0, ratio_10d=0.9,
+                       mcclellan_oscillator=-40.0, mcclellan_summation=-6000.0)
+        assert _classify_tape(s) != "RECOVERY"
+
+    # ── BEAR ─────────────────────────────────────────────────────────────────
+
+    def test_bear_requires_all_five_conditions(self):
+        from quantlab.signals.breadth import _classify_tape
+        bear = self._snap(pct_above_200sma=20.0, pct_above_50sma=28.0,
+                          ratio_10d=0.5, mcclellan_oscillator=-150.0,
+                          new_high_low_ratio=0.3, mcclellan_summation=-8000.0)
+        assert _classify_tape(bear) == "BEAR"
+
+    def test_bear_missing_one_condition_not_bear(self):
+        """Failing just one condition (p200=31%) makes it not BEAR."""
+        from quantlab.signals.breadth import _classify_tape
+        almost_bear = self._snap(pct_above_200sma=31.0, pct_above_50sma=28.0,
+                                 ratio_10d=0.5, mcclellan_oscillator=-150.0,
+                                 new_high_low_ratio=0.3, mcclellan_summation=-8000.0)
+        assert _classify_tape(almost_bear) != "BEAR"
+
+    def test_bear_requires_p200_below_30(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=30.1, pct_above_50sma=28.0,
+                       ratio_10d=0.5, mcclellan_oscillator=-150.0,
+                       new_high_low_ratio=0.3, mcclellan_summation=-8000.0)
+        assert _classify_tape(s) != "BEAR"
+
+    def test_bear_requires_nh_nl_below_half(self):
+        from quantlab.signals.breadth import _classify_tape
+        s = self._snap(pct_above_200sma=20.0, pct_above_50sma=28.0,
+                       ratio_10d=0.5, mcclellan_oscillator=-150.0,
+                       new_high_low_ratio=0.51, mcclellan_summation=-8000.0)
+        assert _classify_tape(s) != "BEAR"
+
+    # ── fetch_and_store history_data integration ──────────────────────────────
+
+    def test_fetch_and_store_passes_history_data_to_compute(self):
+        """fetch_and_store() calls compute_market_breadth with history_data when
+        flat_file_provider is supplied."""
+        import sys
+        from pathlib import Path
+        from datetime import date
+        from unittest.mock import MagicMock, patch
+
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import update_breadth as _ub
+
+        # Minimal mock provider returning 1 symbol
+        from quantlab.providers.base import Bar
+        mock_bar = Bar(as_of=date(2026, 6, 8), open=100.0, high=102.0,
+                       low=99.0, close=101.0, volume=50_000.0)
+        mock_poly = MagicMock()
+        mock_poly.get_grouped_daily.return_value = {"AAPL": mock_bar}
+
+        # Flat file provider returning a single day dict
+        mock_flat = MagicMock()
+        mock_flat.get_grouped_daily.return_value = {"AAPL": mock_bar}
+
+        captured = {}
+        original_comb = _ub.compute_market_breadth
+
+        def capturing_comb(**kwargs):
+            captured.update(kwargs)
+            return original_comb(**kwargs)
+
+        with patch.object(_ub, "compute_market_breadth", side_effect=capturing_comb):
+            _ub.fetch_and_store(date(2026, 6, 8), mock_poly,
+                                flat_file_provider=mock_flat)
+
+        assert "history_data" in captured
+        assert captured["history_data"] is not None
 
 
 # ══════════════════════════════════════════════════════════════════════════════

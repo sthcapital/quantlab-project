@@ -22,10 +22,13 @@ Rolling / momentum signals:
     McClellan Summation   = cumulative McClellan Oscillator
     AD line               = cumulative (A - D)
 
-Tape classification:
-    BULL    — 10d-ratio > 2.0 and McClellan > -100
-    NEUTRAL — 10d-ratio 1.0-2.0
-    BEAR    — 10d-ratio < 0.5 or McClellan < -100 or up_25pct_quarter < 200
+Tape classification (5 states):
+    BULL       — healthy, expanding market (p200>55%, p50>50%, r10>1.5, mc>-50)
+    CORRECTION — pullback within bull (structure intact, breadth weakening)
+    RECOVERY   — emerging from lows (mc>-100, p200 30-55%, summation rising)
+    NEUTRAL    — mixed/transitional signals
+    BEAR       — genuine bear (all 5 conditions: p200<30%, p50<35%, mc<-100,
+                               r10<0.7, nh_nl<0.5 — requires broad collapse)
 """
 
 from __future__ import annotations
@@ -76,8 +79,12 @@ class BreadthSnapshot:
     mcclellan_summation: float | None    = None
     ad_line: int | None                  = None
 
+    # SPY 200 SMA fields (populated by update_breadth.py when flat files available)
+    spy_above_200sma: bool  = True   # is SPY above its 200-day SMA
+    spy_200sma_slope: float = 0.0    # slope of SPY 200 SMA over last 20 days
+
     # Tape classification
-    tape: str = "NEUTRAL"   # BULL / NEUTRAL / BEAR
+    tape: str = "NEUTRAL"   # BULL / CORRECTION / RECOVERY / NEUTRAL / BEAR
 
     def summary_line(self) -> str:
         """One-line breadth summary for scan output and logs."""
@@ -297,28 +304,48 @@ def rolling_breadth(
     return snapshots
 
 
-def _classify_tape(s: BreadthSnapshot) -> str:
-    """Classify the market tape from a BreadthSnapshot's rolling metrics."""
-    mc  = s.mcclellan_oscillator or 0.0
-    r10 = s.ratio_10d
-    u25 = s.up_25pct_quarter
+def _classify_tape(s: BreadthSnapshot, vix_close: float | None = None) -> str:
+    """
+    Classify the market tape using 5-state institutional logic.
 
-    # Hard bear signals (override individual conviction)
-    if mc < -100:
+    Priority order (first match wins):
+        1. BEAR       — genuine breadth collapse; requires ALL 5 conditions
+        2. RECOVERY   — turning up from lows; mc > -100 with p200 in 30-55%
+        3. BULL       — healthy, expanding market
+        4. CORRECTION — structure intact but breadth weakening
+        5. NEUTRAL    — mixed/transitional (fallback)
+
+    A McClellan at -321 during a 2-week pullback is CORRECTION, not BEAR,
+    because long-term structure (pct_above_200sma) remains intact.
+    """
+    mc    = s.mcclellan_oscillator or 0.0
+    r10   = s.ratio_10d or 1.0
+    p200  = s.pct_above_200sma or 0.0
+    p50   = s.pct_above_50sma  or 0.0
+    p20   = s.pct_above_20sma  or 0.0       # noqa: F841  (available for future use)
+    nh_nl = s.new_high_low_ratio or 0.0
+    vix   = vix_close or 20.0               # noqa: F841  (available for future use)
+
+    # 1. BEAR — requires breadth collapse across ALL five metrics simultaneously
+    if (p200 < 30.0 and p50 < 35.0 and mc < -100 and r10 < 0.7 and nh_nl < 0.5):
         return "BEAR"
-    if u25 > 0 and u25 < 200:
-        return "BEAR"
 
-    if r10 is None:
-        return "NEUTRAL"
+    # 2. RECOVERY — breadth turning from lows; summation must not be deeply negative
+    if (30.0 <= p200 <= 55.0 and mc > -100
+            and s.mcclellan_summation is not None
+            and s.mcclellan_summation > -5000):
+        return "RECOVERY"
 
-    if r10 > 2.0:
+    # 3. BULL — healthy and expanding
+    if (p200 > 55.0 and p50 > 50.0 and r10 > 1.5 and mc > -50):
         return "BULL"
-    if r10 > 1.0:
-        return "NEUTRAL"
-    if r10 > 0.5:
-        return "WEAK"
-    return "BEAR"
+
+    # 4. CORRECTION — long-term structure intact but breadth weakening
+    if (p200 > 40.0 and s.spy_above_200sma):
+        return "CORRECTION"
+
+    # 5. NEUTRAL — mixed or transitional
+    return "NEUTRAL"
 
 
 # ── Breadth regime adjustment for conviction scorer ────────────────────────────
@@ -327,51 +354,32 @@ def breadth_regime_adjustment(
     snapshot: BreadthSnapshot | None,
 ) -> tuple[float, bool]:
     """
-    Compute the conviction score adjustment and override flag from breadth.
+    Compute the conviction score adjustment from the tape classification.
 
     Returns:
         (adjustment, override) where:
-            adjustment — negative delta to apply to conviction score (-0.12 to 0.0)
-            override   — True when market is in hard-bear mode (no new longs)
+            adjustment — delta applied to conviction score (+0.05 to -0.10)
+            override   — always False; use min_conviction thresholds per tape
+                         to control entry aggressiveness (see run_universe_scan)
 
-    Scoring matrix:
-        10d-ratio > 2.0         : 0.00  (full bull — no penalty)
-        10d-ratio 1.0–2.0       : -0.03
-        10d-ratio 0.5–1.0       : -0.07
-        10d-ratio < 0.5         : -0.12
-        new_high_low_ratio < 0.5: -0.05 additional
-        McClellan < -100        : override → no new longs
-        up_25pct_quarter < 200  : override → no new longs
+    Tape → adjustment mapping:
+        BULL       : +0.05  (healthy market, loosen bar slightly)
+        CORRECTION :  0.00  (do NOT suppress — best Stage 2 setups form here)
+        RECOVERY   : +0.03  (improving tape, slight lift)
+        NEUTRAL    :  0.00  (no adjustment)
+        BEAR       : -0.10  (genuine breadth collapse; raise bar via min_conviction)
     """
-    if snapshot is None or snapshot.ratio_10d is None:
-        return 0.0, False   # neutral when no breadth data
+    if snapshot is None:
+        return 0.0, False
 
-    mc  = snapshot.mcclellan_oscillator or 0.0
-    r10 = snapshot.ratio_10d
-    u25 = snapshot.up_25pct_quarter
-
-    # Hard overrides
-    if mc < -100:
-        return 0.0, True
-    if u25 > 0 and u25 < 200:
-        return 0.0, True
-
-    # Ratio-based penalty
-    if r10 > 2.0:
-        adj = 0.00
-    elif r10 > 1.0:
-        adj = -0.03
-    elif r10 > 0.5:
-        adj = -0.07
-    else:
-        adj = -0.12
-
-    # Additional warning for NH/NL deterioration
-    nhl = snapshot.new_high_low_ratio
-    if nhl > 0 and nhl < 0.5:
-        adj = round(adj - 0.05, 4)
-
-    return adj, False
+    _ADJ: dict[str, float] = {
+        "BULL":        +0.05,
+        "CORRECTION":   0.00,
+        "RECOVERY":    +0.03,
+        "NEUTRAL":      0.00,
+        "BEAR":        -0.10,
+    }
+    return _ADJ.get(snapshot.tape, 0.0), False
 
 
 # ── DuckDB persistence ────────────────────────────────────────────────────────
@@ -381,6 +389,15 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
     try:
         from quantlab.storage import get_db
         con = get_db()
+        # Migration: add SPY 200 SMA columns if not present
+        for _col_sql in (
+            "ALTER TABLE breadth_history ADD COLUMN spy_above_200sma BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE breadth_history ADD COLUMN spy_200sma_slope DOUBLE DEFAULT 0.0",
+        ):
+            try:
+                con.execute(_col_sql)
+            except Exception:
+                pass  # column already exists
         con.execute("""
             INSERT OR REPLACE INTO breadth_history (
                 date, advances, declines, unchanged, total_stocks,
@@ -388,9 +405,10 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
                 new_highs_52w, new_lows_52w,
                 pct_above_20sma, pct_above_50sma, pct_above_200sma,
                 advance_decline_ratio, new_high_low_ratio,
-                ratio_10d, mcclellan_oscillator, mcclellan_summation, ad_line, tape
+                ratio_10d, mcclellan_oscillator, mcclellan_summation, ad_line, tape,
+                spy_above_200sma, spy_200sma_slope
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """, [
             snapshot.date,
@@ -402,6 +420,7 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
             snapshot.advance_decline_ratio, snapshot.new_high_low_ratio,
             snapshot.ratio_10d, snapshot.mcclellan_oscillator,
             snapshot.mcclellan_summation, snapshot.ad_line, snapshot.tape,
+            snapshot.spy_above_200sma, snapshot.spy_200sma_slope,
         ])
         con.close()
     except Exception as e:
@@ -413,13 +432,16 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
     try:
         from quantlab.storage import get_db
         con = get_db()
+        # Use COALESCE for new columns so older rows without them get defaults
         rows = con.execute(f"""
             SELECT date, advances, declines, unchanged, total_stocks,
                    up_4pct_count, down_4pct_count, up_25pct_quarter, down_25pct_quarter,
                    new_highs_52w, new_lows_52w,
                    pct_above_20sma, pct_above_50sma, pct_above_200sma,
                    advance_decline_ratio, new_high_low_ratio,
-                   ratio_10d, mcclellan_oscillator, mcclellan_summation, ad_line, tape
+                   ratio_10d, mcclellan_oscillator, mcclellan_summation, ad_line, tape,
+                   COALESCE(spy_above_200sma, TRUE)  AS spy_above_200sma,
+                   COALESCE(spy_200sma_slope,  0.0)  AS spy_200sma_slope
             FROM breadth_history
             ORDER BY date DESC LIMIT {n}
         """).fetchall()
@@ -439,6 +461,8 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
                 ratio_10d=r[16], mcclellan_oscillator=r[17],
                 mcclellan_summation=r[18], ad_line=r[19],
                 tape=r[20] or "NEUTRAL",
+                spy_above_200sma=bool(r[21]),
+                spy_200sma_slope=float(r[22] or 0.0),
             )
             snapshots.append(s)
         return snapshots

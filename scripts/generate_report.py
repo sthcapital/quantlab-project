@@ -49,16 +49,19 @@ C_LGRAY  = HexColor("#f0f2f5")
 C_MGRAY  = HexColor("#cccccc")
 C_DGRAY  = HexColor("#444444")
 C_TGRAY  = HexColor("#888888")
+C_BLUE   = HexColor("#74b9ff")       # RECOVERY state
+C_NGRAY  = HexColor("#636e72")       # NEUTRAL state
 
 # Row shading for candidate table
 _ROW_GREEN  = HexColor("#d4f5e9")   # Stage 2 + options + 2+ days
 _ROW_YELLOW = HexColor("#fff9e0")   # Stage 2, no options or single day
 
 _TAPE_COLORS = {
-    "BULL":     C_GREEN,
-    "RECOVERY": C_YELLOW,
-    "CAUTION":  C_ORANGE,
-    "BEAR":     C_RED,
+    "BULL":       C_GREEN,
+    "CORRECTION": C_YELLOW,
+    "RECOVERY":   C_BLUE,
+    "NEUTRAL":    C_NGRAY,
+    "BEAR":       C_RED,
 }
 
 PAGE_W, PAGE_H = letter
@@ -170,6 +173,7 @@ def _page1(
     n_cand: int,
     n_multi: int,
     abt_entry: dict | None,
+    vix_close: float | None = None,
 ) -> list:
     tape  = (breadth_snap.tape if breadth_snap else "N/A")
     mcl   = (f"{breadth_snap.mcclellan_oscillator:+.0f}"
@@ -180,6 +184,19 @@ def _page1(
              if breadth_snap and breadth_snap.ad_line is not None else "—")
     summ  = (f"{breadth_snap.mcclellan_summation:,.0f}"
              if breadth_snap and breadth_snap.mcclellan_summation is not None else "—")
+    p20   = (f"{breadth_snap.pct_above_20sma:.1f}%"
+             if breadth_snap else "—")
+    p50   = (f"{breadth_snap.pct_above_50sma:.1f}%"
+             if breadth_snap else "—")
+    p200  = (f"{breadth_snap.pct_above_200sma:.1f}%"
+             if breadth_snap else "—")
+    spy_status = ("Above" if (breadth_snap and breadth_snap.spy_above_200sma) else "Below")
+    vix_str    = f"{vix_close:.1f}" if vix_close is not None else "—"
+    try:
+        from quantlab.providers.cboe import classify_vix_regime as _cvr
+        vix_regime_str = _cvr(vix_close)[0].capitalize() if vix_close is not None else "—"
+    except Exception:
+        vix_regime_str = "—"
     tape_c = _TAPE_COLORS.get(tape, C_DGRAY)
 
     e: list = []
@@ -208,10 +225,13 @@ def _page1(
     e.append(Spacer(1, 0.15 * inch))
 
     # ── Market breadth metrics ─────────────────────────────────────────────────
-    e.append(Paragraph("Market Breadth", S["section"]))
+    e.append(Paragraph("Market Internals", S["section"]))
     met_data = [
-        ["McClellan Oscillator", mcl, "10-Day Breadth Ratio", ratio],
-        ["AD Line",              ad_ln, "McClellan Summation",  summ],
+        ["McClellan Oscillator", mcl,   "10-Day Breadth Ratio", ratio],
+        ["AD Line",              ad_ln,  "McClellan Summation",  summ],
+        ["% Above 20 SMA",       p20,    "% Above 50 SMA",       p50],
+        ["% Above 200 SMA",      p200,   "SPY vs 200 SMA",       spy_status],
+        ["VIX Close",            vix_str,"VIX Regime",           vix_regime_str],
     ]
     col_w = [1.8 * inch, 1.0 * inch, 1.8 * inch, 1.2 * inch]
     met_tbl = Table(met_data, colWidths=col_w)
@@ -222,7 +242,7 @@ def _page1(
         ("FONTSIZE",  (0, 0), (-1, -1), 8.5),
         ("ALIGN",     (1, 0), (1, -1), "RIGHT"),
         ("ALIGN",     (3, 0), (3, -1), "RIGHT"),
-        ("BACKGROUND",(0, 0), (-1, 0), C_LGRAY),
+        ("ROWBACKGROUNDS", (0, 0), (-1, -1), [C_LGRAY, white]),
         ("GRID",      (0, 0), (-1, -1), 0.4, C_MGRAY),
         ("PADDING",   (0, 0), (-1, -1), 6),
     ]))
@@ -540,6 +560,17 @@ def generate(
     abt_entry    = _load_abt_entry(db_path)
     n_multi      = sum(1 for c in candidates if c.get("consecutive_days", 1) >= 2)
 
+    # VIX close (non-fatal; defaults to None → shown as "—" in report)
+    vix_close: float | None = None
+    try:
+        from datetime import timedelta as _td
+        from quantlab.providers.cboe import fetch_vix_history
+        _vix_bars = fetch_vix_history(report_date - _td(days=7), report_date)
+        if _vix_bars:
+            vix_close = _vix_bars[-1].close
+    except Exception:
+        pass
+
     # ── Build PDF ──────────────────────────────────────────────────────────────
     ts     = datetime.now().strftime("%Y-%m-%d %H:%M")
     footer = _make_footer(ts)
@@ -556,7 +587,8 @@ def generate(
     )
 
     story: list = []
-    story += _page1(S, report_date, breadth, len(candidates), n_multi, abt_entry)
+    story += _page1(S, report_date, breadth, len(candidates), n_multi, abt_entry,
+                    vix_close=vix_close)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map)
         story += _alert_section(S, candidates, backtest_map)
