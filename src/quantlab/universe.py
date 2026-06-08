@@ -8,25 +8,20 @@ Build pipeline:
     1. Polygon grouped daily      →  raw ~12,299 US tickers
     2. Price / volume filters     →  ~3,500 liquid names
     3. Symbol quality filters     →  ~2,800 (removes warrants, preferred, ETF tickers)
-    4. Polygon options check      →  ~2,300 confirmed optionable equities
+    4. Optionable check           →  ~2,300 confirmed optionable equities
     5. Sort by dollar volume, cache, return
 
-Optionable check (Polygon /v3/reference/options/contracts):
-    Queries the Polygon options contract reference for each candidate.
-    Uses 3 concurrent workers (Polygon rate limit).
-    First run: ~12 minutes for 3,000 symbols; subsequent same-day: instant.
-    Requires POLYGON_API_KEY environment variable.
+Optionable check priority (no TWS required):
+    1. Polygon /v3/reference/options/contracts (POLYGON_API_KEY, ~12 min first run)
+    2. Massive S3 options flat file  — reads the 'underlying' column from the most
+       recent cached options Parquet; instant when cache is warm, one S3 download
+       otherwise.  No API rate limits.
+    3. Static curated list fallback (data/external/optionable_universe.py)
 
 Caching:
-    data/processed/universe_{YYYY-MM-DD}.parquet  — full universe list
+    data/processed/universe_{YYYY-MM-DD}.parquet   — full universe list
     data/processed/optionable_{YYYY-MM-DD}.parquet — confirmed optionable symbols
-    DuckDB universe_history table                  — filter stats per date
-
-IBKR options check (legacy, client_id=61):
-    Still available via check_optionable_ibkr() for cases where Polygon is
-    unavailable.  Calls reqSecDefOptParams() per symbol (~20 min for 2,500).
-    First run ~20 minutes for 2,500 symbols; subsequent same-day runs instant.
-    Set ib=None to skip the check (tradeable_no_options mode).
+    DuckDB universe_history table                   — filter stats per date
 
 Usage::
 
@@ -36,16 +31,14 @@ Usage::
     polygon = PolygonProvider()
     mgr     = UniverseManager()
 
-    # Build + cache (first run ~20 min with options check)
     symbols, stats = mgr.build_tradeable_universe(
         trade_date       = date.today(),
         polygon_provider = polygon,
-        ib               = ib,   # connected IB() instance; None to skip options check
     )
-    print(f"{stats['final_count']} optionable stocks from {stats['total_raw']} raw")
+    print(f"{stats.final_count} optionable stocks from {stats.total_raw} raw")
 
     # Subsequent calls load from cache instantly
-    symbols, stats = mgr.build_tradeable_universe(date.today(), polygon, ib=None)
+    symbols, stats = mgr.build_tradeable_universe(date.today(), polygon)
 """
 
 from __future__ import annotations
@@ -355,7 +348,106 @@ def check_optionable_polygon(
     return optionable_ordered
 
 
-# ── IBKR options availability check (legacy) ──────────────────────────────────
+# ── Massive S3 options flat-file check (preferred when no Polygon key) ────────
+
+def check_optionable_massive(
+    candidates: list[str],
+    trade_date: date,
+    lookback_days: int = 7,
+) -> list[str]:
+    """
+    Check which symbols have listed options via the Massive S3 options flat files.
+
+    Reads only the ``underlying`` column from the most recent cached options
+    Parquet — no API key and no per-symbol HTTP requests required.  On cache
+    miss for the most recent day it attempts one S3 download; if that also
+    fails it walks back through ``lookback_days`` to find any cached file.
+
+    Falls back to the static optionable list when no flat file is available.
+
+    Args:
+        candidates:    Symbol list to check.
+        trade_date:    Date to associate with the resulting cache entry.
+        lookback_days: How many calendar days to walk back looking for a
+                       usable options file (default 7).
+
+    Returns:
+        Subset of candidates that appear as an underlying in the options file.
+    """
+    from quantlab.providers.flat_files import FlatFileProvider
+    from datetime import timedelta
+
+    try:
+        from quantlab.market_calendar import is_market_open as _is_open
+    except ImportError:
+        _is_open = lambda d: d.weekday() < 5  # type: ignore[assignment]
+
+    # Return cached result when available
+    cached = load_optionable_cache(trade_date)
+    if cached is not None:
+        logger.info("Optionable cache hit for %s: %d symbols", trade_date, len(cached))
+        cached_set = set(cached)
+        return [s for s in candidates if s in cached_set]
+
+    flat = FlatFileProvider()
+
+    # Walk back from yesterday (today's file may not be published yet)
+    check_date = trade_date - timedelta(days=1)
+    options_underlyings: set[str] = set()
+
+    for _ in range(lookback_days):
+        if not _is_open(check_date):
+            check_date -= timedelta(days=1)
+            continue
+
+        cache_path = flat.options_cache_path(check_date)
+
+        # Try local Parquet cache first (read only the underlying column — fast)
+        if not cache_path.exists():
+            try:
+                flat.download_options_day(check_date)
+            except Exception as _dl_err:
+                logger.debug(
+                    "Massive options S3 download failed for %s: %s", check_date, _dl_err
+                )
+                check_date -= timedelta(days=1)
+                continue
+
+        if cache_path.exists():
+            try:
+                import pyarrow.parquet as pq
+                tbl = pq.read_table(str(cache_path), columns=["underlying"])
+                options_underlyings = set(tbl.to_pydict()["underlying"])
+                logger.info(
+                    "Massive options optionable check: %d unique underlyings on %s",
+                    len(options_underlyings), check_date,
+                )
+                break
+            except Exception as _read_err:
+                logger.debug(
+                    "Options Parquet read failed for %s: %s", check_date, _read_err
+                )
+
+        check_date -= timedelta(days=1)
+
+    if not options_underlyings:
+        logger.warning(
+            "Massive options flat file unavailable within %d days of %s"
+            " — falling back to static optionable list",
+            lookback_days, trade_date,
+        )
+        return _filter_by_static_optionable(candidates)
+
+    optionable = [s for s in candidates if s in options_underlyings]
+    logger.info(
+        "Massive options check: %d/%d candidates are optionable",
+        len(optionable), len(candidates),
+    )
+    save_optionable_cache(trade_date, optionable)
+    return optionable
+
+
+# ── IBKR options availability check (legacy — kept for reference only) ─────────
 
 def check_optionable_ibkr(
     candidates: list[str],
@@ -594,7 +686,7 @@ class UniverseManager:
             min_price        = self.min_price,
             min_volume       = self.min_volume,
             min_dollar_volume = self.min_dollar_volume,
-            optionable_only  = optionable_only and ib is not None,
+            optionable_only  = optionable_only,
         )
         logger.info("Raw tickers: %d", stats.total_raw)
 
@@ -620,14 +712,12 @@ class UniverseManager:
         logger.info("After symbol filter: %d", stats.after_symbol_filter)
 
         # ── Step 4: Options check ──────────────────────────────────────────────
-        # Priority:
-        #   1. Polygon dynamic check (paid tier; 5 req/min on free tier makes
-        #      bulk checking impractical for 3,000+ symbols).
-        #   2. IBKR reqSecDefOptParams() — accurate but ~20 min for 2,500 syms.
-        #   3. Static optionable fallback — intersect with curated S&P 500 +
-        #      Russell 1000 list (data/external/optionable_universe.py).
-        #      Upgrade: replace with dynamic check when Polygon paid tier or
-        #      FactSet options-reference feed is available.
+        # Priority (TWS not required for any path):
+        #   1. Polygon /v3/reference/options/contracts — per-symbol REST check.
+        #      First run ~12 min for 3,000 symbols; subsequent same-day: instant.
+        #   2. Massive S3 options flat file — reads 'underlying' column from the
+        #      most recent cached Parquet.  No API rate limits; instant on cache hit.
+        #   3. Static optionable fallback (S&P 500 + Russell 1000 curated list).
         if optionable_only:
             import os
             api_key = polygon_api_key or os.environ.get("POLYGON_API_KEY", "")
@@ -635,16 +725,9 @@ class UniverseManager:
                 candidates = check_optionable_polygon(
                     candidates, api_key, trade_date
                 )
-            elif ib is not None:
-                logger.info("No POLYGON_API_KEY — using IBKR options check")
-                candidates = check_optionable_ibkr(candidates, ib, trade_date)
             else:
-                # static optionable fallback
-                candidates = _filter_by_static_optionable(candidates)
-                logger.info(
-                    "No POLYGON_API_KEY or IB connection — "
-                    "using static optionable universe (S&P 500 + Russell 1000 curated list)"
-                )
+                # Massive flat-file check — no API key needed
+                candidates = check_optionable_massive(candidates, trade_date)
             stats.optionable_count = len(candidates)
             logger.info("After options filter: %d", stats.optionable_count)
         else:

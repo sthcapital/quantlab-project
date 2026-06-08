@@ -318,34 +318,6 @@ def main() -> None:
                 except Exception as e:
                     print(f"  {r.symbol:<8}  options ERROR — {e}")
 
-        elif args.provider == "ibkr":
-            from quantlab.signals.options_flow import options_conviction_score
-            from ib_insync import IB
-
-            options_client_id = ibkr_cfg.get("options_chain_client_id", 21)
-            print(f"\nOptions enrichment via IBKR ({len(results)} symbols, "
-                  f"client_id={options_client_id}) ...")
-            ib_opt = IB()
-            try:
-                ib_opt.connect(args.host, args.port,
-                               clientId=options_client_id, timeout=10)
-                for r in results:
-                    try:
-                        bars = list(provider.get_daily_bars(r.symbol, start_date, end_date))
-                        opt_score = options_conviction_score(r.symbol, bars, ib_opt)
-                        r.options_conviction = opt_score
-                        r.conviction_score   = score_conviction(r)
-                        flag = " ▲" if opt_score >= 0.6 else ""
-                        print(f"  {r.symbol:<8}  opt={opt_score:.2f}  "
-                              f"conv={r.conviction_score:.2f}{flag}")
-                    except Exception as e:
-                        print(f"  {r.symbol:<8}  options ERROR — {e}")
-            except Exception as e:
-                print(f"[options] IBKR connection failed: {e} — skipping")
-            finally:
-                if ib_opt.isConnected():
-                    ib_opt.disconnect()
-
         else:
             print("\n--with-options: set POLYGON_API_KEY for Polygon options data.")
 

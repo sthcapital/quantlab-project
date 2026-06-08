@@ -373,26 +373,11 @@ def options_conviction_score(
     ib_connection,
 ) -> float:
     """
-    Fetch option chain via live IBKR connection and return a conviction score.
+    Deprecated — MassiveOptionsProvider (Polygon S3) is the sole options data
+    source for scanning.  TWS is reserved for news and execution only.
 
-    Uses bars[-1].close as spot price to avoid an extra market data request.
-    Returns 0.0 when options data is unavailable or IBKR returns no chain.
-
-    Args:
-        symbol:        Ticker symbol.
-        bars:          Bar sequence with at least one bar (spot = last close).
-        ib_connection: Active IB() instance.
-
-    Returns:
-        Float in [0.0, 1.0].  Safe to call — all exceptions return 0.0.
+    Returns 0.5 (neutral) unconditionally so callers that still reference this
+    function get a no-op score rather than an IBKR TWS call.  Use
+    MassiveOptionsProvider.compute_options_score() for live options scoring.
     """
-    if not bars:
-        return 0.0
-    try:
-        spot = float(bars[-1].close)
-        chain = fetch_chain_data(ib_connection, symbol, spot)
-        if chain is None or not chain.contracts:
-            return 0.0
-        return compute_options_score(chain)
-    except Exception:
-        return 0.0
+    return 0.5

@@ -4,9 +4,18 @@
 #
 # Run every trading-day morning before market open (e.g. 08:30 ET).
 # 1. Activates the quantlab conda environment
-# 2. Runs scan_universe.py across sp500_sample (breakout, lookback=5)
-# 3. Runs run_backtest.py on every symbol scoring above 0.70 conviction
-# 4. Appends all output to ~/quantlab-scan.log with timestamps
+# 2. Builds tradeable universe (Polygon grouped daily + Massive options check)
+# 3. Updates breadth metrics (Polygon + Massive S3 flat files)
+# 4. Runs scan_universe.py — bars from Massive S3 flatfile, options from
+#    MassiveOptionsProvider (Polygon key).  TWS is NOT used for bars or options.
+# 5. Runs run_backtest.py on every symbol scoring above 0.70 conviction
+# 6. Appends all output to ~/quantlab-scan.log with timestamps
+#
+# TWS (IBKR Gateway) is used for:
+#   - News headlines   (--with-news flag)
+#   - Forward return price updates  (track_forward_returns.py)
+#   - Execution / order placement   (not in this script)
+#   TWS is NOT required for bars, options scoring, or the main scan.
 #
 # Cron (08:00 ET = 12:00 UTC Mon–Fri):
 #   0 12 * * 1-5 /home/quantlab/projects/quantlab-project/scripts/daily_scan.sh

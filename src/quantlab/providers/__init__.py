@@ -41,6 +41,8 @@ def create_market_data_provider(name: str, **kwargs) -> MarketDataProvider:
         return IbkrProvider(**kwargs)
 
     if normalized in {"flatfile", "flat_file", "flat-file"}:
+        # No TWS connection is opened — not even if --with-options is passed.
+        # Options scoring uses MassiveOptionsProvider (Polygon S3) exclusively.
         from quantlab.providers.flat_files import FlatFileMarketDataProvider
         return FlatFileMarketDataProvider(**kwargs)
 
