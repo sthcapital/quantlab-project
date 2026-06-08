@@ -72,11 +72,11 @@ def _styles() -> dict:
     S = {}
     S["title"] = ParagraphStyle(
         "RLTitle", fontName="Helvetica-Bold", fontSize=20,
-        textColor=C_NAVY, spaceAfter=2,
+        spaceAfter=6, textColor=C_NAVY, alignment=TA_CENTER,
     )
     S["date_line"] = ParagraphStyle(
         "RLDateLine", fontName="Helvetica", fontSize=10,
-        textColor=C_TGRAY, spaceAfter=14,
+        spaceBefore=4, spaceAfter=16, textColor=C_TGRAY, alignment=TA_CENTER,
     )
     S["section"] = ParagraphStyle(
         "RLSection", fontName="Helvetica-Bold", fontSize=11,
@@ -186,7 +186,10 @@ def _page1(
 
     # ── Title block ───────────────────────────────────────────────────────────
     e.append(Paragraph("STH Capital — QuantLab Daily Briefing", S["title"]))
+    e.append(Spacer(1, 0.1 * inch))
     e.append(Paragraph(report_date.strftime("%A, %B %d, %Y"), S["date_line"]))
+    e.append(Spacer(1, 0.25 * inch))
+    e.append(HRFlowable(width="100%", thickness=1, color=C_ACCENT, spaceAfter=12))
 
     # ── Tape badge (colored box via single-cell Table) ────────────────────────
     tape_inner = Paragraph(
