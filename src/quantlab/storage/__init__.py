@@ -354,9 +354,26 @@ def _ensure_schema(con) -> None:
             mcclellan_summation     DOUBLE,
             ad_line                 INTEGER,
             tape                    VARCHAR DEFAULT 'NEUTRAL',
+            spy_above_200sma        BOOLEAN DEFAULT TRUE,
+            spy_200sma_slope        DOUBLE  DEFAULT 0.0,
             created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+
+    # Migration: add SPY 200 SMA columns to breadth_history if absent (pre-3237354 DBs)
+    try:
+        _bh_cols = {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'breadth_history'"
+        ).fetchall()}
+        for _col, _def in [
+            ("spy_above_200sma", "BOOLEAN DEFAULT TRUE"),
+            ("spy_200sma_slope",  "DOUBLE DEFAULT 0.0"),
+        ]:
+            if _col not in _bh_cols:
+                con.execute(f"ALTER TABLE breadth_history ADD COLUMN {_col} {_def}")
+    except Exception:
+        pass
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS universe_history (

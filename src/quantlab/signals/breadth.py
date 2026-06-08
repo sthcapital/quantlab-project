@@ -389,15 +389,18 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
     try:
         from quantlab.storage import get_db
         con = get_db()
-        # Migration: add SPY 200 SMA columns if not present
-        for _col_sql in (
-            "ALTER TABLE breadth_history ADD COLUMN spy_above_200sma BOOLEAN DEFAULT TRUE",
-            "ALTER TABLE breadth_history ADD COLUMN spy_200sma_slope DOUBLE DEFAULT 0.0",
-        ):
-            try:
-                con.execute(_col_sql)
-            except Exception:
-                pass  # column already exists
+        # Migration guard: add SPY columns if absent.  Check before ALTER to avoid
+        # aborting the DuckDB implicit transaction on a duplicate-column error.
+        _bh_cols = {r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'breadth_history'"
+        ).fetchall()}
+        for _col, _def in [
+            ("spy_above_200sma", "BOOLEAN DEFAULT TRUE"),
+            ("spy_200sma_slope",  "DOUBLE DEFAULT 0.0"),
+        ]:
+            if _col not in _bh_cols:
+                con.execute(f"ALTER TABLE breadth_history ADD COLUMN {_col} {_def}")
         con.execute("""
             INSERT OR REPLACE INTO breadth_history (
                 date, advances, declines, unchanged, total_stocks,
