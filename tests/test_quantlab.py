@@ -5332,21 +5332,21 @@ class TestEdgarYoYMetrics:
 
     def test_high_yoy_growth_with_acceleration(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
-        # 70% YoY eps growth is in 50-100% band → base=0.6, + accel bonus=0.1 → 0.70
+        # 70% YoY eps growth hits the O'Neil threshold: 70-100% band → 0.8, + 0.1 accel = 0.9
         snap = self._snap(
             eps_yoy_history=[0.30, 0.50, 0.70],
             eps_yoy_pct=0.70,
             is_accelerating=True,
         )
         score = compute_earnings_acceleration(snap)
-        assert score == pytest.approx(0.70, abs=1e-4)
+        assert score == pytest.approx(0.90, abs=1e-4)
 
     def test_over_100pct_yoy_growth_maps_above_0_5(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
-        # 200% YoY eps → >100% band → base = 0.9; no accel → score = 0.9
+        # 200% YoY eps → >100% band → O'Neil explosive tier → base = 1.0; no accel → 1.0
         snap = self._snap(eps_yoy_history=[0.5, 1.0, 2.0], eps_yoy_pct=2.0)
         score = compute_earnings_acceleration(snap)
-        assert score == pytest.approx(0.9, abs=1e-4)
+        assert score == pytest.approx(1.0, abs=1e-4)
 
     def test_zero_yoy_growth_no_acceleration_returns_zero(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
@@ -5517,14 +5517,267 @@ class TestEdgarYoYMetrics:
             snap.eps_yoy_pct = yoy_pct
             return compute_earnings_acceleration(snap)
 
+        # O'Neil aligned bands: <20%=0.1, 20-50%=0.3, 50-70%=0.6, 70-100%=0.8, >100%=1.0
         assert _score(-0.01) == pytest.approx(0.0,  abs=1e-4)   # negative
-        assert _score(0.00)  == pytest.approx(0.0,  abs=1e-4)   # zero
-        assert _score(0.01)  == pytest.approx(0.3,  abs=1e-4)   # just above 0%
+        assert _score(0.00)  == pytest.approx(0.0,  abs=1e-4)   # zero (≤ 0 boundary)
+        assert _score(0.01)  == pytest.approx(0.1,  abs=1e-4)   # 0–20% → insufficient
+        assert _score(0.199) == pytest.approx(0.1,  abs=1e-4)   # just below 20%
+        assert _score(0.20)  == pytest.approx(0.3,  abs=1e-4)   # exactly 20% → modest
         assert _score(0.499) == pytest.approx(0.3,  abs=1e-4)   # just below 50%
-        assert _score(0.50)  == pytest.approx(0.6,  abs=1e-4)   # exactly 50%
-        assert _score(0.999) == pytest.approx(0.6,  abs=1e-4)   # just below 100%
-        assert _score(1.00)  == pytest.approx(0.9,  abs=1e-4)   # exactly 100%
-        assert _score(5.00)  == pytest.approx(0.9,  abs=1e-4)   # way above 100%
+        assert _score(0.50)  == pytest.approx(0.6,  abs=1e-4)   # exactly 50% → strong
+        assert _score(0.699) == pytest.approx(0.6,  abs=1e-4)   # just below 70%
+        assert _score(0.70)  == pytest.approx(0.8,  abs=1e-4)   # O'Neil 70% threshold
+        assert _score(0.999) == pytest.approx(0.8,  abs=1e-4)   # just below 100%
+        assert _score(1.00)  == pytest.approx(1.0,  abs=1e-4)   # exactly 100% → explosive
+        assert _score(5.00)  == pytest.approx(1.0,  abs=1e-4)   # hypergrowth
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Book-derived edge improvements — stage classification, volume validation,
+# PEG ratio, volume dry-up  (Weinstein / Minervini / O'Neil / Boucher / Darvas)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStageClassification:
+    """Tests for stage_classification() using synthetic bar sequences."""
+
+    @staticmethod
+    def _make_stage_bars(
+        n: int = 250,
+        start: float = 100.0,
+        trend_pct: float = 0.003,
+        vol_factor: float = 1.0,
+    ):
+        """Generate trending bars with given parameters."""
+        from datetime import timedelta
+        bars = []
+        price = start
+        d = date(2025, 1, 2)
+        for i in range(n):
+            price = max(1.0, price * (1 + trend_pct + (i % 3 - 1) * 0.002))
+            bars.append(Bar(
+                as_of=d + timedelta(days=i),
+                open=price * 0.998,
+                high=price * 1.005,
+                low=price * 0.994,
+                close=price,
+                volume=1_000_000 * vol_factor,
+            ))
+        return bars
+
+    def test_stage_2_strong_uptrend(self):
+        from quantlab.signals import stage_classification
+        bars = self._make_stage_bars(n=250, trend_pct=0.004)
+        # Strong uptrend: price well above rising 30W MA with higher highs/lows
+        assert stage_classification(bars) == 2
+
+    def test_stage_4_strong_downtrend(self):
+        from quantlab.signals import stage_classification
+        bars = self._make_stage_bars(n=250, trend_pct=-0.004)
+        assert stage_classification(bars) == 4
+
+    def test_insufficient_bars_returns_zero(self):
+        from quantlab.signals import stage_classification
+        bars = self._make_stage_bars(n=100)  # too short for 150 MA + 40 buffer
+        assert stage_classification(bars) == 0
+
+    def test_minimum_bars_boundary(self):
+        from quantlab.signals import stage_classification
+        # 190 bars = 150 + 40 → exactly at the threshold
+        bars = self._make_stage_bars(n=190, trend_pct=0.003)
+        stage = stage_classification(bars)
+        assert stage in (0, 1, 2, 3, 4)  # any valid output
+
+    def test_stage_returns_int(self):
+        from quantlab.signals import stage_classification
+        bars = self._make_stage_bars(n=250)
+        result = stage_classification(bars)
+        assert isinstance(result, int)
+        assert result in (0, 1, 2, 3, 4)
+
+    def test_scan_result_stage_defaults_zero(self):
+        r = ScanResult(
+            symbol="AAPL", scan_date="2026-06-08",
+            signal_type="breakout", signal=True,
+            entry_close=200.0, indicator_value=None, lookback=20,
+        )
+        assert r.stage == 0
+
+    def test_stage_2_boosts_conviction(self):
+        base = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=False, stage=0,
+        )
+        s2 = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=False, stage=2,
+        )
+        assert score_conviction(s2) - score_conviction(base) == pytest.approx(0.05, abs=1e-9)
+
+    def test_non_stage_2_no_bonus(self):
+        for stage_val in (0, 1, 3, 4):
+            r = ScanResult(
+                "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+                regime_bullish=False, stage=stage_val,
+            )
+            # Should not add the +0.05 stage-2 bonus
+            assert score_conviction(r) == pytest.approx(0.30, abs=1e-9), f"stage={stage_val}"
+
+
+class TestBreakoutVolumeScore:
+    """Tests for volume_on_breakout_score() — Weinstein 2× rule."""
+
+    @staticmethod
+    def _bars_with_today_vol(today_vol: float, avg_vol: float = 1_000_000, n: int = 25):
+        from datetime import timedelta
+        bars = []
+        d = date(2025, 1, 2)
+        for i in range(n):
+            v = avg_vol if i < n - 1 else today_vol
+            bars.append(Bar(d + timedelta(days=i), 100.0, 101.0, 99.0, 100.0, v))
+        return bars
+
+    def test_volume_below_1x_returns_zero(self):
+        from quantlab.signals import volume_on_breakout_score
+        bars = self._bars_with_today_vol(today_vol=800_000, avg_vol=1_000_000)
+        assert volume_on_breakout_score(bars) == pytest.approx(0.0)
+
+    def test_volume_1x_to_2x_returns_weak(self):
+        from quantlab.signals import volume_on_breakout_score
+        bars = self._bars_with_today_vol(today_vol=1_500_000, avg_vol=1_000_000)
+        assert volume_on_breakout_score(bars) == pytest.approx(0.3)
+
+    def test_volume_2x_to_3x_valid_weinstein(self):
+        from quantlab.signals import volume_on_breakout_score
+        bars = self._bars_with_today_vol(today_vol=2_500_000, avg_vol=1_000_000)
+        assert volume_on_breakout_score(bars) == pytest.approx(0.7)
+
+    def test_volume_above_3x_institutional(self):
+        from quantlab.signals import volume_on_breakout_score
+        bars = self._bars_with_today_vol(today_vol=3_500_000, avg_vol=1_000_000)
+        assert volume_on_breakout_score(bars) == pytest.approx(1.0)
+
+    def test_insufficient_bars_returns_zero(self):
+        from quantlab.signals import volume_on_breakout_score
+        from datetime import timedelta
+        bars = [Bar(date(2025,1,2)+timedelta(days=i), 100., 101., 99., 100., 1e6)
+                for i in range(5)]
+        assert volume_on_breakout_score(bars) == pytest.approx(0.0)
+
+    def test_breakout_volume_wires_into_conviction(self):
+        # breakout signal_type → valid volume ≥ 0.7 adds +0.08
+        no_vol = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=False, breakout_volume_score=0.3,
+        )
+        valid = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=False, breakout_volume_score=0.7,
+        )
+        assert score_conviction(valid) - score_conviction(no_vol) == pytest.approx(0.08, abs=1e-9)
+
+    def test_breakout_volume_ignored_for_sma_signal(self):
+        # SMA signal type should not receive the volume bonus
+        r = ScanResult(
+            "AAPL", "2026-06-08", "sma", True, 200.0, None, 20,
+            regime_bullish=False, breakout_volume_score=1.0,
+        )
+        assert score_conviction(r) == pytest.approx(0.30, abs=1e-9)
+
+
+class TestVolumeDryUpScore:
+    """Tests for volume_dry_up_score() — Kell/Darvas base dry-up detection."""
+
+    @staticmethod
+    def _bars(recent_vol: float, prior_vol: float, n: int = 20):
+        from datetime import timedelta
+        bars = []
+        d = date(2025, 1, 2)
+        for i in range(n):
+            vol = prior_vol if i < n // 2 else recent_vol
+            bars.append(Bar(d + timedelta(days=i), 100.0, 101.0, 99.0, 100.0, vol))
+        return bars
+
+    def test_30pct_decline_returns_one(self):
+        from quantlab.signals import volume_dry_up_score
+        bars = self._bars(recent_vol=650_000, prior_vol=1_000_000)
+        assert volume_dry_up_score(bars) == pytest.approx(1.0)
+
+    def test_15_to_30pct_decline_returns_06(self):
+        from quantlab.signals import volume_dry_up_score
+        bars = self._bars(recent_vol=800_000, prior_vol=1_000_000)   # 20% decline
+        assert volume_dry_up_score(bars) == pytest.approx(0.6)
+
+    def test_flat_volume_returns_03(self):
+        from quantlab.signals import volume_dry_up_score
+        bars = self._bars(recent_vol=1_000_000, prior_vol=1_000_000)
+        assert volume_dry_up_score(bars) == pytest.approx(0.3)
+
+    def test_increasing_volume_returns_zero(self):
+        from quantlab.signals import volume_dry_up_score
+        bars = self._bars(recent_vol=1_500_000, prior_vol=1_000_000)
+        assert volume_dry_up_score(bars) == pytest.approx(0.0)
+
+    def test_insufficient_bars_returns_zero(self):
+        from quantlab.signals import volume_dry_up_score
+        from datetime import timedelta
+        bars = [Bar(date(2025,1,2)+timedelta(days=i), 100., 101., 99., 100., 1e6)
+                for i in range(5)]
+        assert volume_dry_up_score(bars) == pytest.approx(0.0)
+
+
+class TestPegRatioScore:
+    """Tests for peg_ratio_score() — Boucher PEG filter."""
+
+    def test_peg_below_05_deeply_undervalued(self):
+        from quantlab.providers.edgar import peg_ratio_score
+        # P/E=10, growth=30% → PEG=0.33 → 1.0
+        assert peg_ratio_score(10.0, 30.0) == pytest.approx(1.0)
+
+    def test_peg_05_to_10_fairly_valued(self):
+        from quantlab.providers.edgar import peg_ratio_score
+        # P/E=20, growth=30% → PEG=0.67 → 0.7
+        assert peg_ratio_score(20.0, 30.0) == pytest.approx(0.7)
+
+    def test_peg_10_to_15_slightly_expensive(self):
+        from quantlab.providers.edgar import peg_ratio_score
+        # P/E=25, growth=20% → PEG=1.25 → 0.4
+        assert peg_ratio_score(25.0, 20.0) == pytest.approx(0.4)
+
+    def test_peg_above_15_overvalued(self):
+        from quantlab.providers.edgar import peg_ratio_score
+        # P/E=40, growth=15% → PEG=2.67 → 0.0
+        assert peg_ratio_score(40.0, 15.0) == pytest.approx(0.0)
+
+    def test_none_inputs_neutral(self):
+        from quantlab.providers.edgar import peg_ratio_score
+        assert peg_ratio_score(None, 25.0) == pytest.approx(0.5)
+        assert peg_ratio_score(20.0, None) == pytest.approx(0.5)
+        assert peg_ratio_score(None, None) == pytest.approx(0.5)
+
+    def test_zero_or_negative_growth_neutral(self):
+        from quantlab.providers.edgar import peg_ratio_score
+        assert peg_ratio_score(20.0, 0.0)  == pytest.approx(0.5)
+        assert peg_ratio_score(20.0, -5.0) == pytest.approx(0.5)
+
+    def test_peg_score_wires_into_conviction(self):
+        # peg_score >= 0.7 → +0.06
+        low = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=False, peg_score=0.4,
+        )
+        high = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=False, peg_score=0.7,
+        )
+        assert score_conviction(high) - score_conviction(low) == pytest.approx(0.06, abs=1e-9)
+
+    def test_scan_result_peg_score_defaults_zero(self):
+        r = ScanResult(
+            symbol="AAPL", scan_date="2026-06-08",
+            signal_type="breakout", signal=True,
+            entry_close=200.0, indicator_value=None, lookback=20,
+        )
+        assert r.peg_score == 0.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

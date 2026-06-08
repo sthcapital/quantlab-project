@@ -123,6 +123,16 @@ class ScanResult:
     breadth_regime_adj: float = 0.0  # -0.12 to 0.0 depending on tape
     breadth_override: bool = False   # True → hard veto (McClellan<-100 or bear)
 
+    # Weinstein/Minervini stage classification (set by scan_symbol from bar history)
+    # 1=Basing  2=Advancing (long-entry candidates only)  3=Topping  4=Declining  0=Unknown
+    stage: int = 0
+
+    # Breakout volume quality — Weinstein's 2× rule (set by scan_symbol)
+    breakout_volume_score: float = 0.0   # volume_on_breakout_score() ≥ 0.7 → +0.08
+
+    # PEG ratio score — Boucher's filter (populated by run_universe_scan via EDGAR cache)
+    peg_score: float = 0.0   # peg_ratio_score() ≥ 0.7 → +0.06
+
     # EDGAR fundamentals (populated by run_universe_scan; None = unavailable)
     edgar_acceleration: float | None = None  # real score; falls back to earnings_acceleration
 
@@ -183,6 +193,9 @@ def score_conviction(result: ScanResult) -> float:
         Breadth regime adjustment       : 0.00 to -0.12 (from 10-day ratio)
         Breadth override                : returns 0.0 immediately (bear market veto)
         Macro regime (FRED+CBOE)        : 0.00 (risk_on), -0.05 (risk_off), -0.10 (stress)
+        Stage 2 confirmation            : +0.05  (Weinstein advancing stage only)
+        Breakout volume ≥ 2× avg        : +0.08  (Weinstein valid breakout — score ≥ 0.7)
+        PEG ratio < 1.0                 : +0.06  (Boucher fairly-valued relative to growth)
 
     Note: base_quality_score() is intentionally excluded from this scorer.
     Live AAPL analysis (82 signals, 2023–2025) showed base quality is
@@ -280,6 +293,18 @@ def score_conviction(result: ScanResult) -> float:
         score += 0.10   # momentum continuation after beat
     elif result.earnings_proximity == "post_earnings_miss":
         score -= 0.05   # headwind after miss
+
+    # Weinstein stage confirmation — Stage 2 only for long entries
+    if result.stage == 2:
+        score += 0.05
+
+    # Breakout volume quality — Weinstein's 2× average minimum for valid breakout
+    if result.signal_type == "breakout" and result.breakout_volume_score >= 0.7:
+        score += 0.08
+
+    # PEG ratio — Boucher's fairly-valued-relative-to-growth filter
+    if result.peg_score >= 0.7:
+        score += 0.06
 
     return max(0.0, min(score, 1.0))
 
@@ -538,7 +563,11 @@ def scan_symbol(
     Returns:
         ScanResult with conviction_score, or None if not enough bars.
     """
-    from quantlab.signals import relative_volume as _rel_vol
+    from quantlab.signals import (
+        relative_volume as _rel_vol,
+        stage_classification as _stage_cls,
+        volume_on_breakout_score as _vol_breakout,
+    )
     from quantlab.signals.wyckoff import (
         absorption_score as _absorption,
         base_quality_score as _base_quality,
@@ -602,6 +631,10 @@ def scan_symbol(
     vol_trend   = _vol_trend(bars)
     climax      = _climax(bars)
 
+    # Stage classification (Weinstein/Minervini) and breakout volume quality
+    stage     = _stage_cls(bars)
+    bvs       = _vol_breakout(bars)
+
     # News features
     n_count = 0
     n_cat = "none"
@@ -639,6 +672,8 @@ def scan_symbol(
         sector=SECTOR_MAP.get(symbol, ""),
         rs_score=rs,
         market_cap_tier=market_cap_tier(symbol),
+        stage=stage,
+        breakout_volume_score=bvs,
     )
 
     result.conviction_score = score_conviction(result)
@@ -806,12 +841,14 @@ def run_universe_scan(
                 get_next_earnings_date as _get_next_earnings,
                 get_last_earnings_result as _get_last_earnings,
                 count_trading_days as _count_trading_days,
+                get_edgar_peg_score as _get_edgar_peg_score,
             )
         except Exception:
-            _get_edgar_accel = None       # type: ignore[assignment]
-            _get_next_earnings = None     # type: ignore[assignment]
-            _get_last_earnings = None     # type: ignore[assignment]
-            _count_trading_days = None    # type: ignore[assignment]
+            _get_edgar_accel = None           # type: ignore[assignment]
+            _get_next_earnings = None         # type: ignore[assignment]
+            _get_last_earnings = None         # type: ignore[assignment]
+            _count_trading_days = None        # type: ignore[assignment]
+            _get_edgar_peg_score = None       # type: ignore[assignment]
 
         # Import real-time earnings press release checker (highest priority proximity source).
         try:
@@ -849,6 +886,15 @@ def run_universe_scan(
                     except Exception as _ea_err:
                         logger.debug("%s: EDGAR acceleration unavailable: %s", symbol, _ea_err)
 
+                # PEG score from EDGAR cache (reads eps_diluted + eps_growth columns;
+                # no additional network request — 0.0 when cache miss).
+                _peg_score: float = 0.0
+                if _get_edgar_peg_score is not None:
+                    try:
+                        _peg_score = _get_edgar_peg_score(symbol, bars[-1].close)
+                    except Exception as _pg_err:
+                        logger.debug("%s: PEG score unavailable: %s", symbol, _pg_err)
+
                 # Fetch news if IBKR connection is provided
                 news_feat = None
                 if ibkr_connection is not None:
@@ -882,6 +928,7 @@ def run_universe_scan(
                     result.macro_regime        = _macro_regime
                     result.vix_regime          = _vix_regime
                     result.edgar_acceleration  = edgar_accel
+                    result.peg_score           = _peg_score
 
                     # Earnings calendar proximity
                     # Priority 1: real-time press release beat/miss (most authoritative)

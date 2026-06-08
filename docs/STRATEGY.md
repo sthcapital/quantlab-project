@@ -237,6 +237,108 @@ earnings filter ultimately needs.
 
 ---
 
+## Stage Classification Framework (Weinstein / Minervini)
+
+All stocks cycle through four stages.  The scanner only enters longs in Stage 2.
+
+```
+Stage 1 — BASING
+  Price action : Within 15% of 52-week low.  Volatility contracting.
+  30-week MA   : Flat or turning up from Stage 4 decline.
+  Volume       : Declining — sellers are exhausted, not accumulating yet.
+  Action       : Do not enter.  Add to weekend watchlist for monitoring.
+                 Stage 1 → Stage 2 transition is the highest-conviction entry.
+
+Stage 2 — ADVANCING  ← ONLY VALID LONG-ENTRY STAGE
+  Price action : Above the rising 30-week MA.  Higher highs and higher lows.
+  30-week MA   : Trending up.  Price stays above MA on pullbacks.
+  Volume       : Expanding on up-weeks, contracting on down-weeks.
+  RS vs market : Improving or leading.
+  Action       : Enter on breakout or first pullback to base.  Full conviction
+                 scoring applies.  score_conviction() adds +0.05 for Stage 2.
+
+Stage 3 — TOPPING
+  Price action : Extended >15% above 30-week MA.  Lower highs beginning.
+  30-week MA   : Flattening.  Price whips around the MA.
+  Volume       : Declining on rallies (institutional distribution).
+  Action       : Do not initiate new longs.  Tighten stops on existing positions.
+
+Stage 4 — DECLINING
+  Price action : Below the declining 30-week MA.  Lower highs, lower lows.
+  30-week MA   : Trending down.
+  Volume       : Can be heavy on down-days (panic selling) or light (disinterest).
+  Action       : Short-only or sidelines.  Never buy a Stage 4 stock.
+```
+
+### Stage Confirmation in `score_conviction()`
+
+| Stage | Adjustment | Rationale |
+|---|---|---|
+| 2 (Advancing) | +0.05 | Confirmed institutional sponsorship structure |
+| Other | 0.00 | Neutral — no confirmation from stage analysis |
+
+---
+
+## O'Neil 70% EPS Growth Threshold
+
+William O'Neil's research on the biggest stock market winners (CAN SLIM
+methodology) showed that the majority had EPS growth of 70%+ in the quarters
+before their major price advances.
+
+### EPS YoY Growth Scoring (aligned with O'Neil)
+
+| EPS YoY Growth | Score | Classification |
+|---|---|---|
+| ≤ 0%           | 0.0   | Shrinking — avoid |
+| 0–20%          | 0.1   | Insufficient — below institutional interest threshold |
+| 20–50%         | 0.3   | Modest — acceptable but below O'Neil minimum |
+| 50–70%         | 0.6   | Strong — approaching the key threshold |
+| **70–100%**    | **0.8** | **Very strong — O'Neil threshold (historically leads big winners)** |
+| > 100%         | 1.0   | Explosive hypergrowth — highest conviction tier |
+
+An additional +0.10 acceleration bonus applies when EPS growth is increasing
+quarter-over-quarter (latest YoY rate > prior quarter YoY rate), for both
+revenue and EPS simultaneously.
+
+### Breakout Volume Validation (Weinstein)
+
+Weinstein's rule: volume must be at least **2× the 4-week average** on the
+breakout bar for a technically valid breakout.
+
+| Volume vs 4-Week Avg | Score | `score_conviction()` weight |
+|---|---|---|
+| < 1×   | 0.0 | +0.00 (false breakout likely) |
+| 1–2×   | 0.3 | +0.00 (below Weinstein minimum) |
+| 2–3×   | 0.7 | **+0.08** (valid breakout) |
+| > 3×   | 1.0 | **+0.08** (institutional conviction) |
+
+### PEG Ratio Filter (Boucher)
+
+PEG = trailing_PE / annual_EPS_growth_rate.  A PEG < 1.0 indicates the stock
+is undervalued relative to its growth rate.
+
+| PEG Ratio | Score | `score_conviction()` weight |
+|---|---|---|
+| < 0.5     | 1.0   | **+0.06** (deeply undervalued) |
+| 0.5–1.0   | 0.7   | **+0.06** (fairly valued — good entry) |
+| 1.0–1.5   | 0.4   | +0.00 |
+| > 1.5     | 0.0   | +0.00 (overvalued relative to growth) |
+
+### Volume Dry-Up (Kell / Darvas)
+
+During the base formation, volume should contract as sellers are exhausted.
+`volume_dry_up_score()` compares the last 10-day average volume to the prior
+10-day average:
+
+| Volume Change | Score | Interpretation |
+|---|---|---|
+| Declining 30%+ | 1.0 | Sellers exhausted — Darvas box forming |
+| Declining 15–30% | 0.6 | Healthy contraction |
+| Flat (±15%) | 0.3 | Neutral |
+| Increasing | 0.0 | Distribution risk — not a clean base |
+
+---
+
 ## What "Historical Winners" Looks Like in the Data
 
 From the 2024–2025 IBKR live run (breakout lookback=5, 10 bps cost):

@@ -113,9 +113,17 @@ def _ensure_edgar_table(con) -> None:
             revenue_growth DOUBLE,
             eps_growth DOUBLE,
             consecutive_beats INTEGER,
+            eps_diluted DOUBLE,
             PRIMARY KEY (symbol, fetch_date)
         )
     """)
+    # Migration: add eps_diluted when table already existed without it
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(edgar_fundamentals)").fetchall()}
+        if "eps_diluted" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_diluted DOUBLE")
+    except Exception:
+        pass
 
 
 def _load_edgar_cache(symbol: str, max_age_days: int) -> Optional[float]:
@@ -168,8 +176,8 @@ def _save_edgar_cache(
             """
             INSERT OR REPLACE INTO edgar_fundamentals
                 (symbol, fetch_date, acceleration_score, revenue_growth,
-                 eps_growth, consecutive_beats)
-            VALUES (?, ?, ?, ?, ?, ?)
+                 eps_growth, consecutive_beats, eps_diluted)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 symbol,
@@ -178,6 +186,7 @@ def _save_edgar_cache(
                 _rev_growth,
                 _eps_growth,
                 consecutive_beats,
+                snap.eps_diluted,
             ],
         )
         con.close()
@@ -662,23 +671,28 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     Falls back to the legacy QoQ acceleration method when fewer than 5 quarters
     of history are available (e.g. recently-listed companies).
 
-    Scoring (YoY path):
+    Scoring (YoY path) — aligned with O'Neil's research showing 70%+ EPS growth
+    precedes the biggest stock market winners:
         base from YoY magnitude:
-            growth ≤ 0        →  0.0  (shrinking or flat)
-            0  < growth < 50% →  0.3
-            50% ≤ growth < 100% → 0.6
-            growth ≥ 100%     →  0.9
+            growth ≤ 0         →  0.0  (shrinking or flat)
+            0  < growth < 20%  →  0.1  (not enough — insufficient earnings driver)
+            20% ≤ growth < 50% →  0.3  (modest — below O'Neil minimum)
+            50% ≤ growth < 70% →  0.6  (strong)
+            70% ≤ growth < 100% → 0.8  (very strong — O'Neil 70% threshold)
+            growth ≥ 100%      →  1.0  (explosive — highest conviction tier)
         acceleration bonus: +0.10 when snap.is_accelerating is True
                             (latest YoY rate > prior quarter YoY rate,
                             for BOTH revenue AND eps)
         result clamped to [0.0, 1.0]
 
     Interpretation:
-        0.0   — negative or zero growth; no contribution to conviction
-        0.3   — modest positive growth (< 50% YoY)
-        0.6   — strong growth (50–100% YoY)
-        0.9   — hypergrowth (> 100% YoY)
-        +0.1  — acceleration trend on top of the above bands
+        0.0   — negative or zero YoY growth
+        0.1   — below 20% YoY — weak fundamental driver
+        0.3   — 20–50% YoY — moderate, below the O'Neil threshold
+        0.6   — 50–70% YoY — strong growth
+        0.8   — 70–100% YoY — O'Neil-grade growth (historically leads big winners)
+        1.0   — > 100% YoY — explosive hypergrowth
+        +0.10 — acceleration trend on top of the above band
     """
     # ── YoY path (preferred when ≥ 5 quarters of data available) ─────────────
     yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
@@ -686,12 +700,16 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
         latest_yoy = yoy_history[-1]
         if latest_yoy <= 0:
             base = 0.0
+        elif latest_yoy < 0.20:
+            base = 0.1   # 0–20%  — below O'Neil minimum
         elif latest_yoy < 0.50:
-            base = 0.3   # 0–50%
+            base = 0.3   # 20–50% — modest
+        elif latest_yoy < 0.70:
+            base = 0.6   # 50–70% — strong
         elif latest_yoy < 1.00:
-            base = 0.6   # 50–100%
+            base = 0.8   # 70–100% — O'Neil threshold
         else:
-            base = 0.9   # >100%
+            base = 1.0   # >100%  — explosive
         bonus = 0.10 if snap.is_accelerating else 0.0
         return round(min(1.0, max(0.0, base + bonus)), 4)
 
@@ -710,3 +728,96 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
 
     clipped = max(-2.0, min(2.0, acceleration))
     return round((clipped + 2.0) / 4.0, 4)
+
+
+# ── PEG ratio scoring (Boucher) ───────────────────────────────────────────────
+
+def peg_ratio_score(
+    forward_pe: Optional[float],
+    eps_growth_pct: Optional[float],
+) -> float:
+    """
+    Score 0.0–1.0 based on PEG ratio (Boucher filter).
+
+    PEG = forward_pe / annual_eps_growth_rate_pct.
+
+    A PEG below 1.0 indicates the stock is undervalued relative to its
+    growth rate — the core insight from Boucher's PEG methodology.
+
+    Args:
+        forward_pe:      Forward (or trailing) price-to-earnings ratio.
+        eps_growth_pct:  Annual EPS growth rate as a percentage (e.g. 25.0 for 25%).
+
+    Returns:
+        1.0 — PEG < 0.5  (deeply undervalued relative to growth)
+        0.7 — PEG 0.5–1.0 (fairly valued — good entry zone)
+        0.4 — PEG 1.0–1.5 (slightly expensive)
+        0.0 — PEG > 1.5  (overvalued relative to growth)
+        0.5 — neutral    (data unavailable or growth ≤ 0)
+    """
+    if forward_pe is None or eps_growth_pct is None:
+        return 0.5
+    if forward_pe <= 0 or eps_growth_pct <= 0:
+        return 0.5   # negative P/E or negative growth → indeterminate
+
+    peg = forward_pe / eps_growth_pct
+    if peg < 0.5:
+        return 1.0
+    elif peg < 1.0:
+        return 0.7
+    elif peg < 1.5:
+        return 0.4
+    else:
+        return 0.0
+
+
+def get_edgar_peg_score(
+    symbol: str,
+    entry_close: float,
+    max_age_days: int = 7,
+) -> float:
+    """
+    Return an approximate PEG score using EDGAR-cached quarterly EPS data.
+
+    Computes trailing P/E = entry_close / (eps_diluted_quarterly × 4) and
+    divides by the cached YoY EPS growth rate (eps_growth column).  Returns
+    0.0 when the cache is stale, data is absent, or EPS is non-positive.
+
+    Does not make a network request — reads from the DuckDB edgar_fundamentals
+    cache populated by get_edgar_acceleration().
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+
+        cutoff = (date.today() - timedelta(days=max_age_days)).isoformat()
+        con = duckdb.connect(str(DB_PATH))
+        _ensure_edgar_table(con)
+        row = con.execute(
+            """
+            SELECT eps_growth, eps_diluted FROM edgar_fundamentals
+            WHERE symbol = ? AND fetch_date >= ?
+            ORDER BY fetch_date DESC LIMIT 1
+            """,
+            [symbol, cutoff],
+        ).fetchone()
+        con.close()
+
+        if row is None or row[0] is None or row[1] is None:
+            return 0.0
+
+        eps_yoy_decimal = float(row[0])   # stored as decimal, e.g. 0.47 = 47%
+        eps_diluted_q   = float(row[1])   # most recent quarterly EPS
+
+        if eps_yoy_decimal <= 0 or eps_diluted_q <= 0:
+            return 0.0
+
+        annual_eps  = eps_diluted_q * 4
+        trailing_pe = entry_close / annual_eps
+        growth_pct  = eps_yoy_decimal * 100   # convert to percentage for peg_ratio_score
+
+        return peg_ratio_score(trailing_pe, growth_pct)
+
+    except Exception as exc:
+        logger.debug("get_edgar_peg_score failed for %s: %s", symbol, exc)
+        return 0.0
