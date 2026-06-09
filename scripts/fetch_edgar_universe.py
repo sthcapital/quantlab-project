@@ -17,6 +17,7 @@ Usage:
     python scripts/fetch_edgar_universe.py              # full tradeable universe
     python scripts/fetch_edgar_universe.py --limit 20   # first 20 symbols (test)
     python scripts/fetch_edgar_universe.py --force      # re-fetch all, ignore cache age
+    python scripts/fetch_edgar_universe.py --force-null # re-fetch only NULL-eps_growth symbols
     python scripts/fetch_edgar_universe.py --universe sp500_sample  # smaller set
 """
 
@@ -50,29 +51,45 @@ _FETCH_METRICS = ["eps_diluted", "net_income", "revenue"]
 _CACHE_MAX_AGE_DAYS = 6   # re-fetch data older than this many days
 
 def _is_recently_cached(symbol: str, con) -> bool:
-    """True when edgar_fundamentals has a fresh entry for symbol (within 6 days).
+    """True only when edgar_fundamentals has a fresh entry with eps_growth populated.
 
-    6-day window lets the Monday weekly job re-fetch data that is up to a week
-    old without re-hitting the SEC for symbols already refreshed this week.
+    Both conditions must hold: fetch_date within 6 days AND eps_growth IS NOT NULL.
+    Symbols cached recently but with NULL eps_growth are re-fetched so bad data
+    written before the USD/shares EPS fix gets corrected automatically.
     """
     cutoff = (date.today() - timedelta(days=_CACHE_MAX_AGE_DAYS)).isoformat()
     row = con.execute(
-        "SELECT 1 FROM edgar_fundamentals WHERE symbol = ? AND fetch_date >= ?",
+        "SELECT 1 FROM edgar_fundamentals "
+        "WHERE symbol = ? AND fetch_date >= ? AND eps_growth IS NOT NULL",
         [symbol, cutoff],
     ).fetchone()
     return row is not None
 
 
-def _process_symbol(symbol: str, force: bool, con) -> str:
+def _has_valid_eps(symbol: str, con) -> bool:
+    """True when any row for symbol already has eps_growth populated."""
+    row = con.execute(
+        "SELECT 1 FROM edgar_fundamentals WHERE symbol = ? AND eps_growth IS NOT NULL",
+        [symbol],
+    ).fetchone()
+    return row is not None
+
+
+def _process_symbol(symbol: str, force: bool, force_null: bool, con) -> str:
     """
     Fetch and store EDGAR fundamentals for one symbol.
 
     Returns:
         "fetched"  — successfully fetched and stored
-        "skipped"  — cached within last 6 days (and force=False)
+        "skipped"  — valid cache exists (per active skip policy)
         "failed"   — not in SEC index or other error
     """
-    if not force and _is_recently_cached(symbol, con):
+    if force:
+        pass
+    elif force_null:
+        if _has_valid_eps(symbol, con):
+            return "skipped"
+    elif _is_recently_cached(symbol, con):
         return "skipped"
 
     try:
@@ -109,6 +126,10 @@ def main() -> None:
         "--force", action="store_true",
         help="Re-fetch all symbols, ignoring cache age",
     )
+    parser.add_argument(
+        "--force-null", action="store_true", dest="force_null",
+        help="Re-fetch only symbols with NULL eps_growth, ignoring cache age",
+    )
     args = parser.parse_args()
 
     symbols = load_universe(args.universe)
@@ -141,7 +162,7 @@ def main() -> None:
         _ensure_edgar_table(con)
 
         for symbol in batch:
-            result = _process_symbol(symbol, args.force, con)
+            result = _process_symbol(symbol, args.force, args.force_null, con)
             if result == "fetched":
                 total_fetched += 1
             elif result == "skipped":
