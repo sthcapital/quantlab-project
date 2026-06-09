@@ -214,14 +214,16 @@ def _page1(
         ParagraphStyle("TBadge", fontName="Helvetica-Bold", fontSize=18,
                        textColor=white, alignment=TA_CENTER),
     )
-    tape_tbl = Table([[tape_inner]], colWidths=[1.6 * inch], rowHeights=[0.42 * inch])
+    # 2.0 in wide so "CORRECTION" (10 chars, 18pt bold ≈ 116 pt) fits with margin.
+    # Outer column is 2.2 in so the inner 2.0 in badge sits inside after cell padding.
+    tape_tbl = Table([[tape_inner]], colWidths=[2.0 * inch], rowHeights=[0.42 * inch])
     tape_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, -1), tape_c),
         ("ALIGN",      (0, 0), (-1, -1), "CENTER"),
         ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
     ]))
     e.append(Table([[tape_tbl, Spacer(0.1 * inch, 0.1 * inch)]],
-                   colWidths=[1.8 * inch, CONTENT_W - 1.8 * inch]))
+                   colWidths=[2.2 * inch, CONTENT_W - 2.2 * inch]))
     e.append(Spacer(1, 0.15 * inch))
 
     # ── Market breadth metrics ─────────────────────────────────────────────────
