@@ -30,7 +30,12 @@ _GAAP_FIELDS: dict[str, list[str]] = {
         "SalesRevenueNet",
     ],
     "net_income": ["NetIncomeLoss"],
-    "eps_diluted": ["EarningsPerShareDiluted"],
+    "eps_diluted": [
+        "EarningsPerShareDiluted",
+        "EarningsPerShareBasicAndDiluted",          # used by many mid/small-caps
+        "IncomeLossFromContinuingOperationsPerDilutedShare",
+        "EarningsPerShareDilutedIncludingDiscontinuedOperations",
+    ],
     "total_assets": ["Assets"],
     "total_debt": [
         "LongTermDebt",
@@ -206,7 +211,13 @@ def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
         if field_name not in us_gaap:
             continue
         units = us_gaap[field_name].get("units", {})
-        unit_data = units.get("USD") or units.get("shares") or units.get("pure")
+        # EPS fields use "USD/shares" (dollars per share); revenue/income use "USD".
+        unit_data = (
+            units.get("USD")
+            or units.get("USD/shares")
+            or units.get("shares")
+            or units.get("pure")
+        )
         if not unit_data:
             continue
 
@@ -695,7 +706,22 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
         1.0   — > 100% YoY — explosive hypergrowth
         +0.10 — acceleration trend on top of the above band
     """
+    # ── Ensure EPS YoY is computed when not pre-filled ────────────────────────
+    # eps_yoy_history is empty when < 5 EDGAR periods are available OR when the
+    # GAAP field was not found on the first fetch pass.  If eps_history has 5+
+    # values, compute a direct same-quarter YoY: current vs 4 periods back.
+    # Write the result back to snap.eps_yoy_pct so _save_edgar_cache persists it.
+    if not snap.eps_yoy_history and len(snap.eps_history) >= 5:
+        _curr  = snap.eps_history[-1]
+        _prior = snap.eps_history[-5]   # same fiscal quarter, prior year
+        if abs(_prior) >= 1e-9:
+            _eps_yoy_direct = round((_curr - _prior) / abs(_prior), 6)
+            snap.eps_yoy_history = [_eps_yoy_direct]
+            if snap.eps_yoy_pct is None:
+                snap.eps_yoy_pct = _eps_yoy_direct
+
     # ── YoY path (preferred when ≥ 5 quarters of data available) ─────────────
+    # Prioritise EPS YoY; fall back to revenue YoY only when EPS is unavailable.
     yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
     if yoy_history:
         latest_yoy = yoy_history[-1]

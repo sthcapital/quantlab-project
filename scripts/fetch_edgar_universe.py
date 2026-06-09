@@ -11,12 +11,12 @@ sleep, effective throughput stays well within the SEC limit.
 
 Estimated runtime:
     2,325 symbols × ~1.2 s/symbol ≈ 45 minutes first run
-    Re-runs on the same day complete instantly (cache hit for each symbol).
+    Re-runs within 6 days skip already-fresh symbols (instant for stale-free cache).
 
 Usage:
     python scripts/fetch_edgar_universe.py              # full tradeable universe
     python scripts/fetch_edgar_universe.py --limit 20   # first 20 symbols (test)
-    python scripts/fetch_edgar_universe.py --force      # re-fetch cached-today entries
+    python scripts/fetch_edgar_universe.py --force      # re-fetch all, ignore cache age
     python scripts/fetch_edgar_universe.py --universe sp500_sample  # smaller set
 """
 
@@ -25,7 +25,7 @@ from __future__ import annotations
 import sys
 import time
 from argparse import ArgumentParser
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -47,11 +47,18 @@ _FETCH_METRICS = ["eps_diluted", "net_income", "revenue"]
 
 # ── Per-symbol helpers ─────────────────────────────────────────────────────────
 
-def _is_cached_today(symbol: str, con) -> bool:
-    """True when edgar_fundamentals already has a row for symbol with fetch_date=today."""
+_CACHE_MAX_AGE_DAYS = 6   # re-fetch data older than this many days
+
+def _is_recently_cached(symbol: str, con) -> bool:
+    """True when edgar_fundamentals has a fresh entry for symbol (within 6 days).
+
+    6-day window lets the Monday weekly job re-fetch data that is up to a week
+    old without re-hitting the SEC for symbols already refreshed this week.
+    """
+    cutoff = (date.today() - timedelta(days=_CACHE_MAX_AGE_DAYS)).isoformat()
     row = con.execute(
-        "SELECT 1 FROM edgar_fundamentals WHERE symbol = ? AND fetch_date = ?",
-        [symbol, date.today().isoformat()],
+        "SELECT 1 FROM edgar_fundamentals WHERE symbol = ? AND fetch_date >= ?",
+        [symbol, cutoff],
     ).fetchone()
     return row is not None
 
@@ -62,10 +69,10 @@ def _process_symbol(symbol: str, force: bool, con) -> str:
 
     Returns:
         "fetched"  — successfully fetched and stored
-        "skipped"  — already cached today (and force=False)
+        "skipped"  — cached within last 6 days (and force=False)
         "failed"   — not in SEC index or other error
     """
-    if not force and _is_cached_today(symbol, con):
+    if not force and _is_recently_cached(symbol, con):
         return "skipped"
 
     try:
@@ -100,7 +107,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Re-fetch even when today's cache entry already exists",
+        help="Re-fetch all symbols, ignoring cache age",
     )
     args = parser.parse_args()
 
