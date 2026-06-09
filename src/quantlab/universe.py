@@ -711,7 +711,10 @@ class UniverseManager:
             from datetime import date as _date
             trade_date = _date.fromisoformat(trade_date)
 
-        # ── Cache check ────────────────────────────────────────────────────────
+        import requests as _requests
+        from quantlab.market_calendar import prev_trading_day as _prev_day
+
+        # ── Today's cache check ────────────────────────────────────────────────
         if not force_rebuild:
             cached = load_universe_cache(trade_date)
             if cached is not None:
@@ -719,14 +722,29 @@ class UniverseManager:
                 logger.info("Universe cache hit for %s: %d symbols", trade_date, len(symbols))
                 return symbols, stats
 
+        # ── Pre-flight: find most recent cached universe as fallback ───────────
+        # Load BEFORE any Polygon call. When Polygon returns empty data (pre-market,
+        # partial session, holiday) or exhausts all retry attempts, we return this
+        # cached result instead of 0 symbols so the daily scan can always proceed.
+        _fallback: tuple[list[str], UniverseStats] | None = None
+        if not force_rebuild:
+            _fb_date = trade_date
+            for _ in range(7):
+                _fb_date = _prev_day(_fb_date)
+                _fb = load_universe_cache(_fb_date)
+                if _fb is not None and _fb[0]:
+                    _fallback = _fb
+                    logger.info(
+                        "Pre-flight: universe_%s (%d symbols) ready as fallback",
+                        _fb_date.isoformat(), len(_fb[0]),
+                    )
+                    break
+
         # ── Step 1: Polygon grouped daily (with previous-day fallback on 403) ──
         # Polygon returns 403 for today's data while the market is still open.
         # Walk back through recent trading days until valid data is found.
         # Universe composition doesn't change intraday, so yesterday's filtered
         # list is valid for today's scan.
-        import requests as _requests
-        from quantlab.market_calendar import prev_trading_day as _prev_day
-
         _MAX_DAY_LOOKBACK = 5
         actual_date = trade_date
         grouped = None
@@ -765,6 +783,13 @@ class UniverseManager:
                 else:
                     raise
         else:
+            if _fallback is not None:
+                logger.warning(
+                    "Universe: no Polygon data within %d days of %s"
+                    " — using cached fallback (%d symbols)",
+                    _MAX_DAY_LOOKBACK, trade_date, len(_fallback[0]),
+                )
+                return _fallback
             logger.warning(
                 "No grouped daily data available within %d trading days of %s",
                 _MAX_DAY_LOOKBACK, trade_date,
@@ -772,6 +797,13 @@ class UniverseManager:
             return [], UniverseStats(date=trade_date.isoformat())
 
         if not grouped:
+            if _fallback is not None:
+                logger.warning(
+                    "Universe: Polygon returned empty data for %s"
+                    " — using cached fallback (%d symbols)",
+                    actual_date, len(_fallback[0]),
+                )
+                return _fallback
             logger.warning("No grouped daily data for %s", actual_date)
             return [], UniverseStats(date=actual_date.isoformat())
 

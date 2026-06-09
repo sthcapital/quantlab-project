@@ -5437,6 +5437,43 @@ class TestUniverseManager:
         assert stats.date == prev.isoformat()
         assert stats.date != today.isoformat()
 
+    def test_build_uses_fallback_when_polygon_returns_empty(self, tmp_path, monkeypatch):
+        """When Polygon returns empty grouped data (pre-market 200 OK), use cached fallback."""
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager, save_universe_cache
+
+        today = date(2026, 6, 9)       # Tuesday
+        yesterday = date(2026, 6, 8)   # Monday — prev trading day
+        save_universe_cache(yesterday, ["AAPL", "MSFT"], [7.5e8, 7.0e8])
+
+        class MockPolyEmpty:
+            def get_grouped_daily(self, d):
+                return {}  # empty — simulates pre-market / incomplete data
+
+        mgr = UniverseManager()
+        symbols, stats = mgr.build_tradeable_universe(
+            today, MockPolyEmpty(), ib=None, optionable_only=False,
+        )
+        assert symbols == ["AAPL", "MSFT"]
+        assert stats.date == yesterday.isoformat()
+
+    def test_build_returns_empty_when_no_cache_and_no_data(self, tmp_path, monkeypatch):
+        """No cache anywhere + empty Polygon → returns empty list (no crash)."""
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager
+
+        class MockPolyEmpty:
+            def get_grouped_daily(self, d):
+                return {}
+
+        mgr = UniverseManager()
+        symbols, stats = mgr.build_tradeable_universe(
+            date(2026, 6, 9), MockPolyEmpty(), ib=None, optionable_only=False,
+        )
+        assert symbols == []
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Earnings calendar awareness (quantlab.providers.edgar + execution)
