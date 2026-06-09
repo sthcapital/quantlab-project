@@ -88,11 +88,7 @@ cd "$PROJECT_DIR"
     else
         echo "  News      : disabled  (pass --with-news to enable)"
     fi
-    if [[ -n "$WITH_OPTIONS" ]]; then
-        echo "  Options   : enabled"
-    else
-        echo "  Options   : disabled  (pass --with-options to enable)"
-    fi
+    echo "  Options   : enabled (Massive S3 / Polygon — always on)"
     echo "  Backtest  : $BACKTEST_START → $BACKTEST_END  (2-year window)"
     sep
 } | tee -a "$LOG_FILE"
@@ -124,6 +120,18 @@ mgr = UniverseManager()
 syms, stats = mgr.build_tradeable_universe(today, polygon, ib=None, optionable_only=False)
 print(f'  {stats.summary()}')
 " 2>&1 | tee -a "$LOG_FILE" || log "WARNING: universe build failed — scan will use cached data"
+
+# ── Macro regime update (FRED + CBOE VIX — daily) ──────────────────────────────
+# Stores yield spreads, credit spreads, VIX, and macro regime to DuckDB
+# macro_snapshots table.  Non-fatal: scan proceeds with last cached reading
+# if FRED is unreachable (VIX-only snapshot is stored when FRED_API_KEY is unset).
+{
+    echo ""
+    echo "══ [$(ts)] Macro regime update — $(date +%Y-%m-%d) ══════════════════"
+} | tee -a "$LOG_FILE"
+
+python scripts/update_macro.py 2>&1 | tee -a "$LOG_FILE" \
+    || log "WARNING: macro update failed — scan will use last cached reading"
 
 # ── Breadth update ──────────────────────────────────────────────────────────────
 # Runs before scan_universe.py so the tape condition (BEAR/BULL) and the
@@ -188,9 +196,9 @@ SCAN_ARGS=(
     --secondary-lookback "$SECONDARY_LOOKBACK"
     --save-db
     --add-to-watchlist
+    --with-options
 )
-[[ -z "$WITH_NEWS"    ]] && SCAN_ARGS+=(--no-news)
-[[ -n "$WITH_OPTIONS" ]] && SCAN_ARGS+=(--with-options)
+[[ -z "$WITH_NEWS" ]] && SCAN_ARGS+=(--no-news)
 
 # Capture and tee simultaneously; || true prevents set -e from aborting on
 # a non-zero exit (e.g. if the scanner finds no setups and exits non-zero).
@@ -262,6 +270,48 @@ python scripts/track_forward_returns.py \
 log "Generating daily institutional watchlist report ..."
 python scripts/generate_report.py 2>&1 | tee -a "$LOG_FILE" \
     || log "WARNING: report generation failed"
+
+# ── Post-scan persistence summary ───────────────────────────────────────────────
+{
+    echo ""
+    echo "══ [$(ts)] Persistence summary ══════════════════════════════════════"
+} | tee -a "$LOG_FILE"
+
+python -c "
+import sys
+sys.path.insert(0, 'src')
+try:
+    import duckdb
+    from quantlab.storage import DB_PATH
+    con = duckdb.connect(str(DB_PATH))
+    today = __import__('datetime').date.today().isoformat()
+    tables = [
+        ('scan_results',           'scan_date'),
+        ('earnings_results',       'report_date'),
+        ('macro_snapshots',        'as_of'),
+        ('options_snapshots',      'snap_date'),
+        ('edgar_fundamentals',     'fetch_date'),
+        ('breadth_history',        'date'),
+        ('institutional_watchlist','last_seen'),
+        ('daily_reports',          'date'),
+    ]
+    print()
+    for tbl, date_col in tables:
+        try:
+            total = con.execute(f'SELECT COUNT(*) FROM {tbl}').fetchone()[0]
+            today_n = con.execute(
+                f\"SELECT COUNT(*) FROM {tbl} WHERE CAST({date_col} AS VARCHAR) = ?\",
+                [today]
+            ).fetchone()[0]
+            flag = '  ← NEW' if today_n > 0 else ''
+            print(f'  {tbl:<30} total={total:>6}  today={today_n:>4}{flag}')
+        except Exception as e:
+            print(f'  {tbl:<30} (unavailable: {e})')
+    con.close()
+    print()
+except Exception as e:
+    print(f'  DuckDB summary failed: {e}')
+" 2>&1 | tee -a "$LOG_FILE"
 
 # ── Footer ───────────────────────────────────────────────────────────────────────
 {

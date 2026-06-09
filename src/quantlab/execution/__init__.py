@@ -909,6 +909,25 @@ def run_universe_scan(
                                 end_date.isoformat(),
                                 lookback_days=7,
                             )
+                            # Parse earnings beat/miss from headlines → earnings_results table
+                            try:
+                                from quantlab.news.earnings_parser import (
+                                    make_earnings_result,
+                                    store_earnings_result,
+                                )
+                                for _item in news_items:
+                                    _hl = getattr(_item, "headline", "") or ""
+                                    _er = make_earnings_result(symbol, _hl)
+                                    if _er is not None:
+                                        store_earnings_result(_er)
+                                        logger.info(
+                                            "%s: earnings headline stored — beat_score=%.2f",
+                                            symbol, _er.beat_score,
+                                        )
+                            except Exception as _ep_err:
+                                logger.debug(
+                                    "%s: earnings parse from news failed: %s", symbol, _ep_err
+                                )
                     except Exception as e:
                         logger.debug(f"{symbol} news fetch failed: {e}")
 
