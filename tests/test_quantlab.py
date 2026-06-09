@@ -6724,3 +6724,105 @@ class TestInstitutionalWatchlist:
         con.close()
         assert row is not None
         assert str(row[0]) == date.today().isoformat()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IC Monitor
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestICMonitor:
+    """Tests for src/quantlab/research/ic_monitor.py."""
+
+    def _make_monitor(self, tmp_path):
+        """Return an ICMonitor wired to a fresh temp DuckDB."""
+        import duckdb
+        from quantlab.research.ic_monitor import ICMonitor
+        from quantlab.storage import _ensure_schema
+
+        db = tmp_path / "ic_test.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.close()
+
+        monitor = ICMonitor()
+        # Patch get_db to use the temp database
+        import quantlab.research.ic_monitor as _mod
+        import quantlab.storage as _stor
+
+        _orig_get_db = _stor.get_db
+
+        def _patched_get_db():
+            con = duckdb.connect(str(db))
+            _ensure_schema(con)
+            return con
+
+        _mod_orig = _mod.get_db
+        _mod.get_db = _patched_get_db
+        monitor._patched = (_mod, _mod_orig)
+        return monitor
+
+    def _restore(self, monitor):
+        _mod, _orig = monitor._patched
+        _mod.get_db = _orig
+
+    def test_ic_monitor_instantiates(self, tmp_path):
+        """ICMonitor should instantiate without raising."""
+        monitor = self._make_monitor(tmp_path)
+        assert monitor is not None
+        self._restore(monitor)
+
+    def test_compute_ic_returns_none_insufficient_data(self, tmp_path):
+        """compute_ic returns None when fewer than 30 observations exist."""
+        monitor = self._make_monitor(tmp_path)
+        # Empty database — no scan_results or watchlist rows
+        result = monitor.compute_ic("ar", horizon=1, lookback_days=60)
+        assert result is None
+        self._restore(monitor)
+
+    def test_flag_weak_signals_identifies_below_threshold(self, tmp_path):
+        """flag_weak_signals returns signal names with mean IC < threshold."""
+        import duckdb
+        from quantlab.research.ic_monitor import ICMonitor
+        from quantlab.storage import _ensure_schema
+
+        db = tmp_path / "ic_flag.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+
+        # Insert two IC history rows: one weak, one strong
+        today = date.today().isoformat()
+        con.execute(
+            "INSERT INTO signal_ic_history VALUES (?, 'ar', 1, 0.01, NULL, 50, 0.5, 0.02, TRUE)",
+            [today],
+        )
+        con.execute(
+            "INSERT INTO signal_ic_history VALUES (?, 'rs', 1, 0.08, NULL, 50, 0.6, 0.03, FALSE)",
+            [today],
+        )
+        con.close()
+
+        import quantlab.research.ic_monitor as _mod
+        _orig = _mod.get_db
+
+        def _patched():
+            c = duckdb.connect(str(db))
+            _ensure_schema(c)
+            return c
+
+        _mod.get_db = _patched
+        monitor = ICMonitor()
+        weak = monitor.flag_weak_signals(threshold=0.02)
+        _mod.get_db = _orig
+
+        assert "ar" in weak
+        assert "rs" not in weak
+
+    def test_summary_report_runs_on_empty_data(self, tmp_path, capsys):
+        """summary_report should print a table without raising on empty data."""
+        monitor = self._make_monitor(tmp_path)
+        monitor.summary_report()
+        self._restore(monitor)
+        captured = capsys.readouterr()
+        # Should print at least the header and one signal row
+        assert "Signal" in captured.out
+        assert "INSUFFICIENT" in captured.out

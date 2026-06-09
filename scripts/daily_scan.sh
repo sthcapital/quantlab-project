@@ -264,6 +264,18 @@ python scripts/track_forward_returns.py \
     --port "$IBKR_PORT" \
     2>&1 | tee -a "$LOG_FILE" || log "WARNING: forward return tracking failed"
 
+# ── IC Monitor (signal information coefficient — run after forward returns) ───────
+# Correlates scan signal values with realized forward returns at H=1/5/10.
+# Non-fatal: IC history continues to accumulate even if today's run fails.
+# Meaningful IC estimates require ~60 trading days of full-universe scans.
+{
+    echo ""
+    echo "══ [$(ts)] IC Monitor — $(date +%Y-%m-%d) ════════════════════════════"
+} | tee -a "$LOG_FILE"
+
+python -m quantlab.research.ic_monitor 2>&1 | tee -a "$LOG_FILE" \
+    || log "WARNING: IC monitor failed — IC history not updated"
+
 # ── Daily report ─────────────────────────────────────────────────────────────────
 # Generates data/reports/YYYY-MM-DD_watchlist.html and updates daily_reports DuckDB.
 # Non-fatal — scan results are already stored even if report generation fails.

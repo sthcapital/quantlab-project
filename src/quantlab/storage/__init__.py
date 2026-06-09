@@ -255,14 +255,28 @@ def _ensure_schema(con) -> None:
             climactic_volume     DOUBLE,
             sector               VARCHAR,
             sector_cluster       BOOLEAN DEFAULT FALSE,
+            -- IC monitor signals
+            rs_score             DOUBLE DEFAULT 0.0,
+            edgar_acceleration   DOUBLE,
+            breakout_volume_score DOUBLE DEFAULT 0.0,
+            peg_score            DOUBLE DEFAULT 0.0,
+            stage                INTEGER DEFAULT 0,
             created_at           TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Migration: add sector columns to scan_results if absent (added later)
+    # Migration: add columns to scan_results if absent (handles pre-existing DBs)
     try:
         _sr_cols = {r[1] for r in con.execute("PRAGMA table_info(scan_results)").fetchall()}
-        for _col, _dtype in [("sector", "VARCHAR"), ("sector_cluster", "BOOLEAN")]:
+        for _col, _dtype in [
+            ("sector",                "VARCHAR"),
+            ("sector_cluster",        "BOOLEAN"),
+            ("rs_score",              "DOUBLE DEFAULT 0.0"),
+            ("edgar_acceleration",    "DOUBLE"),
+            ("breakout_volume_score", "DOUBLE DEFAULT 0.0"),
+            ("peg_score",             "DOUBLE DEFAULT 0.0"),
+            ("stage",                 "INTEGER DEFAULT 0"),
+        ]:
             if _col not in _sr_cols:
                 con.execute(f"ALTER TABLE scan_results ADD COLUMN {_col} {_dtype}")
     except Exception:
@@ -322,11 +336,16 @@ def _ensure_schema(con) -> None:
         )
     """)
 
-    # Migration: add breadth_override_note to existing watchlist tables
+    # Migration: add columns to watchlist if absent (handles pre-existing DBs)
     try:
         _wl_cols = {r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()}
-        if "breadth_override_note" not in _wl_cols:
-            con.execute("ALTER TABLE watchlist ADD COLUMN breadth_override_note VARCHAR DEFAULT ''")
+        for _col, _dtype in [
+            ("breadth_override_note", "VARCHAR DEFAULT ''"),
+            ("price_10d",             "DOUBLE"),
+            ("realized_ret_10d",      "DOUBLE"),
+        ]:
+            if _col not in _wl_cols:
+                con.execute(f"ALTER TABLE watchlist ADD COLUMN {_col} {_dtype}")
     except Exception:
         pass
 
@@ -450,6 +469,21 @@ def _ensure_schema(con) -> None:
             multi_day        INTEGER,
             top_symbols      TEXT,
             generated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS signal_ic_history (
+            computed_date    DATE,
+            signal_name      TEXT,
+            horizon          INTEGER,
+            ic               DOUBLE,
+            ic_ir            DOUBLE,
+            n_observations   INTEGER,
+            mean_signal      DOUBLE,
+            mean_return      DOUBLE,
+            flagged          BOOLEAN,
+            PRIMARY KEY (computed_date, signal_name, horizon)
         )
     """)
 
@@ -722,7 +756,9 @@ def append_scan_results(scan_id: str, results: list) -> None:
                     base_quality, absorption, volume_character, wyckoff_spring,
                     earnings_acceleration,
                     accumulation_ratio, volume_trend, climactic_volume,
-                    sector, sector_cluster
+                    sector, sector_cluster,
+                    rs_score, edgar_acceleration,
+                    breakout_volume_score, peg_score, stage
                 ) VALUES (
                     ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
@@ -731,7 +767,9 @@ def append_scan_results(scan_id: str, results: list) -> None:
                     ?, ?, ?, ?,
                     ?,
                     ?, ?, ?,
-                    ?, ?
+                    ?, ?,
+                    ?, ?,
+                    ?, ?, ?
                 )
             """, [
                 scan_id, r.scan_date, r.symbol, r.signal_type, r.lookback,
@@ -742,6 +780,9 @@ def append_scan_results(scan_id: str, results: list) -> None:
                 r.earnings_acceleration,
                 r.accumulation_ratio, r.volume_trend, r.climactic_volume,
                 getattr(r, "sector", ""), getattr(r, "sector_cluster", False),
+                getattr(r, "rs_score", 0.0), getattr(r, "edgar_acceleration", None),
+                getattr(r, "breakout_volume_score", 0.0),
+                getattr(r, "peg_score", 0.0), getattr(r, "stage", 0),
             ])
         con.close()
     except Exception as e:
