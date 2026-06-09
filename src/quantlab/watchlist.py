@@ -19,10 +19,13 @@ are actually predictive.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, timedelta
 from typing import Any
 
 from quantlab.storage import DB_PATH, get_db
+
+logger = logging.getLogger(__name__)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -245,7 +248,7 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
         if isinstance(date_added, str):
             date_added = date.fromisoformat(date_added)
 
-        # Fetch current price
+        # Fetch current price — prefer last trade over bid/ask midpoint
         try:
             ib_connection.reqMarketDataType(3)
             stock = Stock(symbol, "SMART", "USD")
@@ -254,13 +257,23 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
                 continue
             ticker = ib_connection.reqTickers(qualified[0])[0]
             current = None
-            for candidate in [ticker.marketPrice(), ticker.last, ticker.close]:
+            for candidate in [ticker.last, ticker.close, ticker.marketPrice()]:
                 if candidate is not None and candidate == candidate and candidate > 0:
                     current = float(candidate)
                     break
             if current is None:
                 continue
         except Exception:
+            continue
+
+        # Sanity check: price must be within ±20%/+50% of entry to be trusted.
+        # Pre-market bid/ask midpoints can be wildly stale; reject them rather
+        # than risk a false stop-out (e.g. VOYA $80.13 vs actual low $87.60).
+        if entry_price and not (entry_price * 0.80 <= current <= entry_price * 1.50):
+            logger.warning(
+                "%s: price %.2f rejected as invalid (entry=%.2f) — skipping stop check",
+                symbol, current, entry_price,
+            )
             continue
 
         unrealized = (current - entry_price) / entry_price if entry_price else 0.0
