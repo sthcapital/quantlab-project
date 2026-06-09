@@ -62,6 +62,101 @@ DEFAULT_MIN_PRICE        = 10.0
 DEFAULT_MIN_VOLUME       = 100_000.0
 DEFAULT_MIN_DOLLAR_VOL   = 5_000_000.0
 
+# ── Hard exclusion list: known non-equity instruments ──────────────────────────
+# These pass the basic ticker-quality check (≤5 chars, no dots, no W/R/Z suffix)
+# but are not growth stocks and must never appear as long candidates.
+EXCLUDE_SYMBOLS: frozenset[str] = frozenset({
+    # Volatility products (VIX futures ETPs)
+    "VXX", "UVXY", "SVXY", "VIXY", "VXZ",
+    # Crypto ETFs / trusts
+    "BITI", "ETHD", "SETH", "SBIT", "BTCW", "GBTC", "ETHE",
+    # Leveraged inverse gold-miner ETFs
+    "DUST", "GDXD", "NUGT", "JNUG", "JDST",
+})
+
+# Substrings in a ticker that identify leveraged/inverse products
+_LEVERAGED_SUBSTRINGS = ("2X", "3X", "ULTRA", "BEAR", "BULL", "INVERSE", "SHORT")
+
+
+# ── Exclusion helpers ─────────────────────────────────────────────────────────
+
+def _is_excluded_symbol(sym: str) -> bool:
+    """
+    Return True if the symbol should never appear in the growth-stock universe.
+
+    Catches leveraged ETFs, volatility products, and crypto ETFs that pass the
+    basic apply_symbol_filter() checks (no dots, ≤5 chars, no W/R/Z suffix).
+    """
+    s = sym.upper()
+    if s in EXCLUDE_SYMBOLS:
+        return True
+    return any(sub in s for sub in _LEVERAGED_SUBSTRINGS)
+
+
+def _cs_cache_path(trade_date: date) -> "Path":
+    from quantlab.storage import DATA_PROCESSED, ensure_dirs
+    ensure_dirs()
+    return DATA_PROCESSED / f"cs_tickers_{trade_date.isoformat()}.parquet"
+
+
+def fetch_common_stock_tickers(api_key: str, trade_date: date) -> "set[str] | None":
+    """
+    Return the set of common-stock (type=CS) tickers from Polygon, cached daily.
+
+    Paginates through GET /v3/reference/tickers?type=CS&active=true until all
+    results are collected.  Caches to data/processed/cs_tickers_{date}.parquet
+    so subsequent same-day calls are instant.
+
+    Returns None on any failure so callers can skip the filter gracefully.
+    """
+    import requests
+
+    cache_path = _cs_cache_path(trade_date)
+    if cache_path.exists():
+        try:
+            import pyarrow.parquet as pq
+            tbl = pq.read_table(str(cache_path)).to_pydict()
+            syms: set[str] = set(tbl.get("symbol", []))
+            logger.info("CS tickers cache hit for %s: %d symbols", trade_date, len(syms))
+            return syms
+        except Exception as exc:
+            logger.debug("CS tickers cache read failed: %s", exc)
+
+    logger.info("Fetching common-stock (CS) ticker list from Polygon ...")
+    tickers: list[str] = []
+    url = "https://api.polygon.io/v3/reference/tickers"
+    params: dict = {"type": "CS", "active": "true", "limit": 1000, "apiKey": api_key}
+
+    try:
+        session = requests.Session()
+        while True:
+            r = session.get(url, params=params, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            tickers.extend(t["ticker"] for t in data.get("results", []) if "ticker" in t)
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            url = next_url
+            params = {"apiKey": api_key}
+
+        logger.info("Fetched %d CS tickers from Polygon", len(tickers))
+
+        if tickers:
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                pq.write_table(pa.table({"symbol": tickers}), cache_path)
+                logger.debug("CS tickers cached → %s", cache_path.name)
+            except Exception as exc:
+                logger.warning("CS tickers cache write failed: %s", exc)
+
+        return set(tickers)
+
+    except Exception as exc:
+        logger.warning("CS tickers fetch failed: %s — skipping CS filter", exc)
+        return None
+
 
 # ── Filter result dataclass ────────────────────────────────────────────────────
 
@@ -708,8 +803,30 @@ class UniverseManager:
 
         # ── Step 3: Symbol quality filter ─────────────────────────────────────
         candidates = apply_symbol_filter(candidates)
+        logger.info("After symbol quality filter: %d", len(candidates))
+
+        # ── Step 3.5: Hard exclusion + Polygon CS-type filter ─────────────────
+        # Remove known leveraged ETFs, vol products, and crypto ETFs that pass
+        # the basic ticker-quality checks above.
+        import os as _os
+        candidates = [s for s in candidates if not _is_excluded_symbol(s)]
+        logger.info("After hard exclusion filter: %d", len(candidates))
+
+        # When a Polygon API key is available, restrict further to CS-type only,
+        # eliminating all ETFs, ETNs, and non-equity instruments in one pass.
+        _poly_api_key = polygon_api_key or _os.environ.get("POLYGON_API_KEY", "")
+        if _poly_api_key:
+            _cs_set = fetch_common_stock_tickers(_poly_api_key, actual_date)
+            if _cs_set is not None:
+                _pre_cs = len(candidates)
+                candidates = [s for s in candidates if s in _cs_set]
+                logger.info(
+                    "CS type filter: %d → %d (%d non-CS removed)",
+                    _pre_cs, len(candidates), _pre_cs - len(candidates),
+                )
+
         stats.after_symbol_filter = len(candidates)
-        logger.info("After symbol filter: %d", stats.after_symbol_filter)
+        logger.info("After symbol/exclusion filter: %d", stats.after_symbol_filter)
 
         # ── Step 4: Options check ──────────────────────────────────────────────
         # Priority (TWS not required for any path):

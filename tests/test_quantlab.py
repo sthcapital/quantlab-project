@@ -5086,6 +5086,66 @@ class TestUniverseManager:
         from quantlab.universe import apply_symbol_filter
         assert apply_symbol_filter([]) == []
 
+    # ── EXCLUDE_SYMBOLS + _is_excluded_symbol ────────────────────────────────
+
+    def test_exclude_symbols_contains_vol_products(self):
+        from quantlab.universe import EXCLUDE_SYMBOLS
+        for sym in ("VXX", "UVXY", "SVXY", "VIXY", "VXZ"):
+            assert sym in EXCLUDE_SYMBOLS, f"{sym} missing from EXCLUDE_SYMBOLS"
+
+    def test_exclude_symbols_contains_crypto_etfs(self):
+        from quantlab.universe import EXCLUDE_SYMBOLS
+        for sym in ("BITI", "ETHD", "SETH", "SBIT", "GBTC", "ETHE"):
+            assert sym in EXCLUDE_SYMBOLS, f"{sym} missing from EXCLUDE_SYMBOLS"
+
+    def test_exclude_symbols_contains_leveraged_miners(self):
+        from quantlab.universe import EXCLUDE_SYMBOLS
+        for sym in ("DUST", "GDXD", "NUGT", "JNUG", "JDST"):
+            assert sym in EXCLUDE_SYMBOLS, f"{sym} missing from EXCLUDE_SYMBOLS"
+
+    def test_is_excluded_rejects_known_bad(self):
+        from quantlab.universe import _is_excluded_symbol
+        for sym in ("VXX", "BITI", "DUST", "GBTC", "UVXY"):
+            assert _is_excluded_symbol(sym), f"{sym} should be excluded"
+
+    def test_is_excluded_rejects_leveraged_patterns(self):
+        from quantlab.universe import _is_excluded_symbol
+        assert _is_excluded_symbol("TQQQ3X")
+        assert _is_excluded_symbol("SOXSBEAR")
+        assert _is_excluded_symbol("ULTRA")
+
+    def test_is_excluded_passes_good_tickers(self):
+        from quantlab.universe import _is_excluded_symbol
+        for sym in ("AAPL", "MSFT", "NVDA", "LLY", "CAT", "GS", "ABT", "UNH"):
+            assert not _is_excluded_symbol(sym), f"{sym} should not be excluded"
+
+    def test_build_excludes_known_bad_symbols(self, tmp_path, monkeypatch):
+        """VXX, GBTC, DUST pass symbol-quality checks but are filtered by _is_excluded_symbol."""
+        import quantlab.storage as _storage
+        monkeypatch.setattr(_storage, "DATA_PROCESSED", tmp_path)
+        from quantlab.universe import UniverseManager
+        from quantlab.providers.base import Bar
+
+        d = date(2026, 6, 5)
+
+        class MockPoly:
+            def get_grouped_daily(self, _d):
+                return {
+                    "AAPL": Bar(d, 150, 151, 149, 150, 5_000_000.0),
+                    "VXX":  Bar(d, 20,  21,  19,  20,  3_000_000.0),
+                    "GBTC": Bar(d, 30,  31,  29,  30,  2_000_000.0),
+                    "DUST": Bar(d, 15,  16,  14,  15,  1_000_000.0),
+                }
+
+        mgr = UniverseManager()
+        symbols, _ = mgr.build_tradeable_universe(
+            d, MockPoly(), ib=None, optionable_only=False,
+        )
+        assert "AAPL" in symbols
+        assert "VXX"  not in symbols
+        assert "GBTC" not in symbols
+        assert "DUST" not in symbols
+
     # ── apply_price_volume_filter ─────────────────────────────────────────────
 
     def test_filters_by_price(self):
@@ -5991,13 +6051,20 @@ class TestStageClassification:
         assert score_conviction(s2) - score_conviction(base) == pytest.approx(0.05, abs=1e-9)
 
     def test_non_stage_2_no_bonus(self):
-        for stage_val in (0, 1, 3, 4):
+        for stage_val in (0, 1, 3):
             r = ScanResult(
                 "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
                 regime_bullish=False, stage=stage_val,
             )
             # Should not add the +0.05 stage-2 bonus
             assert score_conviction(r) == pytest.approx(0.30, abs=1e-9), f"stage={stage_val}"
+
+    def test_stage_4_conviction_vetoed(self):
+        r = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=True, stage=4,
+        )
+        assert score_conviction(r) == 0.0
 
 
 class TestBreakoutVolumeScore:
