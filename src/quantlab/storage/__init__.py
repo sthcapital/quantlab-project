@@ -344,6 +344,7 @@ def _ensure_schema(con) -> None:
             down_25pct_quarter      INTEGER,
             new_highs_52w           INTEGER,
             new_lows_52w            INTEGER,
+            pct_above_10sma         DOUBLE  DEFAULT 0.0,
             pct_above_20sma         DOUBLE,
             pct_above_50sma         DOUBLE,
             pct_above_200sma        DOUBLE,
@@ -356,19 +357,46 @@ def _ensure_schema(con) -> None:
             tape                    VARCHAR DEFAULT 'NEUTRAL',
             spy_above_200sma        BOOLEAN DEFAULT TRUE,
             spy_200sma_slope        DOUBLE  DEFAULT 0.0,
+            up_25pct_month          INTEGER DEFAULT 0,
+            dn_25pct_month          INTEGER DEFAULT 0,
+            up_50pct_month          INTEGER DEFAULT 0,
+            dn_50pct_month          INTEGER DEFAULT 0,
+            up_13pct_34d            INTEGER DEFAULT 0,
+            dn_13pct_34d            INTEGER DEFAULT 0,
+            uvol                    DOUBLE  DEFAULT 0.0,
+            dvol                    DOUBLE  DEFAULT 0.0,
+            uvol_dvol_ratio         DOUBLE  DEFAULT 0.0,
+            equity_pcr              DOUBLE  DEFAULT 0.0,
+            index_pcr               DOUBLE  DEFAULT 0.0,
+            total_pcr               DOUBLE  DEFAULT 0.0,
+            pcr_regime              VARCHAR DEFAULT 'neutral',
             created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
-    # Migration: add SPY 200 SMA columns to breadth_history if absent (pre-3237354 DBs)
+    # Migration: add any absent breadth_history columns (handles pre-existing DBs)
     try:
         _bh_cols = {r[0] for r in con.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'breadth_history'"
         ).fetchall()}
         for _col, _def in [
-            ("spy_above_200sma", "BOOLEAN DEFAULT TRUE"),
-            ("spy_200sma_slope",  "DOUBLE DEFAULT 0.0"),
+            ("spy_above_200sma",  "BOOLEAN DEFAULT TRUE"),
+            ("spy_200sma_slope",   "DOUBLE DEFAULT 0.0"),
+            ("pct_above_10sma",    "DOUBLE DEFAULT 0.0"),
+            ("up_25pct_month",     "INTEGER DEFAULT 0"),
+            ("dn_25pct_month",     "INTEGER DEFAULT 0"),
+            ("up_50pct_month",     "INTEGER DEFAULT 0"),
+            ("dn_50pct_month",     "INTEGER DEFAULT 0"),
+            ("up_13pct_34d",       "INTEGER DEFAULT 0"),
+            ("dn_13pct_34d",       "INTEGER DEFAULT 0"),
+            ("uvol",               "DOUBLE DEFAULT 0.0"),
+            ("dvol",               "DOUBLE DEFAULT 0.0"),
+            ("uvol_dvol_ratio",    "DOUBLE DEFAULT 0.0"),
+            ("equity_pcr",         "DOUBLE DEFAULT 0.0"),
+            ("index_pcr",          "DOUBLE DEFAULT 0.0"),
+            ("total_pcr",          "DOUBLE DEFAULT 0.0"),
+            ("pcr_regime",         "VARCHAR DEFAULT 'neutral'"),
         ]:
             if _col not in _bh_cols:
                 con.execute(f"ALTER TABLE breadth_history ADD COLUMN {_col} {_def}")

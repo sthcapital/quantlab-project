@@ -3939,6 +3939,159 @@ class TestClassifyTape:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Stockbee metrics — UVOL/DVOL, month momentum, 34d, PCR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestStockbeeMetrics:
+    """Tests for UVOL/DVOL, month/34d momentum, CBOE PCR, and new BreadthSnapshot fields."""
+
+    # ── BreadthSnapshot new-field defaults ───────────────────────────────────
+
+    def test_breadth_snapshot_new_field_defaults(self):
+        from quantlab.signals.breadth import BreadthSnapshot
+        s = BreadthSnapshot(date="2026-01-01")
+        assert s.up_25pct_month  == 0
+        assert s.dn_25pct_month  == 0
+        assert s.up_50pct_month  == 0
+        assert s.dn_50pct_month  == 0
+        assert s.up_13pct_34d    == 0
+        assert s.dn_13pct_34d    == 0
+        assert s.uvol            == 0.0
+        assert s.dvol            == 0.0
+        assert s.uvol_dvol_ratio == 0.0
+        assert s.pct_above_10sma == 0.0
+        assert s.equity_pcr      == 0.0
+        assert s.index_pcr       == 0.0
+        assert s.total_pcr       == 0.0
+        assert s.pcr_regime      == "neutral"
+
+    # ── UVOL/DVOL computation ─────────────────────────────────────────────────
+
+    def test_uvol_dvol_computed_from_advance_decline_volume(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        from quantlab.providers.base import Bar
+        from datetime import date as _date
+        d = _date(2026, 1, 2)
+        today = {
+            "UP":   Bar(d, 10.0, 11.0, 9.0, 11.0, 1000.0),   # close > open → advance
+            "DN":   Bar(d, 10.0, 11.0, 9.0,  9.0, 2000.0),   # close < open → decline
+            "FLAT": Bar(d, 10.0, 11.0, 9.0, 10.0, 3000.0),   # close == open → unchanged
+        }
+        snap = compute_market_breadth(d, today, min_volume=0)
+        assert snap.uvol == 1000.0
+        assert snap.dvol == 2000.0
+        assert snap.uvol_dvol_ratio == pytest.approx(0.5, abs=1e-9)
+
+    def test_uvol_dvol_ratio_zero_when_no_declines(self):
+        from quantlab.signals.breadth import compute_market_breadth
+        from quantlab.providers.base import Bar
+        from datetime import date as _date
+        d = _date(2026, 1, 3)
+        today = {
+            "A": Bar(d, 10.0, 11.0, 9.0, 11.0, 500.0),   # advance
+            "B": Bar(d, 10.0, 11.0, 9.0, 11.0, 300.0),   # advance
+        }
+        snap = compute_market_breadth(d, today, min_volume=0)
+        assert snap.uvol == 800.0
+        assert snap.dvol == 0.0
+        assert snap.uvol_dvol_ratio == 0.0   # dvol=0 → ratio stored as 0.0
+
+    def test_uvol_dvol_only_counts_volume_filtered_symbols(self):
+        """Symbols below min_volume (default 10_000) should not contribute to UVOL."""
+        from quantlab.signals.breadth import compute_market_breadth
+        from quantlab.providers.base import Bar
+        from datetime import date as _date
+        d = _date(2026, 1, 4)
+        today = {
+            "LIQUID": Bar(d, 10.0, 11.0, 9.0, 11.0, 50_000.0),   # advance, passes filter
+            "PENNY":  Bar(d, 10.0, 11.0, 9.0, 11.0,    100.0),   # advance, below min_vol
+        }
+        snap = compute_market_breadth(d, today)
+        assert snap.uvol == 50_000.0   # only LIQUID
+        assert snap.advances == 1
+
+    # ── classify_pcr_regime() boundary values ─────────────────────────────────
+
+    def test_pcr_extreme_fear(self):
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(1.05)
+        assert label == "extreme_fear"
+        assert score == -2
+
+    def test_pcr_fear(self):
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(0.90)
+        assert label == "fear"
+        assert score == -1
+
+    def test_pcr_neutral(self):
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(0.65)
+        assert label == "neutral"
+        assert score == 0
+
+    def test_pcr_complacency(self):
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(0.50)
+        assert label == "complacency"
+        assert score == 1
+
+    def test_pcr_extreme_complacency(self):
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(0.30)
+        assert label == "extreme_complacency"
+        assert score == 2
+
+    def test_pcr_boundary_at_1_0(self):
+        """PCR exactly at 1.0 is fear (not extreme_fear)."""
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(1.0)
+        assert label == "fear"
+        assert score == -1
+
+    def test_pcr_boundary_at_0_75(self):
+        """PCR exactly at 0.75 is neutral (not fear)."""
+        from quantlab.providers.cboe import classify_pcr_regime
+        label, score = classify_pcr_regime(0.75)
+        assert label == "neutral"
+        assert score == 0
+
+    # ── PCR as confirming signal in tape classifier ────────────────────────────
+
+    def test_high_pcr_widens_recovery_window(self):
+        """equity_pcr > 0.9 should allow RECOVERY when p200 is in 25-30%."""
+        from quantlab.signals.breadth import _classify_tape, BreadthSnapshot
+        # Normally p200=27 is below the 30% RECOVERY threshold → NEUTRAL
+        s_no_pcr = BreadthSnapshot(
+            "2026-01-01",
+            pct_above_200sma=27.0, pct_above_50sma=30.0,
+            ratio_10d=0.9, mcclellan_oscillator=-40.0,
+            mcclellan_summation=200.0, equity_pcr=0.0,
+        )
+        assert _classify_tape(s_no_pcr) != "RECOVERY"  # below normal threshold
+
+        # With high PCR (fear) the threshold lowers to 25%
+        s_high_pcr = BreadthSnapshot(
+            "2026-01-01",
+            pct_above_200sma=27.0, pct_above_50sma=30.0,
+            ratio_10d=0.9, mcclellan_oscillator=-40.0,
+            mcclellan_summation=200.0, equity_pcr=0.95,
+        )
+        assert _classify_tape(s_high_pcr) == "RECOVERY"
+
+    def test_normal_pcr_does_not_affect_classification(self):
+        """equity_pcr=0.0 (default, not set) must not change existing tape logic."""
+        from quantlab.signals.breadth import _classify_tape, BreadthSnapshot
+        s = BreadthSnapshot(
+            "2026-01-01",
+            pct_above_200sma=62.0, pct_above_50sma=55.0,
+            ratio_10d=2.0, mcclellan_oscillator=-20.0,
+            mcclellan_summation=1000.0, equity_pcr=0.0,
+        )
+        assert _classify_tape(s) == "BULL"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # breadth_override_note column — watchlist audit trail
 # ══════════════════════════════════════════════════════════════════════════════
 

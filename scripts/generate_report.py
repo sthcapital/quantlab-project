@@ -184,6 +184,8 @@ def _page1(
              if breadth_snap and breadth_snap.ad_line is not None else "—")
     summ  = (f"{breadth_snap.mcclellan_summation:,.0f}"
              if breadth_snap and breadth_snap.mcclellan_summation is not None else "—")
+    p10   = (f"{breadth_snap.pct_above_10sma:.1f}%"
+             if breadth_snap else "—")
     p20   = (f"{breadth_snap.pct_above_20sma:.1f}%"
              if breadth_snap else "—")
     p50   = (f"{breadth_snap.pct_above_50sma:.1f}%"
@@ -192,6 +194,16 @@ def _page1(
              if breadth_snap else "—")
     spy_status = ("Above" if (breadth_snap and breadth_snap.spy_above_200sma) else "Below")
     vix_str    = f"{vix_close:.1f}" if vix_close is not None else "—"
+    uvol_dvol_str = (f"{breadth_snap.uvol_dvol_ratio:.2f}"
+                     if breadth_snap else "—")
+    eq_pcr_str    = (f"{breadth_snap.equity_pcr:.2f}"
+                     if breadth_snap else "—")
+    pcr_regime_str = (breadth_snap.pcr_regime.replace("_", " ").title()
+                      if breadth_snap else "—")
+    up_25m_str  = (str(breadth_snap.up_25pct_month) if breadth_snap else "—")
+    dn_25m_str  = (str(breadth_snap.dn_25pct_month) if breadth_snap else "—")
+    up_13_34_str = (str(breadth_snap.up_13pct_34d)  if breadth_snap else "—")
+    dn_13_34_str = (str(breadth_snap.dn_13pct_34d)  if breadth_snap else "—")
     try:
         from quantlab.providers.cboe import classify_vix_regime as _cvr
         vix_regime_str = _cvr(vix_close)[0].capitalize() if vix_close is not None else "—"
@@ -229,11 +241,15 @@ def _page1(
     # ── Market breadth metrics ─────────────────────────────────────────────────
     e.append(Paragraph("Market Internals", S["section"]))
     met_data = [
-        ["McClellan Oscillator", mcl,   "10-Day Breadth Ratio", ratio],
-        ["AD Line",              ad_ln,  "McClellan Summation",  summ],
-        ["% Above 20 SMA",       p20,    "% Above 50 SMA",       p50],
-        ["% Above 200 SMA",      p200,   "SPY vs 200 SMA",       spy_status],
-        ["VIX Close",            vix_str,"VIX Regime",           vix_regime_str],
+        ["McClellan Oscillator", mcl,        "10-Day Breadth Ratio", ratio],
+        ["AD Line",              ad_ln,       "McClellan Summation",  summ],
+        ["% Above 10 SMA",       p10,         "UVOL/DVOL",            uvol_dvol_str],
+        ["% Above 20 SMA",       p20,         "% Above 50 SMA",       p50],
+        ["% Above 200 SMA",      p200,        "SPY vs 200 SMA",       spy_status],
+        ["VIX Close",            vix_str,     "VIX Regime",           vix_regime_str],
+        ["Equity PCR",           eq_pcr_str,  "PCR Regime",           pcr_regime_str],
+        ["Up 25% / Month",       up_25m_str,  "Dn 25% / Month",       dn_25m_str],
+        ["Up 13% / 34d",         up_13_34_str,"Dn 13% / 34d",         dn_13_34_str],
     ]
     col_w = [1.8 * inch, 1.0 * inch, 1.8 * inch, 1.2 * inch]
     met_tbl = Table(met_data, colWidths=col_w)

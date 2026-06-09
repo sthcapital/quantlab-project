@@ -135,6 +135,31 @@ def fetch_and_store(
                 spy_sma200_20d_ago = sum(b.close for b in spy_bars[-220:-20]) / 200
                 snapshot.spy_200sma_slope = round(spy_sma200 - spy_sma200_20d_ago, 4)
 
+    # Fetch CBOE PCR data (non-fatal — missing data leaves defaults at 0.0)
+    try:
+        from quantlab.providers.cboe import (
+            fetch_equity_pcr, fetch_index_pcr, fetch_total_pcr,
+            classify_pcr_regime,
+        )
+        _pcr_start = trade_date - timedelta(days=7)
+        _pcr_end   = trade_date
+
+        eq_pcr = fetch_equity_pcr(_pcr_start, _pcr_end)
+        if eq_pcr:
+            snapshot.equity_pcr = eq_pcr[-1].close
+            snapshot.pcr_regime = classify_pcr_regime(eq_pcr[-1].close)[0]
+            print(f"  Equity PCR: {snapshot.equity_pcr:.2f}  ({snapshot.pcr_regime})")
+
+        idx_pcr = fetch_index_pcr(_pcr_start, _pcr_end)
+        if idx_pcr:
+            snapshot.index_pcr = idx_pcr[-1].close
+
+        tot_pcr = fetch_total_pcr(_pcr_start, _pcr_end)
+        if tot_pcr:
+            snapshot.total_pcr = tot_pcr[-1].close
+    except Exception as _pcr_exc:
+        print(f"  PCR fetch skipped: {_pcr_exc}")
+
     return snapshot
 
 

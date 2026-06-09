@@ -60,14 +60,34 @@ class BreadthSnapshot:
     up_25pct_quarter: int   = 0         # stocks up ≥ 25% over 63 days
     down_25pct_quarter: int = 0         # stocks down ≥ 25% over 63 days
 
+    # Stockbee month and 34-day momentum metrics
+    up_25pct_month: int     = 0         # stocks up ≥ 25% in 21 days
+    dn_25pct_month: int     = 0         # stocks down ≥ 25% in 21 days
+    up_50pct_month: int     = 0         # stocks up ≥ 50% in 21 days
+    dn_50pct_month: int     = 0         # stocks down ≥ 50% in 21 days
+    up_13pct_34d:   int     = 0         # stocks up ≥ 13% in 34 days
+    dn_13pct_34d:   int     = 0         # stocks down ≥ 13% in 34 days
+
+    # Volume-weighted breadth (UVOL/DVOL)
+    uvol:            float  = 0.0       # total volume of advancing stocks
+    dvol:            float  = 0.0       # total volume of declining stocks
+    uvol_dvol_ratio: float  = 0.0       # uvol / dvol
+
     # 52-week extremes
     new_highs_52w: int      = 0
     new_lows_52w: int       = 0
 
     # SMA participation
-    pct_above_20sma: float  = 0.0       # 0.0–100.0
+    pct_above_10sma: float  = 0.0       # 0.0–100.0
+    pct_above_20sma: float  = 0.0
     pct_above_50sma: float  = 0.0
     pct_above_200sma: float = 0.0
+
+    # CBOE put/call ratio (populated by update_breadth.py)
+    equity_pcr:      float  = 0.0
+    index_pcr:       float  = 0.0
+    total_pcr:       float  = 0.0
+    pcr_regime:      str    = "neutral"
 
     # Derived ratios
     advance_decline_ratio: float = 0.0  # advances / declines
@@ -151,8 +171,11 @@ def compute_market_breadth(
     advances = declines = unchanged = 0
     up_4pct = down_4pct = 0
     new_highs = new_lows = 0
-    above_20 = above_50 = above_200 = sma_total = 0
+    above_10 = above_20 = above_50 = above_200 = sma_total = 0
     up_25q = down_25q = 0
+    up_25m = dn_25m = up_50m = dn_50m = 0
+    up_13_34 = dn_13_34 = 0
+    uvol = dvol = 0.0
 
     for symbol, bar in today_data.items():
         if bar.volume < min_volume:
@@ -170,8 +193,10 @@ def compute_market_breadth(
 
         if pct > 0:
             advances += 1
+            uvol += bar.volume
         elif pct < 0:
             declines += 1
+            dvol += bar.volume
         else:
             unchanged += 1
 
@@ -195,20 +220,16 @@ def compute_market_breadth(
                 elif bar.close <= lo52 * 1.01:
                     new_lows += 1
 
-            # SMA participation
+            # SMA participation (10/20/50/200 use same sma_total denominator)
             if n >= 20:
-                sma20 = sum(b.close for b in hist[-20:]) / 20
-                if n >= 50:
-                    sma50 = sum(b.close for b in hist[-50:]) / 50
-                else:
-                    sma50 = None
-                if n >= 200:
-                    sma200 = sum(b.close for b in hist[-200:]) / 200
-                else:
-                    sma200 = None
+                sma10  = sum(b.close for b in hist[-10:]) / 10
+                sma20  = sum(b.close for b in hist[-20:]) / 20
+                sma50  = sum(b.close for b in hist[-50:]) / 50 if n >= 50 else None
+                sma200 = sum(b.close for b in hist[-200:]) / 200 if n >= 200 else None
 
                 sma_total += 1
-                if bar.close > sma20:   above_20  += 1
+                if bar.close > sma10:  above_10 += 1
+                if bar.close > sma20:  above_20 += 1
                 if sma50  and bar.close > sma50:  above_50  += 1
                 if sma200 and bar.close > sma200: above_200 += 1
 
@@ -219,6 +240,20 @@ def compute_market_breadth(
                     up_25q += 1
                 elif ret_63 <= -0.25:
                     down_25q += 1
+
+            # Month momentum (21 trading days)
+            if n >= 21:
+                ret_21 = (bar.close / hist[-21].close) - 1.0
+                if ret_21 >= 0.25:    up_25m += 1
+                elif ret_21 <= -0.25: dn_25m += 1
+                if ret_21 >= 0.50:    up_50m += 1
+                elif ret_21 <= -0.50: dn_50m += 1
+
+            # 34-day momentum
+            if n >= 34:
+                ret_34 = (bar.close / hist[-34].close) - 1.0
+                if ret_34 >= 0.13:    up_13_34 += 1
+                elif ret_34 <= -0.13: dn_13_34 += 1
 
     total = advances + declines + unchanged
     snapshot.advances           = advances
@@ -231,8 +266,18 @@ def compute_market_breadth(
     snapshot.new_lows_52w       = new_lows
     snapshot.up_25pct_quarter   = up_25q
     snapshot.down_25pct_quarter = down_25q
+    snapshot.up_25pct_month     = up_25m
+    snapshot.dn_25pct_month     = dn_25m
+    snapshot.up_50pct_month     = up_50m
+    snapshot.dn_50pct_month     = dn_50m
+    snapshot.up_13pct_34d       = up_13_34
+    snapshot.dn_13pct_34d       = dn_13_34
+    snapshot.uvol               = round(uvol, 0)
+    snapshot.dvol               = round(dvol, 0)
+    snapshot.uvol_dvol_ratio    = round(uvol / dvol, 2) if dvol > 0 else 0.0
 
     if sma_total > 0:
+        snapshot.pct_above_10sma  = round(above_10  / sma_total * 100, 2)
         snapshot.pct_above_20sma  = round(above_20  / sma_total * 100, 2)
         snapshot.pct_above_50sma  = round(above_50  / sma_total * 100, 2)
         snapshot.pct_above_200sma = round(above_200 / sma_total * 100, 2)
@@ -325,13 +370,17 @@ def _classify_tape(s: BreadthSnapshot, vix_close: float | None = None) -> str:
     p20   = s.pct_above_20sma  or 0.0       # noqa: F841  (available for future use)
     nh_nl = s.new_high_low_ratio or 0.0
     vix   = vix_close or 20.0               # noqa: F841  (available for future use)
+    pcr   = s.equity_pcr                    # 0.0 when not populated (no effect on logic)
 
     # 1. BEAR — requires breadth collapse across ALL five metrics simultaneously
     if (p200 < 30.0 and p50 < 35.0 and mc < -100 and r10 < 0.7 and nh_nl < 0.5):
         return "BEAR"
 
-    # 2. RECOVERY — breadth turning from lows; summation must not be deeply negative
-    if (30.0 <= p200 <= 55.0 and mc > -100
+    # 2. RECOVERY — breadth turning from lows; summation must not be deeply negative.
+    # High equity PCR (fear > 0.9) widens the p200 lower bound from 30% to 25%:
+    # extreme fear is a contrarian-bullish signal that supports recovery classification.
+    _p200_recovery_lo = 25.0 if pcr > 0.9 else 30.0
+    if (_p200_recovery_lo <= p200 <= 55.0 and mc > -100
             and s.mcclellan_summation is not None
             and s.mcclellan_summation > -5000):
         return "RECOVERY"
@@ -389,15 +438,28 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
     try:
         from quantlab.storage import get_db
         con = get_db()
-        # Migration guard: add SPY columns if absent.  Check before ALTER to avoid
-        # aborting the DuckDB implicit transaction on a duplicate-column error.
+        # Migration guard: add any absent columns before INSERT.
         _bh_cols = {r[0] for r in con.execute(
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'breadth_history'"
         ).fetchall()}
         for _col, _def in [
-            ("spy_above_200sma", "BOOLEAN DEFAULT TRUE"),
-            ("spy_200sma_slope",  "DOUBLE DEFAULT 0.0"),
+            ("spy_above_200sma",  "BOOLEAN DEFAULT TRUE"),
+            ("spy_200sma_slope",   "DOUBLE DEFAULT 0.0"),
+            ("up_25pct_month",     "INTEGER DEFAULT 0"),
+            ("dn_25pct_month",     "INTEGER DEFAULT 0"),
+            ("up_50pct_month",     "INTEGER DEFAULT 0"),
+            ("dn_50pct_month",     "INTEGER DEFAULT 0"),
+            ("up_13pct_34d",       "INTEGER DEFAULT 0"),
+            ("dn_13pct_34d",       "INTEGER DEFAULT 0"),
+            ("uvol",               "DOUBLE DEFAULT 0.0"),
+            ("dvol",               "DOUBLE DEFAULT 0.0"),
+            ("uvol_dvol_ratio",    "DOUBLE DEFAULT 0.0"),
+            ("pct_above_10sma",    "DOUBLE DEFAULT 0.0"),
+            ("equity_pcr",         "DOUBLE DEFAULT 0.0"),
+            ("index_pcr",          "DOUBLE DEFAULT 0.0"),
+            ("total_pcr",          "DOUBLE DEFAULT 0.0"),
+            ("pcr_regime",         "VARCHAR DEFAULT 'neutral'"),
         ]:
             if _col not in _bh_cols:
                 con.execute(f"ALTER TABLE breadth_history ADD COLUMN {_col} {_def}")
@@ -406,12 +468,16 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
                 date, advances, declines, unchanged, total_stocks,
                 up_4pct_count, down_4pct_count, up_25pct_quarter, down_25pct_quarter,
                 new_highs_52w, new_lows_52w,
-                pct_above_20sma, pct_above_50sma, pct_above_200sma,
+                pct_above_10sma, pct_above_20sma, pct_above_50sma, pct_above_200sma,
                 advance_decline_ratio, new_high_low_ratio,
                 ratio_10d, mcclellan_oscillator, mcclellan_summation, ad_line, tape,
-                spy_above_200sma, spy_200sma_slope
+                spy_above_200sma, spy_200sma_slope,
+                up_25pct_month, dn_25pct_month, up_50pct_month, dn_50pct_month,
+                up_13pct_34d, dn_13pct_34d,
+                uvol, dvol, uvol_dvol_ratio,
+                equity_pcr, index_pcr, total_pcr, pcr_regime
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """, [
             snapshot.date,
@@ -419,11 +485,17 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
             snapshot.up_4pct_count, snapshot.down_4pct_count,
             snapshot.up_25pct_quarter, snapshot.down_25pct_quarter,
             snapshot.new_highs_52w, snapshot.new_lows_52w,
+            snapshot.pct_above_10sma,
             snapshot.pct_above_20sma, snapshot.pct_above_50sma, snapshot.pct_above_200sma,
             snapshot.advance_decline_ratio, snapshot.new_high_low_ratio,
             snapshot.ratio_10d, snapshot.mcclellan_oscillator,
             snapshot.mcclellan_summation, snapshot.ad_line, snapshot.tape,
             snapshot.spy_above_200sma, snapshot.spy_200sma_slope,
+            snapshot.up_25pct_month, snapshot.dn_25pct_month,
+            snapshot.up_50pct_month, snapshot.dn_50pct_month,
+            snapshot.up_13pct_34d,  snapshot.dn_13pct_34d,
+            snapshot.uvol, snapshot.dvol, snapshot.uvol_dvol_ratio,
+            snapshot.equity_pcr, snapshot.index_pcr, snapshot.total_pcr, snapshot.pcr_regime,
         ])
         con.close()
     except Exception as e:
@@ -435,7 +507,7 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
     try:
         from quantlab.storage import get_db
         con = get_db()
-        # Use COALESCE for new columns so older rows without them get defaults
+        # Use COALESCE for new columns so older rows without them get safe defaults
         rows = con.execute(f"""
             SELECT date, advances, declines, unchanged, total_stocks,
                    up_4pct_count, down_4pct_count, up_25pct_quarter, down_25pct_quarter,
@@ -443,8 +515,22 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
                    pct_above_20sma, pct_above_50sma, pct_above_200sma,
                    advance_decline_ratio, new_high_low_ratio,
                    ratio_10d, mcclellan_oscillator, mcclellan_summation, ad_line, tape,
-                   COALESCE(spy_above_200sma, TRUE)  AS spy_above_200sma,
-                   COALESCE(spy_200sma_slope,  0.0)  AS spy_200sma_slope
+                   COALESCE(spy_above_200sma, TRUE)   AS spy_above_200sma,
+                   COALESCE(spy_200sma_slope,  0.0)   AS spy_200sma_slope,
+                   COALESCE(up_25pct_month,    0)     AS up_25pct_month,
+                   COALESCE(dn_25pct_month,    0)     AS dn_25pct_month,
+                   COALESCE(up_50pct_month,    0)     AS up_50pct_month,
+                   COALESCE(dn_50pct_month,    0)     AS dn_50pct_month,
+                   COALESCE(up_13pct_34d,      0)     AS up_13pct_34d,
+                   COALESCE(dn_13pct_34d,      0)     AS dn_13pct_34d,
+                   COALESCE(uvol,              0.0)   AS uvol,
+                   COALESCE(dvol,              0.0)   AS dvol,
+                   COALESCE(uvol_dvol_ratio,   0.0)   AS uvol_dvol_ratio,
+                   COALESCE(pct_above_10sma,   0.0)   AS pct_above_10sma,
+                   COALESCE(equity_pcr,        0.0)   AS equity_pcr,
+                   COALESCE(index_pcr,         0.0)   AS index_pcr,
+                   COALESCE(total_pcr,         0.0)   AS total_pcr,
+                   COALESCE(pcr_regime, 'neutral')    AS pcr_regime
             FROM breadth_history
             ORDER BY date DESC LIMIT {n}
         """).fetchall()
@@ -466,6 +552,16 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
                 tape=r[20] or "NEUTRAL",
                 spy_above_200sma=bool(r[21]),
                 spy_200sma_slope=float(r[22] or 0.0),
+                up_25pct_month=int(r[23] or 0), dn_25pct_month=int(r[24] or 0),
+                up_50pct_month=int(r[25] or 0), dn_50pct_month=int(r[26] or 0),
+                up_13pct_34d=int(r[27] or 0),   dn_13pct_34d=int(r[28] or 0),
+                uvol=float(r[29] or 0.0),        dvol=float(r[30] or 0.0),
+                uvol_dvol_ratio=float(r[31] or 0.0),
+                pct_above_10sma=float(r[32] or 0.0),
+                equity_pcr=float(r[33] or 0.0),
+                index_pcr=float(r[34] or 0.0),
+                total_pcr=float(r[35] or 0.0),
+                pcr_regime=str(r[36] or "neutral"),
             )
             snapshots.append(s)
         return snapshots

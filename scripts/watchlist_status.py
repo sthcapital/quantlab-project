@@ -333,18 +333,22 @@ def run_dashboard(use_ibkr: bool = False,
     # ── Load all watchlist data ────────────────────────────────────────────────
     active = get_active_watchlist()
 
-    con = duckdb.connect(str(DB_PATH))
-    _ensure_schema(con)
-    completed_rows = con.execute("""
-        SELECT watch_id, symbol, date_added, entry_price, atr_stop,
-               conviction_score, signal_layers, lookback,
-               realized_ret_1d, realized_ret_3d, realized_ret_5d,
-               current_price, unrealized_ret, days_on_watch, status, date_updated
-        FROM watchlist
-        WHERE status IN ('stopped_out', 'expired')
-        ORDER BY date_added DESC
-    """).fetchall()
-    con.close()
+    completed_rows = []
+    try:
+        con = duckdb.connect(str(DB_PATH))
+        _ensure_schema(con)
+        completed_rows = con.execute("""
+            SELECT watch_id, symbol, date_added, entry_price, atr_stop,
+                   conviction_score, signal_layers, lookback,
+                   realized_ret_1d, realized_ret_3d, realized_ret_5d,
+                   current_price, unrealized_ret, days_on_watch, status, date_updated
+            FROM watchlist
+            WHERE status IN ('stopped_out', 'expired')
+            ORDER BY date_added DESC
+        """).fetchall()
+        con.close()
+    except Exception:
+        pass
 
     _COMP_COLS = ["watch_id","symbol","date_added","entry_price","atr_stop",
                   "conviction_score","signal_layers","lookback",
