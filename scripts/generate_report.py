@@ -465,6 +465,65 @@ def _alert_section(
     return e
 
 
+# ── Basing Candidates (Stage 1) section ──────────────────────────────────────
+
+def _basing_table(S: dict, basing_cands: list[dict]) -> list:
+    """Render 'Basing Candidates — Weekend Watchlist' for Stage 1 stocks."""
+    if not basing_cands:
+        return []
+
+    e: list = []
+    e.append(Spacer(1, 0.2 * inch))
+    e.append(HRFlowable(width=CONTENT_W, thickness=0.5, color=C_MGRAY))
+    e.append(Spacer(1, 0.08 * inch))
+    e.append(Paragraph("Basing Candidates — Weekend Watchlist", S["section"]))
+    e.append(Paragraph(
+        "Stage 1 stocks building a base.  Watch for Stage 2 breakout confirmation before acting.",
+        S["small"],
+    ))
+    e.append(Spacer(1, 0.08 * inch))
+
+    headers = ["#", "Symbol", "Days", "Conv", "Opts", "VDU", "EPS %", "PEG", "Notes"]
+    cw = [0.28, 0.72, 0.45, 0.50, 0.38, 0.38, 0.62, 0.45, 2.30]
+    col_widths = [w * inch for w in cw]
+
+    rows = [headers]
+    for idx, en in enumerate(basing_cands, 1):
+        rows.append([
+            str(idx),
+            en["symbol"],
+            f"{en.get('consecutive_days', 1)}d",
+            _fmt(en.get("conviction_score")),
+            _tick(en.get("options_signal", False)),
+            _tick(en.get("volume_dry_up", False)),
+            _pct(en.get("earnings_score")),
+            _fmt(en.get("peg_score")),
+            "",
+        ])
+
+    style_cmds = [
+        ("BACKGROUND",    (0, 0), (-1, 0),  C_DGRAY),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),  white),
+        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 7.5),
+        ("FONTNAME",      (1, 1), (1, -1),  "Helvetica-Bold"),
+        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+        ("ALIGN",         (1, 0), (1, -1),  "LEFT"),
+        ("ALIGN",         (8, 0), (8, -1),  "LEFT"),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [white, C_LGRAY]),
+        ("GRID",          (0, 0), (-1, -1), 0.3, C_MGRAY),
+        ("LINEBELOW",     (0, 0), (-1, 0),  1.0, C_DGRAY),
+        ("PADDING",       (0, 0), (-1, -1), 4),
+        ("TOPPADDING",    (0, 0), (-1, 0),  6),
+        ("BOTTOMPADDING", (0, 0), (-1, 0),  6),
+    ]
+
+    tbl = Table(rows, colWidths=col_widths, repeatRows=1)
+    tbl.setStyle(TableStyle(style_cmds))
+    e.append(tbl)
+    return e
+
+
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
 def _load_abt_entry(db_path: str | None = None) -> dict | None:
@@ -571,7 +630,10 @@ def generate(
 
     # ── Fetch data ─────────────────────────────────────────────────────────────
     iwl          = InstitutionalWatchlist(db_path=db_path)
-    candidates   = iwl.get_candidates()
+    # Main table: Stage 2 advancing stocks only (defensive filter; upsert already routes)
+    candidates   = [c for c in iwl.get_candidates() if c.get("stage", 0) == 2]
+    # Basing section: Stage 1 stocks from the separate basing_watchlist table
+    basing_cands = iwl.get_basing_candidates()
     breadth      = get_latest_snapshot()
     symbols      = [c["symbol"] for c in candidates]
     backtest_map = _load_backtest_map(symbols, db_path)
@@ -610,6 +672,8 @@ def generate(
     if candidates:
         story += _candidate_table(S, candidates, backtest_map)
         story += _alert_section(S, candidates, backtest_map)
+    if basing_cands:
+        story += _basing_table(S, basing_cands)
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
 

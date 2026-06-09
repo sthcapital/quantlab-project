@@ -403,9 +403,12 @@ class InstitutionalWatchlist:
         base_conviction = getattr(scan_result, "conviction_score", 0.0)
         stage           = getattr(scan_result, "stage", 0)
 
-        # Topping (3) and declining (4) stocks are never long candidates
-        if stage in (3, 4):
+        # Unknown (0), topping (3), declining (4): never store anywhere
+        if stage in (0, 3, 4):
             return {"symbol": symbol, "consecutive_days": 0, "conviction_score": 0.0}
+
+        # Stage 1 (basing) → basing_watchlist; Stage 2 (advancing) → institutional_watchlist
+        _table = "basing_watchlist" if stage == 1 else "institutional_watchlist"
 
         entry_price     = getattr(scan_result, "entry_close", None)
         earnings_score  = (
@@ -435,7 +438,7 @@ class InstitutionalWatchlist:
         try:
             con = self._con()
             row = con.execute(
-                "SELECT consecutive_days, last_seen FROM institutional_watchlist WHERE symbol = ?",
+                f"SELECT consecutive_days, last_seen FROM {_table} WHERE symbol = ?",
                 [symbol],
             ).fetchone()
 
@@ -443,8 +446,8 @@ class InstitutionalWatchlist:
                 consecutive_days = 1
                 stored_conviction = min(1.0, base_conviction + 0.05 * consecutive_days)
                 con.execute(
-                    """
-                    INSERT INTO institutional_watchlist
+                    f"""
+                    INSERT INTO {_table}
                         (symbol, first_seen, last_seen, consecutive_days, stage,
                          conviction_score, entry_price, options_signal, volume_dry_up,
                          earnings_score, peg_score, breakout_volume_score, tape, notes,
@@ -468,8 +471,8 @@ class InstitutionalWatchlist:
                 bonus = min(0.20, 0.05 * consecutive_days)
                 stored_conviction = min(1.0, base_conviction + bonus)
                 con.execute(
-                    """
-                    UPDATE institutional_watchlist SET
+                    f"""
+                    UPDATE {_table} SET
                         last_seen=?, consecutive_days=?, stage=?,
                         conviction_score=?, entry_price=?, options_signal=?,
                         volume_dry_up=?, earnings_score=?, peg_score=?,
@@ -485,7 +488,7 @@ class InstitutionalWatchlist:
                 )
             con.close()
         except Exception as exc:
-            print(f"[institutional_watchlist] upsert failed for {symbol}: {exc}")
+            print(f"[{_table}] upsert failed for {symbol}: {exc}")
             consecutive_days = 1
             stored_conviction = base_conviction
 
@@ -516,6 +519,22 @@ class InstitutionalWatchlist:
     def get_multi_day(self, min_days: int = 2) -> list[dict]:
         """Candidates appearing on min_days+ consecutive scans (highest priority)."""
         return self.get_candidates(min_consecutive_days=min_days)
+
+    def get_basing_candidates(self, min_consecutive_days: int = 1) -> list[dict]:
+        """Stage 1 basing stocks from basing_watchlist, sorted by days then conviction."""
+        try:
+            con = self._con()
+            rows = con.execute(
+                f"SELECT {', '.join(_IWL_COLS)} FROM basing_watchlist "
+                "WHERE consecutive_days >= ? "
+                "ORDER BY consecutive_days DESC, conviction_score DESC",
+                [min_consecutive_days],
+            ).fetchall()
+            con.close()
+            return [dict(zip(_IWL_COLS, r)) for r in rows]
+        except Exception as exc:
+            print(f"[basing_watchlist] get_basing_candidates failed: {exc}")
+            return []
 
     def remove_stale(self, max_days_inactive: int = 5) -> int:
         """

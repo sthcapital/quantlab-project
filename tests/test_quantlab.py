@@ -6661,16 +6661,63 @@ class TestInstitutionalWatchlist:
         # consecutive_days = 11, bonus = min(0.20, 0.05*11) = 0.20
         assert r["conviction_score"] == pytest.approx(base + 0.20, abs=1e-4)
 
-    def test_upsert_skips_stage_3_and_4(self, tmp_path):
-        """Stage 3 (topping) and Stage 4 (declining) should not be stored."""
+    def test_upsert_skips_stage_0_3_4(self, tmp_path):
+        """Stage 0 (unknown), 3 (topping), 4 (declining) should not be stored anywhere."""
         from quantlab.watchlist import InstitutionalWatchlist
         iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
-        for bad_stage in (3, 4):
+        for bad_stage in (0, 3, 4):
             r = iwl.upsert("XYZ", self._make_result("XYZ", stage=bad_stage))
             assert r["consecutive_days"] == 0, f"stage={bad_stage} should be skipped"
             assert r["conviction_score"] == 0.0, f"stage={bad_stage} should yield 0 conviction"
-        # Nothing persisted in DB
+        # Nothing persisted in either table
         assert iwl.get_candidates() == []
+        assert iwl.get_basing_candidates() == []
+
+    def test_upsert_stage_1_routes_to_basing_watchlist(self, tmp_path):
+        """Stage 1 (basing) should go to basing_watchlist, not institutional_watchlist."""
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        r = iwl.upsert("MSFT", self._make_result("MSFT", stage=1, conviction=0.50))
+        assert r["consecutive_days"] == 1
+        assert r["conviction_score"] > 0.0
+        # Main watchlist untouched
+        assert iwl.get_candidates() == []
+        # Basing watchlist has the entry
+        basing = iwl.get_basing_candidates()
+        assert len(basing) == 1
+        assert basing[0]["symbol"] == "MSFT"
+        assert basing[0]["stage"] == 1
+
+    def test_get_basing_candidates_multi_day(self, tmp_path):
+        """Basing watchlist respects min_consecutive_days filter."""
+        from quantlab.watchlist import InstitutionalWatchlist
+        import duckdb
+        from datetime import timedelta
+        db = tmp_path / "test.duckdb"
+        iwl = InstitutionalWatchlist(db_path=db)
+
+        iwl.upsert("SINGLE", self._make_result("SINGLE", stage=1))
+
+        # Manually insert a multi-day basing entry
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        con = duckdb.connect(str(db))
+        con.execute(
+            """
+            INSERT INTO basing_watchlist
+                (symbol, first_seen, last_seen, consecutive_days, stage,
+                 conviction_score, entry_price, options_signal, volume_dry_up,
+                 earnings_score, peg_score, breakout_volume_score, tape, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, FALSE, FALSE, NULL, NULL, NULL, '', '')
+            """,
+            ["MULTI", yesterday, yesterday, 3, 1, 0.55, 80.0],
+        )
+        con.close()
+
+        all_basing = iwl.get_basing_candidates()
+        assert len(all_basing) == 2
+        multi_only = iwl.get_basing_candidates(min_consecutive_days=2)
+        assert len(multi_only) == 1
+        assert multi_only[0]["symbol"] == "MULTI"
 
     # ── get_candidates / get_multi_day ────────────────────────────────────────
 

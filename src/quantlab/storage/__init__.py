@@ -461,6 +461,26 @@ def _ensure_schema(con) -> None:
     """)
 
     con.execute("""
+        CREATE TABLE IF NOT EXISTS basing_watchlist (
+            symbol                TEXT PRIMARY KEY,
+            first_seen            DATE,
+            last_seen             DATE,
+            consecutive_days      INTEGER DEFAULT 1,
+            stage                 INTEGER DEFAULT 0,
+            conviction_score      FLOAT,
+            entry_price           FLOAT,
+            options_signal        BOOLEAN DEFAULT FALSE,
+            volume_dry_up         BOOLEAN DEFAULT FALSE,
+            earnings_score        FLOAT,
+            peg_score             FLOAT,
+            breakout_volume_score FLOAT,
+            tape                  TEXT DEFAULT '',
+            notes                 TEXT DEFAULT '',
+            updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    con.execute("""
         CREATE TABLE IF NOT EXISTS daily_reports (
             date             DATE PRIMARY KEY,
             tape             TEXT,
