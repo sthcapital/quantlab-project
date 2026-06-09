@@ -6088,13 +6088,20 @@ class TestStageClassification:
         assert score_conviction(s2) - score_conviction(base) == pytest.approx(0.05, abs=1e-9)
 
     def test_non_stage_2_no_bonus(self):
-        for stage_val in (0, 1, 3):
+        for stage_val in (0, 1):
             r = ScanResult(
                 "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
                 regime_bullish=False, stage=stage_val,
             )
             # Should not add the +0.05 stage-2 bonus
             assert score_conviction(r) == pytest.approx(0.30, abs=1e-9), f"stage={stage_val}"
+
+    def test_stage_3_conviction_vetoed(self):
+        r = ScanResult(
+            "AAPL", "2026-06-08", "breakout", True, 200.0, None, 20,
+            regime_bullish=True, stage=3,
+        )
+        assert score_conviction(r) == 0.0
 
     def test_stage_4_conviction_vetoed(self):
         r = ScanResult(
@@ -6653,6 +6660,17 @@ class TestInstitutionalWatchlist:
         r = iwl.upsert("CELH", self._make_result("CELH", conviction=base))
         # consecutive_days = 11, bonus = min(0.20, 0.05*11) = 0.20
         assert r["conviction_score"] == pytest.approx(base + 0.20, abs=1e-4)
+
+    def test_upsert_skips_stage_3_and_4(self, tmp_path):
+        """Stage 3 (topping) and Stage 4 (declining) should not be stored."""
+        from quantlab.watchlist import InstitutionalWatchlist
+        iwl = InstitutionalWatchlist(db_path=tmp_path / "test.duckdb")
+        for bad_stage in (3, 4):
+            r = iwl.upsert("XYZ", self._make_result("XYZ", stage=bad_stage))
+            assert r["consecutive_days"] == 0, f"stage={bad_stage} should be skipped"
+            assert r["conviction_score"] == 0.0, f"stage={bad_stage} should yield 0 conviction"
+        # Nothing persisted in DB
+        assert iwl.get_candidates() == []
 
     # ── get_candidates / get_multi_day ────────────────────────────────────────
 

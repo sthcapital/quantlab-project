@@ -402,6 +402,11 @@ class InstitutionalWatchlist:
 
         base_conviction = getattr(scan_result, "conviction_score", 0.0)
         stage           = getattr(scan_result, "stage", 0)
+
+        # Topping (3) and declining (4) stocks are never long candidates
+        if stage in (3, 4):
+            return {"symbol": symbol, "consecutive_days": 0, "conviction_score": 0.0}
+
         entry_price     = getattr(scan_result, "entry_close", None)
         earnings_score  = (
             getattr(scan_result, "edgar_acceleration", None)

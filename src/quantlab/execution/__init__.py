@@ -213,8 +213,8 @@ def score_conviction(result: ScanResult) -> float:
     if result.breadth_override:
         return 0.0
 
-    # Stage 4 veto: declining stocks are never long candidates
-    if result.stage == 4:
+    # Stage 3 (topping) and Stage 4 (declining) are never long candidates
+    if result.stage in (3, 4):
         return 0.0
 
     score = 0.30  # base: signal fired
