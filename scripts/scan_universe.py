@@ -368,7 +368,33 @@ def main() -> None:
     # ── Legacy signal-threshold watchlist ─────────────────────────────────────
     if args.add_to_watchlist:
         from quantlab.watchlist import add_to_watchlist
-        added = sum(1 for r in results if add_to_watchlist(r))
+        from quantlab.universe import _is_excluded_symbol
+
+        # Load today's CS tickers parquet (cached by universe build) so only
+        # confirmed common stocks enter the forward-return watchlist.
+        # Falls back to the EXCLUDE_SYMBOLS hard-list when the parquet is absent.
+        _cs_set: set | None = None
+        try:
+            from quantlab.universe import _cs_cache_path
+            import pyarrow.parquet as _pq
+            from datetime import timedelta as _td2
+            for _d in range(7):
+                _cp = _cs_cache_path(date.today() - _td2(days=_d))
+                if _cp.exists():
+                    _cs_set = set(_pq.read_table(str(_cp)).to_pydict().get("symbol", []))
+                    break
+        except Exception:
+            pass
+
+        def _is_common_stock(sym: str) -> bool:
+            if _cs_set is not None:
+                return sym in _cs_set
+            return not _is_excluded_symbol(sym)
+
+        added = sum(
+            1 for r in results
+            if _is_common_stock(r.symbol) and add_to_watchlist(r)
+        )
         total_qualifying = sum(1 for r in results if r.conviction_score >= 0.70)
         print(f"watchlist → {added}/{total_qualifying} setup(s) added "
               f"(conviction ≥ 0.70)")

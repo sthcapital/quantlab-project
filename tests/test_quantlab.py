@@ -6894,6 +6894,81 @@ class TestInstitutionalWatchlist:
         assert row is not None
         assert str(row[0]) == date.today().isoformat()
 
+    def test_open_positions_includes_entry_without_current_price(self, tmp_path):
+        """Watchlist entries without current_price (e.g. ABT) must appear in the PDF."""
+        import sys, duckdb
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as _gr
+        from quantlab.storage import _ensure_schema
+
+        db = tmp_path / "abt_test.duckdb"
+        reports = tmp_path / "abt_reports"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.execute(
+            """
+            INSERT INTO watchlist (
+                watch_id, symbol, date_added, entry_price, atr_stop,
+                conviction_score, signal_layers, lookback, signal_type,
+                status, date_updated
+            ) VALUES ('ABT_2026-06-04', 'ABT', '2026-06-04', 95.0, 88.0,
+                      0.75, 'REGIME', 5, 'breakout', 'watching', '2026-06-04')
+            """
+        )
+        con.close()
+
+        # Must not crash; PDF must be non-trivial
+        pdf_path = _gr.generate(
+            report_date=date.today(), reports_dir=reports, db_path=str(db),
+        )
+        assert pdf_path.exists()
+        assert pdf_path.stat().st_size > 2000
+
+    def test_load_open_positions_returns_all_watching(self, tmp_path):
+        """_load_open_positions should return every 'watching' row regardless of current_price."""
+        import sys, duckdb
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as _gr
+        from quantlab.storage import _ensure_schema
+
+        db = tmp_path / "pos_test.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        # ABT — no current_price
+        con.execute(
+            """INSERT INTO watchlist (watch_id, symbol, date_added, entry_price, atr_stop,
+               conviction_score, signal_layers, lookback, signal_type, status, date_updated)
+               VALUES ('ABT_2026-06-04','ABT','2026-06-04',95.0,88.0,0.75,'REGIME',5,
+                       'breakout','watching','2026-06-04')"""
+        )
+        # KRC — has current_price
+        con.execute(
+            """INSERT INTO watchlist (watch_id, symbol, date_added, entry_price, atr_stop,
+               conviction_score, signal_layers, lookback, signal_type, status, date_updated,
+               current_price)
+               VALUES ('KRC_2026-06-09','KRC','2026-06-09',37.89,35.88,0.72,'REGIME',5,
+                       'breakout','watching','2026-06-09',38.50)"""
+        )
+        # IDYA — stopped_out, must NOT appear
+        con.execute(
+            """INSERT INTO watchlist (watch_id, symbol, date_added, entry_price, atr_stop,
+               conviction_score, signal_layers, lookback, signal_type, status, date_updated)
+               VALUES ('IDYA_2026-06-09','IDYA','2026-06-09',31.48,29.02,0.71,'REGIME',5,
+                       'breakout','stopped_out','2026-06-09')"""
+        )
+        con.close()
+
+        positions = _gr._load_open_positions(str(db))
+        syms = [p["symbol"] for p in positions]
+        assert "ABT"  in syms, "ABT missing — current_price=NULL must not filter it out"
+        assert "KRC"  in syms, "KRC missing"
+        assert "IDYA" not in syms, "IDYA should not appear (stopped_out)"
+        assert len(positions) == 2
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # IC Monitor

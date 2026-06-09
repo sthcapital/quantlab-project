@@ -172,7 +172,7 @@ def _page1(
     breadth_snap,
     n_cand: int,
     n_multi: int,
-    abt_entry: dict | None,
+    open_positions: list[dict],
     vix_close: float | None = None,
 ) -> list:
     tape  = (breadth_snap.tape if breadth_snap else "N/A")
@@ -285,40 +285,45 @@ def _page1(
     ]))
     e.append(sum_tbl)
 
-    # ── Open position P&L (if available) ──────────────────────────────────────
-    if abt_entry:
+    # ── Open position P&L ─────────────────────────────────────────────────────
+    if open_positions:
         e.append(Spacer(1, 0.15 * inch))
         e.append(Paragraph("Open Position Monitor", S["section"]))
-        sym    = abt_entry.get("symbol", "—")
-        ep     = abt_entry.get("entry_price") or 0.0
-        cp     = abt_entry.get("current_price")
-        unrl   = abt_entry.get("unrealized_ret")
-        days_w = abt_entry.get("days_on_watch", 0)
-        status = (abt_entry.get("status") or "watching").upper()
-        cp_str   = f"${cp:.2f}"    if cp   is not None else "—"
-        unrl_str = f"{unrl*100:+.2f}%" if unrl is not None else "—"
-        pnl_c    = C_GREEN if (unrl or 0) >= 0 else C_RED
 
-        pos_data = [
-            ["Symbol", "Entry",      "Current",  "Unrealized P&L", "Days", "Status"],
-            [sym,      f"${ep:.2f}", cp_str,     unrl_str,          str(days_w), status],
-        ]
+        pos_data = [["Symbol", "Entry", "Current", "Unrealized P&L", "Days", "Status"]]
+        row_cmds: list = []
+
+        for ri, pos in enumerate(open_positions, 1):
+            sym    = pos.get("symbol", "—")
+            ep     = pos.get("entry_price") or 0.0
+            cp     = pos.get("current_price")
+            unrl   = pos.get("unrealized_ret")
+            days_w = pos.get("days_on_watch", 0)
+            status = (pos.get("status") or "watching").upper()
+            cp_str   = f"${cp:.2f}"         if cp   is not None else "—"
+            unrl_str = f"{unrl*100:+.2f}%"  if unrl is not None else "—"
+            pnl_c    = C_GREEN if (unrl or 0) >= 0 else C_RED
+            pos_data.append([sym, f"${ep:.2f}", cp_str, unrl_str, str(days_w), status])
+            row_cmds += [
+                ("FONTNAME",  (0, ri), (0, ri), "Helvetica-Bold"),
+                ("TEXTCOLOR", (3, ri), (3, ri), pnl_c),
+                ("FONTNAME",  (3, ri), (3, ri), "Helvetica-Bold"),
+            ]
+
         pos_tbl = Table(
             pos_data,
             colWidths=[0.85*inch, 0.85*inch, 0.85*inch, 1.15*inch, 0.7*inch, 0.9*inch],
         )
         pos_tbl.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), C_NAVY),
-            ("TEXTCOLOR",  (0, 0), (-1, 0), white),
-            ("FONTNAME",   (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE",   (0, 0), (-1, -1), 8),
-            ("FONTNAME",   (0, 1), (0,  1), "Helvetica-Bold"),
-            ("TEXTCOLOR",  (3, 1), (3,  1), pnl_c),
-            ("FONTNAME",   (3, 1), (3,  1), "Helvetica-Bold"),
-            ("ALIGN",      (1, 0), (-1, -1), "CENTER"),
-            ("GRID",       (0, 0), (-1, -1), 0.4, C_MGRAY),
-            ("PADDING",    (0, 0), (-1, -1), 6),
-        ]))
+            ("BACKGROUND",     (0, 0), (-1, 0), C_NAVY),
+            ("TEXTCOLOR",      (0, 0), (-1, 0), white),
+            ("FONTNAME",       (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE",       (0, 0), (-1, -1), 8),
+            ("ALIGN",          (1, 0), (-1, -1), "CENTER"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [white, C_LGRAY]),
+            ("GRID",           (0, 0), (-1, -1), 0.4, C_MGRAY),
+            ("PADDING",        (0, 0), (-1, -1), 6),
+        ] + row_cmds))
         e.append(pos_tbl)
 
     return e
@@ -526,30 +531,29 @@ def _basing_table(S: dict, basing_cands: list[dict]) -> list:
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
 
-def _load_abt_entry(db_path: str | None = None) -> dict | None:
-    """Return the top active watchlist entry that has a current price set."""
+def _load_open_positions(db_path: str | None = None) -> list[dict]:
+    """Return all 'watching' watchlist entries for the Open Position Monitor."""
     try:
         import duckdb
-        from quantlab.storage import DB_PATH
+        from quantlab.storage import DB_PATH, _ensure_schema
         con = duckdb.connect(db_path or str(DB_PATH))
-        row = con.execute(
+        _ensure_schema(con)
+        rows = con.execute(
             """
             SELECT symbol, entry_price, current_price, unrealized_ret,
                    days_on_watch, status
             FROM watchlist
-            WHERE status = 'watching' AND current_price IS NOT NULL
-            ORDER BY conviction_score DESC LIMIT 1
+            WHERE status = 'watching'
+            ORDER BY conviction_score DESC
             """
-        ).fetchone()
+        ).fetchall()
         con.close()
-        if row:
-            return dict(zip(
-                ["symbol", "entry_price", "current_price", "unrealized_ret",
-                 "days_on_watch", "status"], row,
-            ))
+        cols = ["symbol", "entry_price", "current_price", "unrealized_ret",
+                "days_on_watch", "status"]
+        return [dict(zip(cols, row)) for row in rows]
     except Exception:
         pass
-    return None
+    return []
 
 
 def _load_backtest_map(symbols: list[str], db_path: str | None = None) -> dict:
@@ -636,9 +640,9 @@ def generate(
     basing_cands = iwl.get_basing_candidates()
     breadth      = get_latest_snapshot()
     symbols      = [c["symbol"] for c in candidates]
-    backtest_map = _load_backtest_map(symbols, db_path)
-    abt_entry    = _load_abt_entry(db_path)
-    n_multi      = sum(1 for c in candidates if c.get("consecutive_days", 1) >= 2)
+    backtest_map    = _load_backtest_map(symbols, db_path)
+    open_positions  = _load_open_positions(db_path)
+    n_multi         = sum(1 for c in candidates if c.get("consecutive_days", 1) >= 2)
 
     # VIX close (non-fatal; defaults to None → shown as "—" in report)
     vix_close: float | None = None
@@ -667,7 +671,7 @@ def generate(
     )
 
     story: list = []
-    story += _page1(S, report_date, breadth, len(candidates), n_multi, abt_entry,
+    story += _page1(S, report_date, breadth, len(candidates), n_multi, open_positions,
                     vix_close=vix_close)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map)
