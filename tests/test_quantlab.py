@@ -6971,6 +6971,138 @@ class TestInstitutionalWatchlist:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# select_top_candidates — watchlist top-5 filter
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSelectTopCandidates:
+    """Tests for select_top_candidates() in scripts/scan_universe.py."""
+
+    def _load(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import scan_universe as _su
+        return _su.select_top_candidates
+
+    def _make_result(self, symbol, conviction=0.75, stage=2, sector="Technology",
+                     edgar_accel=0.6, earnings_accel=0.5):
+        return ScanResult(
+            symbol=symbol, scan_date=date.today().isoformat(),
+            signal_type="breakout", signal=True,
+            entry_close=100.0, indicator_value=None, lookback=20,
+            conviction_score=conviction, stage=stage,
+            edgar_acceleration=edgar_accel,
+            earnings_acceleration=earnings_accel,
+            sector=sector,
+        )
+
+    def _iwl_entry(self, options=False, vdu=False, days=1):
+        return {"options_signal": options, "volume_dry_up": vdu, "consecutive_days": days}
+
+    def test_basic_stage2_conviction_passes(self):
+        fn = self._load()
+        r = self._make_result("AAPL", conviction=0.75, stage=2)
+        iwl = {"AAPL": self._iwl_entry(options=True)}
+        result = fn([r], iwl, lambda s: True)
+        assert len(result) == 1
+        assert result[0][0].symbol == "AAPL"
+
+    def test_stage_not_2_excluded(self):
+        fn = self._load()
+        for bad_stage in (0, 1, 3, 4):
+            r = self._make_result("XYZ", stage=bad_stage)
+            iwl = {"XYZ": self._iwl_entry(options=True)}
+            assert fn([r], iwl, lambda s: True) == [], f"stage={bad_stage} should be excluded"
+
+    def test_conviction_below_070_excluded(self):
+        fn = self._load()
+        r = self._make_result("MSFT", conviction=0.65)
+        iwl = {"MSFT": self._iwl_entry(options=True)}
+        assert fn([r], iwl, lambda s: True) == []
+
+    def test_non_cs_excluded(self):
+        fn = self._load()
+        r = self._make_result("DUST", conviction=0.80)
+        iwl = {"DUST": self._iwl_entry(options=True)}
+        assert fn([r], iwl, lambda s: s != "DUST") == []
+
+    def test_zero_earnings_excluded(self):
+        fn = self._load()
+        r = self._make_result("NVDA", edgar_accel=0.0, earnings_accel=0.0)
+        iwl = {"NVDA": self._iwl_entry(options=True)}
+        assert fn([r], iwl, lambda s: True) == []
+
+    def test_confirming_signal_required(self):
+        fn = self._load()
+        r = self._make_result("LLY", conviction=0.80)
+        # no options, no vdu, days=1 — no confirming signal
+        iwl = {"LLY": self._iwl_entry(options=False, vdu=False, days=1)}
+        assert fn([r], iwl, lambda s: True) == []
+
+    def test_options_signal_qualifies(self):
+        fn = self._load()
+        r = self._make_result("LLY")
+        iwl = {"LLY": self._iwl_entry(options=True, vdu=False, days=1)}
+        assert len(fn([r], iwl, lambda s: True)) == 1
+
+    def test_volume_dry_up_qualifies(self):
+        fn = self._load()
+        r = self._make_result("CAT")
+        iwl = {"CAT": self._iwl_entry(options=False, vdu=True, days=1)}
+        assert len(fn([r], iwl, lambda s: True)) == 1
+
+    def test_consecutive_days_2_qualifies(self):
+        fn = self._load()
+        r = self._make_result("UNH")
+        iwl = {"UNH": self._iwl_entry(options=False, vdu=False, days=2)}
+        assert len(fn([r], iwl, lambda s: True)) == 1
+
+    def test_top5_cap(self):
+        fn = self._load()
+        results = [self._make_result(f"SYM{i}", conviction=0.80 - i * 0.01)
+                   for i in range(8)]
+        iwl = {f"SYM{i}": self._iwl_entry(options=True) for i in range(8)}
+        selected = fn(results, iwl, lambda s: True)
+        assert len(selected) <= 5
+
+    def test_sorted_by_days_then_conviction(self):
+        fn = self._load()
+        r_high_conv = self._make_result("HIGH", conviction=0.90)
+        r_multi_day = self._make_result("MULTI", conviction=0.75)
+        iwl = {
+            "HIGH":  self._iwl_entry(options=True, days=1),
+            "MULTI": self._iwl_entry(options=True, days=3),
+        }
+        selected = fn([r_high_conv, r_multi_day], iwl, lambda s: True)
+        # MULTI has more days → should rank first despite lower conviction
+        assert selected[0][0].symbol == "MULTI"
+
+    def test_sector_cap_at_3(self):
+        fn = self._load()
+        # 5 Tech symbols all qualifying — only 3 should be selected
+        results = [self._make_result(f"T{i}", conviction=0.80 - i * 0.01, sector="Technology")
+                   for i in range(5)]
+        iwl = {f"T{i}": self._iwl_entry(options=True) for i in range(5)}
+        selected = fn(results, iwl, lambda s: True)
+        assert len(selected) == 3
+
+    def test_sector_diversification_fills_from_other_sectors(self):
+        fn = self._load()
+        # 4 Tech + 2 Health — expect 3 Tech + 2 Health = 5 total
+        tech = [self._make_result(f"T{i}", conviction=0.85, sector="Technology")
+                for i in range(4)]
+        health = [self._make_result(f"H{i}", conviction=0.80, sector="Health Care")
+                  for i in range(2)]
+        iwl = {r.symbol: self._iwl_entry(options=True) for r in tech + health}
+        selected = fn(tech + health, iwl, lambda s: True)
+        sectors = [getattr(item[0], "sector", "") for item in selected]
+        assert sectors.count("Technology") == 3
+        assert sectors.count("Health Care") == 2
+        assert len(selected) == 5
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # IC Monitor
 # ══════════════════════════════════════════════════════════════════════════════
 

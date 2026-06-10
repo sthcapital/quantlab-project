@@ -11,6 +11,7 @@ Usage:
 """
 
 from argparse import ArgumentParser
+from collections import defaultdict
 from datetime import date
 
 from quantlab.execution import run_universe_scan, load_universe
@@ -18,6 +19,71 @@ from quantlab.providers import create_market_data_provider
 from quantlab.risk import fmt_pct, fmt_float
 from quantlab.storage import append_scan_results, ensure_dirs
 from quantlab.utils import setup_logging, parse_date, n_days_ago, make_run_id, get_config
+
+
+def select_top_candidates(
+    results,
+    iwl_state: dict,
+    is_cs_fn,
+    max_per_day: int = 5,
+    max_per_sector: int = 3,
+) -> list:
+    """
+    Apply the strict paper-trading watchlist filter and return up to max_per_day
+    candidates, with sector concentration capped at max_per_sector per sector.
+
+    Qualification rules (ALL must be true):
+      - stage == 2
+      - is_cs_fn(symbol) → common stock
+      - conviction_score >= 0.70
+      - earnings_score > 0.0 (real earnings data available)
+      - at least one confirming signal: options_signal OR volume_dry_up OR
+        consecutive_days >= 2 (already on institutional_watchlist)
+
+    Ranking: consecutive_days DESC → conviction_score DESC → earnings_score DESC.
+
+    Returns:
+        List of (ScanResult, earn_score, consecutive_days) tuples.
+    """
+    qualifying = []
+    for r in results:
+        if r.stage != 2:
+            continue
+        if not is_cs_fn(r.symbol):
+            continue
+        if r.conviction_score < 0.70:
+            continue
+
+        earn = (r.edgar_acceleration if r.edgar_acceleration is not None
+                else r.earnings_acceleration)
+        if earn is None or earn <= 0.0:
+            continue
+
+        iwl_e = iwl_state.get(r.symbol, {})
+        opts  = bool(iwl_e.get("options_signal", False))
+        vdu   = bool(iwl_e.get("volume_dry_up", False))
+        cdays = int(iwl_e.get("consecutive_days", 1))
+
+        if not (opts or vdu or cdays >= 2):
+            continue
+
+        qualifying.append((r, earn, cdays))
+
+    qualifying.sort(key=lambda x: (-x[2], -x[0].conviction_score, -x[1]))
+
+    # Sector cap: no more than max_per_sector from the same GICS sector
+    sector_count: dict[str, int] = defaultdict(int)
+    selected = []
+    for item in qualifying:
+        sector = getattr(item[0], "sector", "") or "unknown"
+        if sector_count[sector] >= max_per_sector:
+            continue
+        selected.append(item)
+        sector_count[sector] += 1
+        if len(selected) >= max_per_day:
+            break
+
+    return selected
 
 
 def main() -> None:
@@ -331,15 +397,38 @@ def main() -> None:
         append_scan_results(scan_id, results)
         print(f"db  → {len(results)} scan result(s) stored (scan_id={scan_id})")
 
-    # ── Institutional watchlist — persistent multi-day candidate tracking ────────
+    # ── CS filter (shared by IWL and paper watchlist) ─────────────────────────
+    from quantlab.universe import _is_excluded_symbol as _is_excl_sym, EXCLUDE_SYMBOLS
+    _cs_set: set | None = None
+    try:
+        from quantlab.universe import _cs_cache_path
+        import pyarrow.parquet as _pq
+        from datetime import timedelta as _td2
+        for _d in range(7):
+            _cp = _cs_cache_path(date.today() - _td2(days=_d))
+            if _cp.exists():
+                _cs_set = set(_pq.read_table(str(_cp)).to_pydict().get("symbol", []))
+                break
+    except Exception:
+        pass
+
+    def _is_common_stock(sym: str) -> bool:
+        if _cs_set is not None:
+            return sym in _cs_set
+        return not _is_excl_sym(sym)
+
+    # ── Institutional watchlist — broad Stage 2 CS multi-day tracking ─────────
+    # Upserts ALL Stage 2 CS symbols above the scanner's min_conviction (≥0.40).
+    # This is the wide monitoring layer; the strict top-5 filter below governs
+    # only the paper-trading watchlist table.
+    iwl = None
     try:
         from quantlab.watchlist import InstitutionalWatchlist
         iwl = InstitutionalWatchlist()
 
-        # Upsert every result returned by the scanner (all have conviction >= min)
-        # The min threshold is already >= 0.4, capturing pre-breakout interest.
         for r in results:
-            iwl.upsert(r.symbol, r)
+            if _is_common_stock(r.symbol):
+                iwl.upsert(r.symbol, r)
 
         # Identify PRIORITY candidates: conviction >= 0.70 AND 2+ consecutive days
         priority_entries = [
@@ -365,39 +454,66 @@ def main() -> None:
     except Exception as _iwl_err:
         print(f"  WARNING: institutional watchlist update failed: {_iwl_err}")
 
-    # ── Legacy signal-threshold watchlist ─────────────────────────────────────
+    # ── Paper trading watchlist — strict top-5 filter ─────────────────────────
     if args.add_to_watchlist:
         from quantlab.watchlist import add_to_watchlist
-        from quantlab.universe import _is_excluded_symbol
 
-        # Load today's CS tickers parquet (cached by universe build) so only
-        # confirmed common stocks enter the forward-return watchlist.
-        # Falls back to the EXCLUDE_SYMBOLS hard-list when the parquet is absent.
-        _cs_set: set | None = None
+        # Build IWL state for confirming-signal fields (options, vdu, consecutive_days)
+        iwl_state: dict[str, dict] = {}
+        if iwl is not None:
+            try:
+                iwl_state = {e["symbol"]: e for e in iwl.get_candidates()}
+            except Exception:
+                pass
+
+        # Select top-5 using strict qualification + sector concentration cap
+        top5 = select_top_candidates(results, iwl_state, _is_common_stock)
+        top5_symbols = {item[0].symbol for item in top5}
+
+        # ── Clean today's watchlist: keep only top-5, drop known non-CS ────────
+        today_str = date.today().isoformat()
         try:
-            from quantlab.universe import _cs_cache_path
-            import pyarrow.parquet as _pq
-            from datetime import timedelta as _td2
-            for _d in range(7):
-                _cp = _cs_cache_path(date.today() - _td2(days=_d))
-                if _cp.exists():
-                    _cs_set = set(_pq.read_table(str(_cp)).to_pydict().get("symbol", []))
-                    break
-        except Exception:
-            pass
+            import duckdb as _ddb
+            from quantlab.storage import DB_PATH as _DB
+            _con = _ddb.connect(str(_DB))
 
-        def _is_common_stock(sym: str) -> bool:
-            if _cs_set is not None:
-                return sym in _cs_set
-            return not _is_excluded_symbol(sym)
+            if top5_symbols:
+                _ph = ",".join(["?"] * len(top5_symbols))
+                _con.execute(
+                    f"DELETE FROM watchlist "
+                    f"WHERE date_added=? AND status='watching' AND symbol NOT IN ({_ph})",
+                    [today_str, *top5_symbols],
+                )
+            else:
+                _con.execute(
+                    "DELETE FROM watchlist WHERE date_added=? AND status='watching'",
+                    [today_str],
+                )
 
-        added = sum(
-            1 for r in results
-            if _is_common_stock(r.symbol) and add_to_watchlist(r)
-        )
-        total_qualifying = sum(1 for r in results if r.conviction_score >= 0.70)
-        print(f"watchlist → {added}/{total_qualifying} setup(s) added "
-              f"(conviction ≥ 0.70)")
+            for _bad in EXCLUDE_SYMBOLS:
+                _con.execute(
+                    "DELETE FROM watchlist WHERE symbol=? AND status='watching'", [_bad]
+                )
+            _con.close()
+        except Exception as _cl_err:
+            print(f"  watchlist cleanup warning: {_cl_err}")
+
+        # ── Add top-5 to paper watchlist ─────────────────────────────────────
+        added = sum(1 for item in top5 if add_to_watchlist(item[0]))
+        n_qual = len([
+            r for r in results
+            if r.stage == 2 and _is_common_stock(r.symbol) and r.conviction_score >= 0.70
+        ])
+        print(f"\nwatchlist → {n_qual} qualifying | top {len(top5)} selected | {added} added")
+        for item in top5:
+            r, earn, cdays = item
+            iwl_e = iwl_state.get(r.symbol, {})
+            print(
+                f"  ★ {r.symbol:<8}  conv={r.conviction_score:.2f}  "
+                f"day={cdays}  earn={earn:.2f}  "
+                f"opts={'✓' if iwl_e.get('options_signal') else '–'}  "
+                f"vdu={'✓' if iwl_e.get('volume_dry_up') else '–'}"
+            )
 
 
 if __name__ == "__main__":
