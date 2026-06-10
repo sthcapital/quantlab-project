@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 _CDN = "https://cdn.cboe.com/api/global/us_indices/daily_prices"
 _VIX_URL        = f"{_CDN}/VIX_History.csv"
 _TOTAL_PCR_URL  = f"{_CDN}/PC_History.csv"
 _EQUITY_PCR_URL = f"{_CDN}/EQUITY_PC_History.csv"
 _INDEX_PCR_URL  = f"{_CDN}/INDEX_PC_History.csv"
-_HEADERS = {"User-Agent": "QuantLab Research quantlab@sthcapital.com"}
+_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; QuantLab/1.0; +https://sthcapital.com)"}
+
+# CBOE index option underlyings — excluded from equity PCR, included in index PCR
+_INDEX_UNDERLYINGS: frozenset[str] = frozenset({
+    "SPX", "SPXW", "NDX", "NDXP", "RUT", "RUTW",
+    "VIX", "VIXW", "XSP", "DJX", "OEX", "XEO", "MNX",
+})
 
 
 @dataclass(frozen=True)
@@ -74,15 +83,26 @@ class PcrBar:
 
 def _fetch_pcr(url: str, start: date, end: date) -> list[PcrBar]:
     """
-    Generic helper: download a CBOE PCR CSV and return PcrBars in [start, end].
+    Download a CBOE PCR CSV from the CDN and return PcrBars in [start, end].
 
     CBOE PCR files use the column layout:
         DATE, CALL, PUT, TOTAL
-    where TOTAL is the put/call ratio.  Falls back to CLOSE if TOTAL is absent
-    (some index PCR files use a different column name).
+    where TOTAL is the put/call ratio.  Returns an empty list (never raises)
+    when the CDN is unavailable — CBOE restricted PCR CSV access in 2025.
     """
-    resp = requests.get(url, headers=_HEADERS, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", "?")
+        logger.warning(
+            "CBOE PCR CDN returned %s for %s — PCR unavailable from CDN",
+            status, url,
+        )
+        return []
+    except requests.RequestException as exc:
+        logger.warning("CBOE PCR request failed (%s) — PCR unavailable", exc)
+        return []
 
     bars: list[PcrBar] = []
     reader = csv.DictReader(io.StringIO(resp.text))
@@ -93,7 +113,6 @@ def _fetch_pcr(url: str, start: date, end: date) -> list[PcrBar]:
             continue
         if dt < start or dt > end:
             continue
-        # CBOE PCR files: TOTAL = put/call ratio; fall back to CLOSE
         raw = row.get("TOTAL") or row.get("CLOSE") or row.get("P/C Ratio", "")
         try:
             bars.append(PcrBar(date=dt, close=float(raw)))
@@ -104,19 +123,109 @@ def _fetch_pcr(url: str, start: date, end: date) -> list[PcrBar]:
     return bars
 
 
+def _pcr_from_flat_file(trade_date: date) -> "tuple[float, float, float] | None":
+    """
+    Compute (equity_pcr, total_pcr, index_pcr) from the Massive options flat file.
+
+    Returns None when no flat file is cached for trade_date.  Uses volume
+    aggregated by option_type ('C'/'P') across all underlyings; separates
+    equity vs index using _INDEX_UNDERLYINGS.
+    """
+    try:
+        from quantlab.providers.flat_files import FlatFileProvider
+        import pyarrow.parquet as pq
+
+        path = FlatFileProvider().options_cache_path(trade_date)
+        if not path.exists():
+            return None
+
+        tbl = pq.read_table(
+            str(path), columns=["option_type", "volume", "underlying"]
+        ).to_pydict()
+
+        eq_puts = eq_calls = idx_puts = idx_calls = 0
+        for opt_type, vol, underlying in zip(
+            tbl["option_type"], tbl["volume"], tbl["underlying"]
+        ):
+            if not vol:
+                continue
+            is_index = underlying in _INDEX_UNDERLYINGS
+            if opt_type == "P":
+                if is_index:
+                    idx_puts += vol
+                else:
+                    eq_puts += vol
+            elif opt_type == "C":
+                if is_index:
+                    idx_calls += vol
+                else:
+                    eq_calls += vol
+
+        eq_pcr    = eq_puts  / eq_calls   if eq_calls  > 0 else 0.0
+        idx_pcr   = idx_puts / idx_calls  if idx_calls > 0 else 0.0
+        total_pcr = (eq_puts + idx_puts) / (eq_calls + idx_calls) \
+                    if (eq_calls + idx_calls) > 0 else 0.0
+        return round(eq_pcr, 4), round(total_pcr, 4), round(idx_pcr, 4)
+
+    except Exception as exc:
+        logger.debug("Flat-file PCR computation failed for %s: %s", trade_date, exc)
+        return None
+
+
+def _flat_file_pcr_range(
+    start: date, end: date, kind: str
+) -> list[PcrBar]:
+    """
+    Compute PCR for each cached flat-file day in [start, end].
+
+    kind: 'equity' | 'total' | 'index'
+    """
+    from datetime import timedelta
+
+    bars: list[PcrBar] = []
+    d = start
+    while d <= end:
+        result = _pcr_from_flat_file(d)
+        if result is not None:
+            eq_pcr, total_pcr, idx_pcr = result
+            val = {"equity": eq_pcr, "total": total_pcr, "index": idx_pcr}.get(kind, 0.0)
+            if val > 0.0:
+                bars.append(PcrBar(date=d, close=val))
+        d += timedelta(days=1)
+    return bars
+
+
 def fetch_total_pcr(start: date, end: date) -> list[PcrBar]:
-    """Download CBOE total (equity + index) put/call ratio history."""
-    return _fetch_pcr(_TOTAL_PCR_URL, start, end)
+    """
+    Return CBOE total (equity + index) put/call ratio for [start, end].
+    Tries CBOE CDN first; falls back to Massive flat-file computation.
+    """
+    bars = _fetch_pcr(_TOTAL_PCR_URL, start, end)
+    if not bars:
+        bars = _flat_file_pcr_range(start, end, "total")
+    return bars
 
 
 def fetch_equity_pcr(start: date, end: date) -> list[PcrBar]:
-    """Download CBOE equity-only put/call ratio history."""
-    return _fetch_pcr(_EQUITY_PCR_URL, start, end)
+    """
+    Return CBOE equity-only put/call ratio for [start, end].
+    Tries CBOE CDN first; falls back to Massive flat-file computation.
+    """
+    bars = _fetch_pcr(_EQUITY_PCR_URL, start, end)
+    if not bars:
+        bars = _flat_file_pcr_range(start, end, "equity")
+    return bars
 
 
 def fetch_index_pcr(start: date, end: date) -> list[PcrBar]:
-    """Download CBOE index-only put/call ratio history."""
-    return _fetch_pcr(_INDEX_PCR_URL, start, end)
+    """
+    Return CBOE index-only put/call ratio for [start, end].
+    Tries CBOE CDN first; falls back to Massive flat-file computation.
+    """
+    bars = _fetch_pcr(_INDEX_PCR_URL, start, end)
+    if not bars:
+        bars = _flat_file_pcr_range(start, end, "index")
+    return bars
 
 
 def classify_pcr_regime(pcr: float) -> tuple[str, int]:
