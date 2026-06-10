@@ -5876,8 +5876,8 @@ class TestEdgarYoYMetrics:
             revenue_yoy_pct=0.50,
         )
         score = compute_earnings_acceleration(snap)
-        # 50% YoY is exactly at the ≥50% threshold → 50-100% band → base=0.6, no accel bonus
-        assert score == pytest.approx(0.60, abs=1e-4)
+        # 50% YoY → base=0.6, no accel bonus, rev_mod=+0.05 (rev +50% ≥ 10%) → 0.65
+        assert score == pytest.approx(0.65, abs=1e-4)
 
     # ── Legacy QoQ fallback ───────────────────────────────────────────────────
 
@@ -5962,8 +5962,8 @@ class TestEdgarYoYMetrics:
         snap.eps_yoy_history     = [0.16, 0.19, 0.22]
         snap.is_accelerating = True   # eps 0.22 > 0.19; rev 0.17 > 0.15 → both improving
         score = compute_earnings_acceleration(snap)
-        # 22% in 0-50% band → 0.3 + 0.1 accel = 0.4
-        assert score == pytest.approx(0.40, abs=1e-4)
+        # 22% in 0-50% band → 0.3 + 0.1 accel + 0.05 rev_mod (rev +17% ≥ 10%) = 0.45
+        assert score == pytest.approx(0.45, abs=1e-4)
         print(format_yoy_summary(snap, score))  # shows: AAPL: revenue_yoy=+17% eps_yoy=+22% ...
 
     def test_nvda_like_hypergrowth_scores_high_band(self):
@@ -5990,8 +5990,8 @@ class TestEdgarYoYMetrics:
         snap.eps_yoy_history     = [1.20, 0.80, 0.45]  # decelerating
         snap.is_accelerating = False   # both rates falling
         score = compute_earnings_acceleration(snap)
-        # 45% in 0-50% band → 0.3, no accel bonus
-        assert score == pytest.approx(0.30, abs=1e-4)
+        # 45% in 0-50% band → 0.3, no accel bonus, rev_mod=+0.05 (rev +37% ≥ 10%) = 0.35
+        assert score == pytest.approx(0.35, abs=1e-4)
         print(format_yoy_summary(snap, score))  # CELH: ... accelerating=False score=0.30
 
     def test_scoring_band_boundaries(self):
@@ -6017,6 +6017,73 @@ class TestEdgarYoYMetrics:
         assert _score(0.999) == pytest.approx(0.8,  abs=1e-4)   # just below 100%
         assert _score(1.00)  == pytest.approx(1.0,  abs=1e-4)   # exactly 100% → explosive
         assert _score(5.00)  == pytest.approx(1.0,  abs=1e-4)   # hypergrowth
+
+    # ── _revenue_quality_modifier boundaries ─────────────────────────────────
+
+    def test_rev_modifier_strong_growth_gives_bonus(self):
+        from quantlab.providers.edgar import _revenue_quality_modifier
+        assert _revenue_quality_modifier(0.10)  == pytest.approx(0.05)  # exactly 10%
+        assert _revenue_quality_modifier(0.31)  == pytest.approx(0.05)  # VIRT-like +31%
+        assert _revenue_quality_modifier(1.00)  == pytest.approx(0.05)  # hypergrowth
+
+    def test_rev_modifier_weak_growth_neutral(self):
+        from quantlab.providers.edgar import _revenue_quality_modifier
+        assert _revenue_quality_modifier(0.0)   == pytest.approx(0.0)
+        assert _revenue_quality_modifier(0.06)  == pytest.approx(0.0)   # CVS-like +6%
+        assert _revenue_quality_modifier(0.099) == pytest.approx(0.0)   # just below 10%
+
+    def test_rev_modifier_mild_decline_penalty(self):
+        from quantlab.providers.edgar import _revenue_quality_modifier
+        assert _revenue_quality_modifier(-0.001) == pytest.approx(-0.10)  # just below 0
+        assert _revenue_quality_modifier(-0.05)  == pytest.approx(-0.10)  # -5%
+        assert _revenue_quality_modifier(-0.10)  == pytest.approx(-0.10)  # exactly -10%
+
+    def test_rev_modifier_serious_decline_penalty(self):
+        from quantlab.providers.edgar import _revenue_quality_modifier
+        assert _revenue_quality_modifier(-0.101) == pytest.approx(-0.20)  # just past -10%
+        assert _revenue_quality_modifier(-0.15)  == pytest.approx(-0.20)  # -15%
+        assert _revenue_quality_modifier(-0.25)  == pytest.approx(-0.20)  # exactly -25%
+        assert _revenue_quality_modifier(-0.251) == pytest.approx(-0.30)  # just past -25%
+        assert _revenue_quality_modifier(-0.50)  == pytest.approx(-0.30)  # -50%
+
+    def test_rev_modifier_none_is_neutral(self):
+        from quantlab.providers.edgar import _revenue_quality_modifier
+        assert _revenue_quality_modifier(None) == pytest.approx(0.0)
+
+    def test_rev_modifier_applied_in_yoy_path(self):
+        """Revenue modifier shifts the score when revenue_yoy_pct is set."""
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # EPS +90% → base=0.8; revenue +31% → +0.05 modifier
+        snap_with_rev = self._snap(
+            eps_yoy_history=[0.60, 0.75, 0.90], eps_yoy_pct=0.90,
+            revenue_yoy_pct=0.31,
+        )
+        snap_no_rev = self._snap(
+            eps_yoy_history=[0.60, 0.75, 0.90], eps_yoy_pct=0.90,
+        )
+        assert compute_earnings_acceleration(snap_with_rev) == pytest.approx(0.85, abs=1e-4)
+        assert compute_earnings_acceleration(snap_no_rev)   == pytest.approx(0.80, abs=1e-4)
+
+    def test_rev_modifier_declining_revenue_penalizes_eps_score(self):
+        """Revenue -30% (< -25%) applies -0.30 penalty to an otherwise strong EPS score."""
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        snap = self._snap(
+            eps_yoy_history=[0.60, 0.80, 1.00], eps_yoy_pct=1.00,  # explosive EPS
+            revenue_yoy_pct=-0.30,  # serious red flag
+        )
+        # base=1.0, rev_mod=-0.30 → 0.70
+        assert compute_earnings_acceleration(snap) == pytest.approx(0.70, abs=1e-4)
+
+    def test_rev_modifier_not_applied_in_legacy_qoq_path(self):
+        """Legacy QoQ fallback (< 5 quarters) ignores revenue_yoy_pct."""
+        from quantlab.providers.edgar import compute_earnings_acceleration
+        # Only 3 EPS quarters — falls back to QoQ, no YoY path
+        snap = self._snap(
+            eps_history=[1.0, 1.2, 1.5],
+            revenue_yoy_pct=-0.50,   # would be a big penalty in the YoY path
+        )
+        score = compute_earnings_acceleration(snap)
+        assert score > 0.5   # QoQ acceleration still shows through; modifier ignored
 
 
 # ══════════════════════════════════════════════════════════════════════════════

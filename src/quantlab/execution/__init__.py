@@ -880,6 +880,7 @@ def run_universe_scan(
             from quantlab.providers.edgar import (
                 get_edgar_acceleration as _get_edgar_accel,
                 get_edgar_eps_growth as _get_edgar_eps_growth,
+                get_edgar_revenue_growth as _get_edgar_rev_growth,
                 get_next_earnings_date as _get_next_earnings,
                 get_last_earnings_result as _get_last_earnings,
                 count_trading_days as _count_trading_days,
@@ -888,6 +889,7 @@ def run_universe_scan(
         except Exception:
             _get_edgar_accel = None           # type: ignore[assignment]
             _get_edgar_eps_growth = None      # type: ignore[assignment]
+            _get_edgar_rev_growth = None      # type: ignore[assignment]
             _get_next_earnings = None         # type: ignore[assignment]
             _get_last_earnings = None         # type: ignore[assignment]
             _count_trading_days = None        # type: ignore[assignment]
@@ -930,13 +932,28 @@ def run_universe_scan(
                     except Exception as _ea_err:
                         logger.debug("%s: EDGAR acceleration unavailable: %s", symbol, _ea_err)
 
-                # EPS growth rate from EDGAR cache.
+                # EPS and revenue growth rates from EDGAR cache (for veto + logging).
                 _eps_growth: float | None = None
                 if _get_edgar_eps_growth is not None:
                     try:
                         _eps_growth = _get_edgar_eps_growth(symbol)
                     except Exception:
                         pass
+
+                _rev_growth: float | None = None
+                if _get_edgar_rev_growth is not None:
+                    try:
+                        _rev_growth = _get_edgar_rev_growth(symbol)
+                    except Exception:
+                        pass
+
+                if edgar_accel is not None:
+                    _eps_pct = f"{_eps_growth * 100:+.0f}%" if _eps_growth is not None else "N/A"
+                    _rev_pct = f"{_rev_growth * 100:+.0f}%" if _rev_growth is not None else "N/A"
+                    logger.debug(
+                        "%s: edgar_accel=%.2f  eps_yoy=%s  rev_yoy=%s",
+                        symbol, edgar_accel, _eps_pct, _rev_pct,
+                    )
 
                 # PEG score from EDGAR cache.
                 _peg_score: float = 0.0

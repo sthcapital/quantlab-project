@@ -538,6 +538,27 @@ def get_edgar_eps_growth(symbol: str, max_age_days: int = 7) -> Optional[float]:
         return None
 
 
+def get_edgar_revenue_growth(symbol: str, max_age_days: int = 7) -> Optional[float]:
+    """Return cached YoY revenue growth rate for symbol from edgar_fundamentals, or None."""
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+
+        cutoff = (date.today() - timedelta(days=max_age_days)).isoformat()
+        con = duckdb.connect(str(DB_PATH))
+        _ensure_edgar_table(con)
+        row = con.execute(
+            "SELECT revenue_growth FROM edgar_fundamentals "
+            "WHERE symbol = ? AND fetch_date >= ? "
+            "ORDER BY fetch_date DESC LIMIT 1",
+            [symbol, cutoff],
+        ).fetchone()
+        con.close()
+        return float(row[0]) if row is not None and row[0] is not None else None
+    except Exception:
+        return None
+
+
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
 # ── Earnings calendar helpers ─────────────────────────────────────────────────
@@ -975,6 +996,33 @@ def format_yoy_summary(snap: FundamentalSnapshot, score: float) -> str:
     )
 
 
+def _revenue_quality_modifier(revenue_yoy_pct: Optional[float]) -> float:
+    """
+    Revenue-quality adjustment applied on top of the EPS-based score.
+
+    Rewards EPS growth confirmed by strong revenue; penalises EPS growth
+    unsupported (or contradicted) by revenue trends.
+
+        revenue growing  ≥ 10%              → +0.05  (confirms EPS strength)
+        revenue growing   0–10%             →  0.00  (neutral)
+        revenue declining 0–10%  (≥ −10%)  → −0.10  (mild concern)
+        revenue declining 10–25% (≥ −25%)  → −0.20  (EPS may not be sustainable)
+        revenue declining  >25%  (< −25%)  → −0.30  (serious red flag)
+        revenue_yoy_pct is None             →  0.00  (no data — no penalty)
+    """
+    if revenue_yoy_pct is None:
+        return 0.0
+    if revenue_yoy_pct >= 0.10:
+        return 0.05
+    if revenue_yoy_pct >= 0.0:
+        return 0.0
+    if revenue_yoy_pct >= -0.10:
+        return -0.10
+    if revenue_yoy_pct >= -0.25:
+        return -0.20
+    return -0.30
+
+
 def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     """
     Score 0.0–1.0 reflecting year-over-year earnings growth and acceleration trend.
@@ -995,6 +1043,13 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
         acceleration bonus: +0.10 when snap.is_accelerating is True
                             (latest YoY rate > prior quarter YoY rate,
                             for BOTH revenue AND eps)
+        revenue quality modifier (snap.revenue_yoy_pct):
+            ≥ 10%       → +0.05  (revenue confirms EPS strength)
+            0–10%       →  0.00  (neutral)
+            declining 0–10%    → −0.10  (mild concern)
+            declining 10–25%   → −0.20  (EPS growth may not be sustainable)
+            declining  >25%    → −0.30  (serious red flag)
+            None        →  0.00  (no data — no penalty)
         result clamped to [0.0, 1.0]
 
     Interpretation:
@@ -1005,6 +1060,7 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
         0.8   — 70–100% YoY — O'Neil-grade growth (historically leads big winners)
         1.0   — > 100% YoY — explosive hypergrowth
         +0.10 — acceleration trend on top of the above band
+        ±0.05/0.10/0.20/0.30 — revenue quality modifier
     """
     # ── Ensure EPS YoY is computed when not pre-filled ────────────────────────
     # eps_yoy_history is empty when < 5 EDGAR periods are available OR when the
@@ -1042,7 +1098,8 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
         else:
             base = 1.0   # >100%  — explosive
         bonus = 0.10 if snap.is_accelerating else 0.0
-        return round(min(1.0, max(0.0, base + bonus)), 4)
+        rev_mod = _revenue_quality_modifier(snap.revenue_yoy_pct)
+        return round(min(1.0, max(0.0, base + bonus + rev_mod)), 4)
 
     # ── Legacy QoQ fallback (< 5 quarters of data) ───────────────────────────
     history = snap.eps_history if len(snap.eps_history) >= 3 else snap.net_income_history
