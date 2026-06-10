@@ -6111,8 +6111,10 @@ class TestAdjustedEpsFrom8K:
             raise ValueError(f"Unexpected URL: {url}")
 
         monkeypatch.setattr(_req, "get", mock_get)
-        result = _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS")
-        assert result == pytest.approx((2.57, 2.25))
+        adj_eps, prior_adj_eps, surprise_pct = _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS")
+        assert adj_eps    == pytest.approx(2.57)
+        assert prior_adj_eps == pytest.approx(2.25)
+        assert surprise_pct is None  # no consensus comparison in test press release
 
     def test_fetch_no_recent_8k_returns_none(self, monkeypatch):
         """No 8-K in submissions → (None, None)."""
@@ -6130,10 +6132,10 @@ class TestAdjustedEpsFrom8K:
             }}}
 
         monkeypatch.setattr(_req, "get", lambda url, headers=None, timeout=30: _R())
-        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None)
+        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None, None)
 
     def test_fetch_8k_outside_90_days_returns_none(self, monkeypatch):
-        """8-K exists but older than 90 days → (None, None)."""
+        """8-K exists but older than 90 days → (None, None, None)."""
         import quantlab.providers.edgar as _edgar
         import requests as _req
 
@@ -6148,10 +6150,10 @@ class TestAdjustedEpsFrom8K:
             }}}
 
         monkeypatch.setattr(_req, "get", lambda url, headers=None, timeout=30: _R())
-        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None)
+        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None, None)
 
     def test_fetch_no_ex991_returns_none(self, monkeypatch):
-        """8-K present but no EX-99.1 in filing index → (None, None)."""
+        """8-K present but no EX-99.1 in filing index → (None, None, None)."""
         import quantlab.providers.edgar as _edgar
         import requests as _req
 
@@ -6179,7 +6181,7 @@ class TestAdjustedEpsFrom8K:
             raise ValueError(f"Unexpected: {url}")
 
         monkeypatch.setattr(_req, "get", mock_get)
-        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None)
+        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None, None)
 
     # ── compute_earnings_acceleration prefers adj_eps_yoy_pct ────────────────
 
@@ -6227,6 +6229,143 @@ class TestAdjustedEpsFrom8K:
         snap = FundamentalSnapshot(ticker="X", cik="0", as_of=date.today())
         assert snap.adj_eps is None
         assert snap.adj_eps_yoy_pct is None
+        assert snap.eps_surprise_pct is None
+
+    # ── EPS surprise parsing ──────────────────────────────────────────────────
+
+    def test_parse_surprise_estimate_pattern(self):
+        """vs. consensus of $X.XX — estimate given directly."""
+        from quantlab.providers.edgar import _parse_eps_surprise
+        text = "Adjusted EPS of $2.57 vs. consensus of $2.40 for the quarter."
+        surprise = _parse_eps_surprise(text, 2.57)
+        assert surprise == pytest.approx((2.57 - 2.40) / 2.40, rel=1e-4)
+
+    def test_parse_surprise_above_consensus_pattern(self):
+        """above the consensus estimate of $X.XX."""
+        from quantlab.providers.edgar import _parse_eps_surprise
+        text = "Results above the consensus estimate of $3.00."
+        surprise = _parse_eps_surprise(text, 3.30)
+        assert surprise == pytest.approx(0.10, rel=1e-4)
+
+    def test_parse_surprise_beat_amount_pattern(self):
+        """beat estimates by $X.XX — beat amount, not the estimate."""
+        from quantlab.providers.edgar import _parse_eps_surprise
+        text = "The company beat the estimates by $0.15."
+        # actual=2.57, beat=0.15 → estimate=2.42 → surprise=0.15/2.42
+        surprise = _parse_eps_surprise(text, 2.57)
+        assert surprise == pytest.approx(0.15 / 2.42, rel=1e-4)
+
+    def test_parse_surprise_no_match_returns_none(self):
+        from quantlab.providers.edgar import _parse_eps_surprise
+        assert _parse_eps_surprise("Revenue grew 15% year over year.", 2.57) is None
+        assert _parse_eps_surprise("", 1.0) is None
+
+    def test_fetch_cvs_surprise_parsed_when_present(self, monkeypatch):
+        """Full flow with a press release that contains a consensus comparison."""
+        import quantlab.providers.edgar as _edgar
+        import requests as _req
+
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        PRESS_RELEASE = (
+            "Adjusted EPS of $2.57 increased from $2.25. "
+            "Results above the consensus estimate of $2.40."
+        )
+        INDEX_HTML = (
+            '<td scope="row">EX-99.1</td>'
+            '<td scope="row">'
+            '<a href="/Archives/edgar/data/64803/000006480326042428/cvs_ex99x1q1-26.htm">'
+            "cvs_ex99x1q1-26.htm</a></td>"
+        )
+
+        class _R:
+            def __init__(self, data): self._d = data; self.text = data if isinstance(data, str) else ""
+            def raise_for_status(self): pass
+            def json(self): return self._d
+
+        def mock_get(url, headers=None, timeout=30):
+            if "submissions" in url:
+                return _R({"filings": {"recent": {
+                    "form":            ["8-K"],
+                    "filingDate":      ["2026-05-06"],
+                    "accessionNumber": ["0000064803-26-042428"],
+                    "items":           ["2.02,9.01"],
+                }}})
+            if "index.html" in url:
+                return _R(INDEX_HTML)
+            if "cvs_ex99x1q1-26.htm" in url:
+                return _R(PRESS_RELEASE)
+            raise ValueError(f"Unexpected URL: {url}")
+
+        monkeypatch.setattr(_req, "get", mock_get)
+        adj_eps, prior_adj_eps, surprise_pct = _edgar.fetch_adjusted_eps_from_8k(
+            "0000064803", "CVS"
+        )
+        assert adj_eps == pytest.approx(2.57)
+        assert prior_adj_eps == pytest.approx(2.25)
+        assert surprise_pct == pytest.approx((2.57 - 2.40) / 2.40, rel=1e-4)
+
+    # ── Annual period filter (_remove_annual_outliers) ────────────────────────
+
+    def test_remove_annual_outliers_basic(self):
+        """Annual totals ~4x quarterly are removed."""
+        from quantlab.providers.edgar import _remove_annual_outliers
+        # Pattern: Q1, Q2, Annual(~4x), Q4 for two years
+        values = [6.0, 7.0, 25.0, 3.0, 6.5, 7.2, 24.0, 2.8]
+        cleaned = _remove_annual_outliers(values)
+        assert 25.0 not in cleaned
+        assert 24.0 not in cleaned
+        # Quarterly values preserved
+        assert all(v in cleaned for v in [6.0, 7.0, 3.0, 6.5, 7.2, 2.8])
+
+    def test_remove_annual_outliers_no_outliers(self):
+        """Clean quarterly array is returned unchanged."""
+        from quantlab.providers.edgar import _remove_annual_outliers
+        values = [6.0, 7.0, 6.5, 7.2, 6.8, 7.5, 7.0, 7.8]
+        assert _remove_annual_outliers(values) == values
+
+    def test_remove_annual_outliers_short_array(self):
+        """Arrays with fewer than 3 elements are returned unchanged."""
+        from quantlab.providers.edgar import _remove_annual_outliers
+        assert _remove_annual_outliers([]) == []
+        assert _remove_annual_outliers([5.0]) == [5.0]
+        assert _remove_annual_outliers([5.0, 6.0]) == [5.0, 6.0]
+
+    def test_remove_annual_outliers_endpoints_not_removed(self):
+        """First and last values are never removed (only one neighbor)."""
+        from quantlab.providers.edgar import _remove_annual_outliers
+        # 25 at position 0 and 24 at last position — should NOT be removed
+        values = [25.0, 6.0, 7.0, 24.0]
+        assert _remove_annual_outliers(values) == values
+
+    def test_extract_periods_filters_annual_durations(self):
+        """_extract_periods drops observations with duration > 120 days."""
+        from quantlab.providers.edgar import _extract_periods
+
+        # Build synthetic EDGAR facts with quarterly and annual observations
+        # for the same end date (Dec 31) — as happens in 10-K filings
+        facts = {"us-gaap": {"EarningsPerShareDiluted": {"units": {"USD/shares": [
+            # Q1: 90-day period
+            {"form": "10-Q", "start": "2025-01-01", "end": "2025-03-31",
+             "val": 2.0, "filed": "2025-05-01", "accn": "A1"},
+            # Q2: 91-day period
+            {"form": "10-Q", "start": "2025-04-01", "end": "2025-06-30",
+             "val": 2.5, "filed": "2025-08-01", "accn": "A2"},
+            # Q3: 92-day period
+            {"form": "10-Q", "start": "2025-07-01", "end": "2025-09-30",
+             "val": 2.8, "filed": "2025-11-01", "accn": "A3"},
+            # Annual (full-year 10-K): 365-day period — should be EXCLUDED
+            {"form": "10-K", "start": "2025-01-01", "end": "2025-12-31",
+             "val": 10.5, "filed": "2026-02-15", "accn": "A4"},
+            # Q4 (also from 10-K, 91-day period): should be KEPT
+            {"form": "10-K", "start": "2025-10-01", "end": "2025-12-31",
+             "val": 3.2, "filed": "2026-02-15", "accn": "A4"},
+        ]}}}}
+
+        result = _extract_periods(facts, "eps_diluted", 8)
+        assert 10.5 not in result, "Annual total must be filtered out"
+        assert 3.2 in result, "Q4 quarterly from 10-K must be kept"
+        assert result == pytest.approx([2.0, 2.5, 2.8, 3.2])
 
 
 # ══════════════════════════════════════════════════════════════════════════════

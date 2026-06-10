@@ -103,6 +103,7 @@ class FundamentalSnapshot:
     # Adjusted (non-GAAP) EPS from most recent 8-K press release (Exhibit 99.1)
     adj_eps: Optional[float] = None
     adj_eps_yoy_pct: Optional[float] = None   # (current - prior) / abs(prior)
+    eps_surprise_pct: Optional[float] = None  # (adj_eps - consensus) / abs(consensus)
 
 
 # ── CIK lookup — cached for process lifetime ──────────────────────────────────
@@ -157,6 +158,8 @@ def _ensure_edgar_table(con) -> None:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN adj_eps DOUBLE")
         if "adj_eps_yoy_pct" not in cols:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN adj_eps_yoy_pct DOUBLE")
+        if "eps_surprise_pct" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_surprise_pct DOUBLE")
     except Exception:
         pass
 
@@ -213,8 +216,8 @@ def _save_edgar_cache(
             INSERT OR REPLACE INTO edgar_fundamentals
                 (symbol, fetch_date, acceleration_score, revenue_growth,
                  eps_growth, consecutive_beats, eps_diluted,
-                 adj_eps, adj_eps_yoy_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 adj_eps, adj_eps_yoy_pct, eps_surprise_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 symbol,
@@ -226,6 +229,7 @@ def _save_edgar_cache(
                 snap.eps_diluted,
                 snap.adj_eps,
                 snap.adj_eps_yoy_pct,
+                snap.eps_surprise_pct,
             ],
         )
         con.close()
@@ -236,7 +240,13 @@ def _save_edgar_cache(
 # ── Fundamental data fetching ─────────────────────────────────────────────────
 
 def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
-    """Extract up to `periods` quarterly values for a metric. Returns oldest-first."""
+    """Extract up to `periods` quarterly values for a metric. Returns oldest-first.
+
+    Annual periods (duration > 120 days) are excluded so that 10-K full-year
+    totals — which EDGAR XBRL often reports alongside Q4 quarterly values under
+    the same period-end date — do not contaminate the quarterly history used for
+    YoY growth calculations.
+    """
     gaap_fields = _GAAP_FIELDS.get(metric, [])
     us_gaap = facts.get("us-gaap", {})
 
@@ -254,10 +264,29 @@ def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
         if not unit_data:
             continue
 
-        quarterly = [
-            obs for obs in unit_data
-            if obs.get("form") in ("10-Q", "10-K") and obs.get("end")
-        ]
+        quarterly = []
+        for obs in unit_data:
+            if obs.get("form") not in ("10-Q", "10-K"):
+                continue
+            if not obs.get("end"):
+                continue
+            # Duration filter: skip annual/semi-annual periods.
+            # Quarterly ≈ 60-105 days; annual ≈ 365 days.  Threshold 120 days
+            # correctly separates them while tolerating calendar irregularities.
+            # Only applied when "start" is present (instant balance-sheet facts
+            # such as Assets and SharesOutstanding have no "start" field).
+            if obs.get("start"):
+                try:
+                    duration = (
+                        date.fromisoformat(obs["end"])
+                        - date.fromisoformat(obs["start"])
+                    ).days
+                    if duration > 120:
+                        continue  # annual or semi-annual — exclude
+                except (ValueError, KeyError):
+                    pass  # malformed dates — keep conservatively
+            quarterly.append(obs)
+
         if not quarterly:
             continue
 
@@ -267,9 +296,34 @@ def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
             seen[obs["end"]] = obs["val"]
 
         values = [seen[k] for k in sorted(seen.keys())]
+        # Secondary defense: remove any value that is >2.5x both its neighbors.
+        # Annual totals that slip through the duration filter are ~4x quarterly.
+        values = _remove_annual_outliers(values)
         return values[-periods:]
 
     return []
+
+
+def _remove_annual_outliers(values: list[float]) -> list[float]:
+    """Remove interior values that are >2.5x both adjacent values.
+
+    Annual totals (~4x a quarterly figure) occasionally slip through the
+    duration filter when EDGAR XBRL start-date metadata is absent or
+    mis-tagged.  This secondary check catches them without touching
+    endpoint values (which have only one neighbor).
+    """
+    if len(values) < 3:
+        return values
+    to_remove: set[int] = set()
+    for i in range(1, len(values) - 1):
+        prev_abs = abs(values[i - 1])
+        curr_abs = abs(values[i])
+        next_abs = abs(values[i + 1])
+        if prev_abs < 1e-9 or next_abs < 1e-9:
+            continue
+        if curr_abs > 2.5 * prev_abs and curr_abs > 2.5 * next_abs:
+            to_remove.add(i)
+    return [v for i, v in enumerate(values) if i not in to_remove]
 
 
 def _qoq_growth(history: list[float]) -> Optional[float]:
@@ -716,6 +770,19 @@ def _strip_html(html: str) -> str:
     return re.sub(r'\s+', ' ', text)
 
 
+# EPS surprise — consensus estimate captured directly from the text
+_EPS_ESTIMATE_PATTERNS = [
+    re.compile(r'(?:versus|vs\.?)\s+(?:consensus|estimates?)\s+of\s+\$(\d+\.\d+)', re.I),
+    re.compile(r'above\s+(?:the\s+)?consensus\s+estimate\s+of\s+\$(\d+\.\d+)', re.I),
+    re.compile(r'compared?\s+to\s+(?:the\s+)?(?:consensus|estimate)\s+of\s+\$(\d+\.\d+)', re.I),
+]
+
+# EPS surprise — beat/miss *amount* captured (estimate = actual - beat_amount)
+_EPS_BEAT_AMOUNT_PATTERNS = [
+    re.compile(r'beat\s+(?:the\s+)?(?:estimates?|consensus)\s+by\s+\$(\d+\.\d+)', re.I),
+]
+
+
 def _parse_adjusted_eps(text: str) -> tuple[Optional[float], Optional[float]]:
     """Extract (current_adj_eps, prior_adj_eps) from press release text."""
     m = _ADJ_EPS_WITH_PRIOR_PATTERN.search(text)
@@ -736,21 +803,55 @@ def _parse_adjusted_eps(text: str) -> tuple[Optional[float], Optional[float]]:
     return (None, None)
 
 
+def _parse_eps_surprise(text: str, actual_eps: float) -> Optional[float]:
+    """
+    Parse EPS beat/miss vs. consensus from press release text.
+
+    Returns surprise_pct = (actual - estimate) / abs(estimate), or None.
+
+    Handles two text forms:
+    - Estimate given directly: "vs. consensus of $X.XX"
+    - Beat amount given: "beat estimates by $X.XX" → estimate = actual - beat
+    """
+    for pat in _EPS_ESTIMATE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            try:
+                estimate = float(m.group(1))
+                if abs(estimate) >= 0.01:
+                    return round((actual_eps - estimate) / abs(estimate), 6)
+            except (ValueError, IndexError):
+                continue
+
+    for pat in _EPS_BEAT_AMOUNT_PATTERNS:
+        m = pat.search(text)
+        if m:
+            try:
+                beat = float(m.group(1))
+                estimate = actual_eps - beat
+                if abs(estimate) >= 0.01:
+                    return round(beat / abs(estimate), 6)
+            except (ValueError, IndexError):
+                continue
+
+    return None
+
+
 def fetch_adjusted_eps_from_8k(
     cik: str, symbol: str
-) -> tuple[Optional[float], Optional[float]]:
+) -> tuple[Optional[float], Optional[float], Optional[float]]:
     """
-    Parse adjusted/non-GAAP EPS from the most recent EDGAR 8-K Exhibit 99.1.
-
-    Searches for the most recent 8-K filed within 90 days, locates Exhibit 99.1
-    (earnings press release), and parses adjusted EPS via regex.
+    Parse adjusted/non-GAAP EPS and EPS surprise from the most recent EDGAR
+    8-K Exhibit 99.1 (earnings press release).
 
     Args:
         cik:    Zero-padded 10-digit CIK string (e.g. "0000064803" for CVS).
         symbol: Ticker symbol — used for logging only.
 
     Returns:
-        (current_adj_eps, prior_adj_eps) or (None, None) if not found.
+        (current_adj_eps, prior_adj_eps, surprise_pct) or (None, None, None).
+        surprise_pct = (actual - consensus) / abs(consensus); None when the
+        press release contains no consensus comparison.
     """
     cutoff = date.today() - timedelta(days=90)
     cik_int = str(int(cik))  # strip leading zeros for EDGAR archive URLs
@@ -760,7 +861,7 @@ def fetch_adjusted_eps_from_8k(
         data = _edgar_get(_SUBMISSIONS_URL.format(cik=cik)).json()
     except Exception as exc:
         logger.debug("%s: fetch_adjusted_eps_from_8k submissions failed: %s", symbol, exc)
-        return (None, None)
+        return (None, None, None)
 
     recent       = data.get("filings", {}).get("recent", {})
     forms        = recent.get("form", [])
@@ -789,7 +890,7 @@ def fetch_adjusted_eps_from_8k(
 
     if target_acc is None:
         logger.debug("%s: no earnings 8-K found within 90 days", symbol)
-        return (None, None)
+        return (None, None, None)
 
     # Step 2: filing index HTML — locate Exhibit 99.1 filename
     acc_nodashes = target_acc.replace("-", "")
@@ -801,7 +902,7 @@ def fetch_adjusted_eps_from_8k(
         idx_html = _edgar_get(index_url).text
     except Exception as exc:
         logger.debug("%s: 8-K index fetch failed: %s", symbol, exc)
-        return (None, None)
+        return (None, None, None)
 
     # Parse index HTML: find the row with type EX-99 or EX-99.1 and extract the
     # direct archive href (not wrapped in XBRL viewer /ix?doc= prefix).
@@ -815,22 +916,25 @@ def fetch_adjusted_eps_from_8k(
 
     if ex991_url is None:
         logger.debug("%s: Exhibit 99.1 not found in 8-K filing index", symbol)
-        return (None, None)
+        return (None, None, None)
 
-    # Step 3: fetch press release and parse adjusted EPS
+    # Step 3: fetch press release and parse adjusted EPS + surprise vs. consensus
     try:
         pr_text = _edgar_get(ex991_url, timeout=60).text
     except Exception as exc:
         logger.debug("%s: Exhibit 99.1 fetch failed: %s", symbol, exc)
-        return (None, None)
+        return (None, None, None)
 
-    result = _parse_adjusted_eps(_strip_html(pr_text))
-    if result[0] is not None:
+    text = _strip_html(pr_text)
+    adj_eps, prior_adj_eps = _parse_adjusted_eps(text)
+    if adj_eps is not None:
+        surprise_pct = _parse_eps_surprise(text, adj_eps)
         logger.debug(
-            "%s: adjusted EPS from 8-K: current=%.2f  prior=%s",
-            symbol, result[0], result[1],
+            "%s: adjusted EPS from 8-K: current=%.2f  prior=%s  surprise=%s",
+            symbol, adj_eps, prior_adj_eps, surprise_pct,
         )
-    return result
+        return (adj_eps, prior_adj_eps, surprise_pct)
+    return (None, None, None)
 
 
 def format_yoy_summary(snap: FundamentalSnapshot, score: float) -> str:

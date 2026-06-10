@@ -98,13 +98,17 @@ def _process_symbol(symbol: str, force: bool, force_null: bool, con) -> str:
 
         # Enrich with adjusted (non-GAAP) EPS from 8-K press release when available
         try:
-            adj_eps, prior_adj_eps = fetch_adjusted_eps_from_8k(snap.cik, symbol)
+            adj_eps, prior_adj_eps, surprise_pct = fetch_adjusted_eps_from_8k(
+                snap.cik, symbol
+            )
             if adj_eps is not None:
                 snap.adj_eps = adj_eps
                 if prior_adj_eps is not None and abs(prior_adj_eps) >= 1e-9:
                     snap.adj_eps_yoy_pct = round(
                         (adj_eps - prior_adj_eps) / abs(prior_adj_eps), 6
                     )
+                if surprise_pct is not None:
+                    snap.eps_surprise_pct = surprise_pct
         except Exception:
             pass
 
