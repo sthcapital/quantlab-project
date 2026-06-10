@@ -118,6 +118,66 @@ def _styles() -> dict:
     return S
 
 
+# ── Pure-computation helpers (testable without ReportLab) ────────────────────
+
+def momentum_interpretation(up: int, dn: int, up_34: int = 0, dn_34: int = 0) -> str:
+    """
+    Generate a 1-2 sentence market interpretation from monthly and 34-day momentum counts.
+
+    Args:
+        up:    Stocks up ≥ 25% in the last 21 trading days.
+        dn:    Stocks down ≥ 25% in the last 21 trading days.
+        up_34: Stocks up ≥ 13% in the last 34 trading days.
+        dn_34: Stocks down ≥ 13% in the last 34 trading days.
+    """
+    ratio = up / max(dn, 1)
+    if ratio > 2.0:
+        main = (
+            f"Strong accumulation — {up} stocks made 25%+ monthly gains "
+            f"vs {dn} with similar losses. "
+            "Institutional money is actively deploying."
+        )
+    elif ratio >= 1.2:
+        main = (
+            "Moderate positive momentum — more stocks advancing "
+            "strongly than declining. "
+            "Market internals support selective long exposure."
+        )
+    elif ratio >= 0.8:
+        main = (
+            "Mixed momentum — advances and declines roughly balanced. "
+            "Wait for clearer directional signal before adding exposure."
+        )
+    else:
+        main = (
+            f"Distribution in progress — {dn} stocks declining sharply "
+            f"vs {up} advancing. Reduce risk, protect capital."
+        )
+
+    if up_34 > dn_34:
+        confirm = "34-day momentum confirms positive trend."
+    elif dn_34 > up_34:
+        confirm = "34-day momentum confirms negative trend."
+    else:
+        confirm = "34-day momentum is neutral."
+
+    return f"{main} {confirm}"
+
+
+def _compute_r_multiple(
+    entry_price: float | None,
+    atr_stop: float | None,
+    current_price: float | None,
+) -> float | None:
+    """Return R-multiple (current - entry) / (entry - stop), or None if inputs invalid."""
+    if not (entry_price and atr_stop and current_price):
+        return None
+    risk = entry_price - atr_stop
+    if risk <= 0:
+        return None
+    return (current_price - entry_price) / risk
+
+
 # ── Helper formatters ─────────────────────────────────────────────────────────
 
 def _pct(v) -> str:
@@ -238,33 +298,109 @@ def _page1(
                    colWidths=[2.2 * inch, CONTENT_W - 2.2 * inch]))
     e.append(Spacer(1, 0.15 * inch))
 
-    # ── Market breadth metrics ─────────────────────────────────────────────────
+    # ── Market Internals — grouped sections ───────────────────────────────────
     e.append(Paragraph("Market Internals", S["section"]))
+
+    # SPY MA distance values
+    _spy21_pct  = getattr(breadth_snap, "spy_pct_above_21ema",  0.0) if breadth_snap else None
+    _spy50_pct  = getattr(breadth_snap, "spy_pct_above_50sma",  0.0) if breadth_snap else None
+    _spy200_pct = getattr(breadth_snap, "spy_pct_above_200sma", 0.0) if breadth_snap else None
+
+    def _spy_str(pct):
+        if pct is None:
+            return "—"
+        d = "Above" if pct >= 0 else "Below"
+        return f"{d} ({pct:+.1f}%)"
+
+    def _spy_color(pct):
+        if pct is None or pct == 0.0:
+            return C_DGRAY
+        return C_GREEN if pct >= 0 else C_RED
+
+    spy21_str  = _spy_str(_spy21_pct)
+    spy50_str  = _spy_str(_spy50_pct)
+    spy200_str = _spy_str(_spy200_pct)
+    spy21_c    = _spy_color(_spy21_pct)
+    spy50_c    = _spy_color(_spy50_pct)
+    spy200_c   = _spy_color(_spy200_pct)
+
+    # Row layout:  [label, value, label, value]
+    # Header rows span all 4 columns (navy bg, white text).
+    # SPY trend value spans cols 1-3 (data in col 0 only in col 1).
+    _HDR_ROWS = [0, 4, 7, 11, 14]
+    _SPY_ROWS = [8, 9, 10]   # rows where value cell gets SPY color
     met_data = [
-        ["McClellan Oscillator", mcl,        "10-Day Breadth Ratio", ratio],
-        ["AD Line",              ad_ln,       "McClellan Summation",  summ],
-        ["% Above 10 SMA",       p10,         "UVOL/DVOL",            uvol_dvol_str],
-        ["% Above 20 SMA",       p20,         "% Above 50 SMA",       p50],
-        ["% Above 200 SMA",      p200,        "SPY vs 200 SMA",       spy_status],
-        ["VIX Close",            vix_str,     "VIX Regime",           vix_regime_str],
-        ["Equity PCR",           eq_pcr_str,  "PCR Regime",           pcr_regime_str],
-        ["Up 25% / Month",       up_25m_str,  "Dn 25% / Month",       dn_25m_str],
-        ["Up 13% / 34d",         up_13_34_str,"Dn 13% / 34d",         dn_13_34_str],
+        # 0 — section header
+        ["Breadth Momentum", "", "", ""],
+        # 1-3
+        ["McClellan Oscillator", mcl,         "McClellan Summation",  summ],
+        ["10-Day Breadth Ratio", ratio,        "AD Line",              ad_ln],
+        ["UVOL / DVOL",          uvol_dvol_str,"",                     ""],
+        # 4 — section header
+        ["Market Participation (% of stocks above MA)", "", "", ""],
+        # 5-6
+        ["% Above 10 SMA", p10, "% Above 20 SMA", p20],
+        ["% Above 50 SMA", p50, "% Above 200 SMA", p200],
+        # 7 — section header
+        ["SPY Trend", "", "", ""],
+        # 8-10
+        ["SPY vs 21 EMA",  spy21_str,  "", ""],
+        ["SPY vs 50 SMA",  spy50_str,  "", ""],
+        ["SPY vs 200 SMA", spy200_str, "", ""],
+        # 11 — section header
+        ["Volatility & Sentiment", "", "", ""],
+        # 12-13
+        ["VIX Close",   vix_str,     "VIX Regime",   vix_regime_str],
+        ["Equity PCR",  eq_pcr_str,  "PCR Regime",   pcr_regime_str],
+        # 14 — section header
+        ["Momentum", "", "", ""],
+        # 15-16
+        ["Up 25% / Month", up_25m_str,  "Dn 25% / Month", dn_25m_str],
+        ["Up 13% / 34d",   up_13_34_str,"Dn 13% / 34d",   dn_13_34_str],
     ]
     col_w = [1.8 * inch, 1.0 * inch, 1.8 * inch, 1.2 * inch]
-    met_tbl = Table(met_data, colWidths=col_w)
-    met_tbl.setStyle(TableStyle([
+
+    _met_style: list = [
         ("FONTNAME",  (0, 0), (-1, -1), "Helvetica"),
-        ("FONTNAME",  (0, 0), (0, -1), "Helvetica-Bold"),
-        ("FONTNAME",  (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTNAME",  (0, 0), (0, -1),  "Helvetica-Bold"),
+        ("FONTNAME",  (2, 0), (2, -1),  "Helvetica-Bold"),
         ("FONTSIZE",  (0, 0), (-1, -1), 8.5),
-        ("ALIGN",     (1, 0), (1, -1), "RIGHT"),
-        ("ALIGN",     (3, 0), (3, -1), "RIGHT"),
+        ("ALIGN",     (1, 0), (1, -1),  "RIGHT"),
+        ("ALIGN",     (3, 0), (3, -1),  "RIGHT"),
         ("ROWBACKGROUNDS", (0, 0), (-1, -1), [C_LGRAY, white]),
         ("GRID",      (0, 0), (-1, -1), 0.4, C_MGRAY),
         ("PADDING",   (0, 0), (-1, -1), 6),
-    ]))
+    ]
+    # Section headers: span + navy bg + white bold text
+    for _hr in _HDR_ROWS:
+        _met_style += [
+            ("SPAN",        (0, _hr), (-1, _hr)),
+            ("BACKGROUND",  (0, _hr), (-1, _hr), C_NAVY),
+            ("TEXTCOLOR",   (0, _hr), (-1, _hr), white),
+            ("FONTNAME",    (0, _hr), (-1, _hr), "Helvetica-Bold"),
+            ("ALIGN",       (0, _hr), (-1, _hr), "LEFT"),
+        ]
+    # SPY trend rows: span value across cols 1-3; apply directional color
+    for _sr, _sc in zip(_SPY_ROWS, [spy21_c, spy50_c, spy200_c]):
+        _met_style += [
+            ("SPAN",      (1, _sr), (-1, _sr)),
+            ("TEXTCOLOR", (1, _sr), (1,  _sr), _sc),
+            ("FONTNAME",  (1, _sr), (1,  _sr), "Helvetica-Bold"),
+        ]
+
+    met_tbl = Table(met_data, colWidths=col_w)
+    met_tbl.setStyle(TableStyle(_met_style))
     e.append(met_tbl)
+
+    # Momentum interpretation text
+    if breadth_snap:
+        _interp = momentum_interpretation(
+            breadth_snap.up_25pct_month, breadth_snap.dn_25pct_month,
+            breadth_snap.up_13pct_34d,  breadth_snap.dn_13pct_34d,
+        )
+        e.append(Spacer(1, 0.06 * inch))
+        e.append(Paragraph(_interp, S["small"]))
+
     e.append(Spacer(1, 0.15 * inch))
 
     # ── Scan summary ───────────────────────────────────────────────────────────
@@ -290,7 +426,7 @@ def _page1(
         e.append(Spacer(1, 0.15 * inch))
         e.append(Paragraph("Open Position Monitor", S["section"]))
 
-        pos_data = [["Symbol", "Entry", "Current", "Unrealized P&L", "Days", "Status"]]
+        pos_data = [["Symbol", "Entry", "Current", "Stop", "Target", "R-Mult", "P&L", "Days", "Status"]]
         row_cmds: list = []
 
         for ri, pos in enumerate(open_positions, 1):
@@ -300,29 +436,52 @@ def _page1(
             unrl   = pos.get("unrealized_ret")
             days_w = pos.get("days_on_watch", 0)
             status = (pos.get("status") or "watching").upper()
-            cp_str   = f"${cp:.2f}"         if cp   is not None else "—"
-            unrl_str = f"{unrl*100:+.2f}%"  if unrl is not None else "—"
+            atr_stp = pos.get("atr_stop")
+            tgt     = pos.get("target_price")
+            if tgt is None and ep and atr_stp and ep > atr_stp:
+                tgt = ep + 2 * (ep - atr_stp)
+
+            cp_str   = f"${cp:.2f}"         if cp       is not None else "—"
+            unrl_str = f"{unrl*100:+.2f}%"  if unrl     is not None else "—"
+            stop_str = f"${atr_stp:.2f}"    if atr_stp  is not None else "—"
+            tgt_str  = f"${tgt:.2f}"        if tgt      is not None else "—"
             pnl_c    = C_GREEN if (unrl or 0) >= 0 else C_RED
-            pos_data.append([sym, f"${ep:.2f}", cp_str, unrl_str, str(days_w), status])
+
+            r_mult = _compute_r_multiple(ep, atr_stp, cp)
+            if r_mult is not None:
+                rm_str = f"{r_mult:+.1f}R"
+                rm_c   = C_GREEN if r_mult > 0 else (C_RED if r_mult < 0 else C_TGRAY)
+            else:
+                rm_str = "—"
+                rm_c   = C_TGRAY
+
+            pos_data.append([
+                sym, f"${ep:.2f}", cp_str, stop_str, tgt_str, rm_str, unrl_str, str(days_w), status,
+            ])
             row_cmds += [
                 ("FONTNAME",  (0, ri), (0, ri), "Helvetica-Bold"),
-                ("TEXTCOLOR", (3, ri), (3, ri), pnl_c),
-                ("FONTNAME",  (3, ri), (3, ri), "Helvetica-Bold"),
+                ("TEXTCOLOR", (5, ri), (5, ri), rm_c),
+                ("FONTNAME",  (5, ri), (5, ri), "Helvetica-Bold"),
+                ("TEXTCOLOR", (6, ri), (6, ri), pnl_c),
+                ("FONTNAME",  (6, ri), (6, ri), "Helvetica-Bold"),
             ]
 
         pos_tbl = Table(
             pos_data,
-            colWidths=[0.85*inch, 0.85*inch, 0.85*inch, 1.15*inch, 0.7*inch, 0.9*inch],
+            colWidths=[
+                0.72*inch, 0.68*inch, 0.68*inch, 0.68*inch,
+                0.68*inch, 0.65*inch, 0.82*inch, 0.52*inch, 0.72*inch,
+            ],
         )
         pos_tbl.setStyle(TableStyle([
             ("BACKGROUND",     (0, 0), (-1, 0), C_NAVY),
             ("TEXTCOLOR",      (0, 0), (-1, 0), white),
             ("FONTNAME",       (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE",       (0, 0), (-1, -1), 8),
+            ("FONTSIZE",       (0, 0), (-1, -1), 7.5),
             ("ALIGN",          (1, 0), (-1, -1), "CENTER"),
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [white, C_LGRAY]),
             ("GRID",           (0, 0), (-1, -1), 0.4, C_MGRAY),
-            ("PADDING",        (0, 0), (-1, -1), 6),
+            ("PADDING",        (0, 0), (-1, -1), 5),
         ] + row_cmds))
         e.append(pos_tbl)
 
@@ -335,6 +494,7 @@ def _candidate_table(
     S: dict,
     candidates: list[dict],
     backtest_map: dict,
+    revenue_map: dict | None = None,
 ) -> list:
     e: list = []
     e.append(PageBreak())
@@ -346,34 +506,63 @@ def _candidate_table(
     ))
     e.append(Spacer(1, 0.08 * inch))
 
-    headers = ["#", "Symbol", "Stage", "Days", "Conv", "Opts", "VDU",
-               "EPS %", "PEG", "Notes"]
-    cw = [0.28, 0.72, 0.60, 0.40, 0.50, 0.38, 0.38, 0.62, 0.45, 1.95]
+    # Include Rev % column only when coverage > 20% of candidates
+    rev_map   = revenue_map or {}
+    n_cands   = len(candidates)
+    n_rev_cov = sum(1 for en in candidates if rev_map.get(en["symbol"]) is not None)
+    show_rev  = n_cands > 0 and (n_rev_cov / n_cands) > 0.20
+
+    if show_rev:
+        headers   = ["#", "Symbol", "Stage", "Days", "Conv", "Opts", "VDU",
+                     "EPS %", "Rev %", "PEG", "Notes"]
+        cw        = [0.28, 0.72, 0.60, 0.40, 0.50, 0.38, 0.38, 0.55, 0.55, 0.45, 1.47]
+    else:
+        headers   = ["#", "Symbol", "Stage", "Days", "Conv", "Opts", "VDU",
+                     "EPS %", "PEG", "Notes"]
+        cw        = [0.28, 0.72, 0.60, 0.40, 0.50, 0.38, 0.38, 0.62, 0.45, 1.95]
     col_widths = [w * inch for w in cw]
+    _notes_col = len(headers) - 1   # last column index
 
     rows = [headers]
     row_cmds: list = []
 
     for idx, en in enumerate(candidates, 1):
-        stage = en.get("stage", 0)
-        days  = en.get("consecutive_days", 1)
-        opts  = en.get("options_signal", False)
-        bkt   = backtest_map.get(en["symbol"], {})
-        wr    = (f"WR:{bkt['win_rate']*100:.0f}%"
-                 if bkt.get("win_rate") is not None else "")
+        stage  = en.get("stage", 0)
+        days   = en.get("consecutive_days", 1)
+        opts   = en.get("options_signal", False)
+        bkt    = backtest_map.get(en["symbol"], {})
+        wr     = (f"WR:{bkt['win_rate']*100:.0f}%"
+                  if bkt.get("win_rate") is not None else "")
+        rev_v  = rev_map.get(en["symbol"])
+        rev_str = _pct(rev_v) if rev_v is not None else "—"
 
-        rows.append([
-            str(idx),
-            en["symbol"],
-            _stage_lbl(stage),
-            f"{days}d",
-            _fmt(en.get("conviction_score")),
-            _tick(opts),
-            _tick(en.get("volume_dry_up")),
-            _pct(en.get("earnings_score")),
-            _fmt(en.get("peg_score")),
-            wr,
-        ])
+        if show_rev:
+            rows.append([
+                str(idx),
+                en["symbol"],
+                _stage_lbl(stage),
+                f"{days}d",
+                _fmt(en.get("conviction_score")),
+                _tick(opts),
+                _tick(en.get("volume_dry_up")),
+                _pct(en.get("earnings_score")),
+                rev_str,
+                _fmt(en.get("peg_score")),
+                wr,
+            ])
+        else:
+            rows.append([
+                str(idx),
+                en["symbol"],
+                _stage_lbl(stage),
+                f"{days}d",
+                _fmt(en.get("conviction_score")),
+                _tick(opts),
+                _tick(en.get("volume_dry_up")),
+                _pct(en.get("earnings_score")),
+                _fmt(en.get("peg_score")),
+                wr,
+            ])
 
         # Row shading — applied after ROWBACKGROUNDS, so these take priority
         ri = idx  # table row index (header = 0)
@@ -383,20 +572,20 @@ def _candidate_table(
             row_cmds.append(("BACKGROUND", (0, ri), (-1, ri), _ROW_YELLOW))
 
     style_cmds = [
-        ("BACKGROUND",    (0, 0), (-1, 0),  C_NAVY),
-        ("TEXTCOLOR",     (0, 0), (-1, 0),  white),
-        ("FONTNAME",      (0, 0), (-1, 0),  "Helvetica-Bold"),
-        ("FONTSIZE",      (0, 0), (-1, -1), 7.5),
-        ("FONTNAME",      (1, 1), (1, -1),  "Helvetica-Bold"),
-        ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-        ("ALIGN",         (1, 0), (1, -1),  "LEFT"),
-        ("ALIGN",         (9, 0), (9, -1),  "LEFT"),
-        ("ROWBACKGROUNDS",(0, 1), (-1, -1), [white, C_LGRAY]),
-        ("GRID",          (0, 0), (-1, -1), 0.3, C_MGRAY),
-        ("LINEBELOW",     (0, 0), (-1, 0),  1.0, C_NAVY),
-        ("PADDING",       (0, 0), (-1, -1), 4),
-        ("TOPPADDING",    (0, 0), (-1, 0),  6),
-        ("BOTTOMPADDING", (0, 0), (-1, 0),  6),
+        ("BACKGROUND",    (0, 0), (-1, 0),           C_NAVY),
+        ("TEXTCOLOR",     (0, 0), (-1, 0),           white),
+        ("FONTNAME",      (0, 0), (-1, 0),           "Helvetica-Bold"),
+        ("FONTSIZE",      (0, 0), (-1, -1),          7.5),
+        ("FONTNAME",      (1, 1), (1, -1),           "Helvetica-Bold"),
+        ("ALIGN",         (0, 0), (-1, -1),          "CENTER"),
+        ("ALIGN",         (1, 0), (1, -1),           "LEFT"),
+        ("ALIGN",         (_notes_col, 0), (_notes_col, -1), "LEFT"),
+        ("ROWBACKGROUNDS",(0, 1), (-1, -1),          [white, C_LGRAY]),
+        ("GRID",          (0, 0), (-1, -1),          0.3, C_MGRAY),
+        ("LINEBELOW",     (0, 0), (-1, 0),           1.0, C_NAVY),
+        ("PADDING",       (0, 0), (-1, -1),          4),
+        ("TOPPADDING",    (0, 0), (-1, 0),           6),
+        ("BOTTOMPADDING", (0, 0), (-1, 0),           6),
     ] + row_cmds
 
     tbl = Table(rows, colWidths=col_widths, repeatRows=1)
@@ -541,7 +730,9 @@ def _load_open_positions(db_path: str | None = None) -> list[dict]:
         rows = con.execute(
             """
             SELECT symbol, entry_price, current_price, unrealized_ret,
-                   days_on_watch, status
+                   days_on_watch, status,
+                   COALESCE(atr_stop, NULL) AS atr_stop,
+                   COALESCE(target_price, NULL) AS target_price
             FROM watchlist
             WHERE status = 'watching'
             ORDER BY conviction_score DESC
@@ -549,11 +740,36 @@ def _load_open_positions(db_path: str | None = None) -> list[dict]:
         ).fetchall()
         con.close()
         cols = ["symbol", "entry_price", "current_price", "unrealized_ret",
-                "days_on_watch", "status"]
+                "days_on_watch", "status", "atr_stop", "target_price"]
         return [dict(zip(cols, row)) for row in rows]
     except Exception:
         pass
     return []
+
+
+def _load_revenue_map(symbols: list[str], db_path: str | None = None) -> dict:
+    """Return {symbol: revenue_yoy_pct} from the edgar_fundamentals cache."""
+    if not symbols:
+        return {}
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(db_path or str(DB_PATH))
+        ph  = ",".join("?" * len(symbols))
+        rows = con.execute(
+            f"SELECT symbol, revenue_growth FROM edgar_fundamentals "
+            f"WHERE symbol IN ({ph}) "
+            f"ORDER BY fetch_date DESC",
+            symbols,
+        ).fetchall()
+        con.close()
+        result: dict = {}
+        for sym, rev in rows:
+            if sym not in result:
+                result[sym] = rev
+        return result
+    except Exception:
+        return {}
 
 
 def _load_backtest_map(symbols: list[str], db_path: str | None = None) -> dict:
@@ -641,6 +857,7 @@ def generate(
     breadth      = get_latest_snapshot()
     symbols      = [c["symbol"] for c in candidates]
     backtest_map    = _load_backtest_map(symbols, db_path)
+    revenue_map     = _load_revenue_map(symbols, db_path)
     open_positions  = _load_open_positions(db_path)
     n_multi         = sum(1 for c in candidates if c.get("consecutive_days", 1) >= 2)
 
@@ -674,7 +891,7 @@ def generate(
     story += _page1(S, report_date, breadth, len(candidates), n_multi, open_positions,
                     vix_close=vix_close)
     if candidates:
-        story += _candidate_table(S, candidates, backtest_map)
+        story += _candidate_table(S, candidates, backtest_map, revenue_map)
         story += _alert_section(S, candidates, backtest_map)
     if basing_cands:
         story += _basing_table(S, basing_cands)

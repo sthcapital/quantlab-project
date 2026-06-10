@@ -20,6 +20,7 @@ from argparse import ArgumentParser
 from datetime import date, timedelta
 
 from quantlab.signals.breadth import (
+    _ema,
     compute_market_breadth,
     rolling_breadth,
     save_breadth_snapshot,
@@ -123,7 +124,7 @@ def fetch_and_store(
         history_data = history_data if history_data else None,
     )
 
-    # Compute SPY 200 SMA and slope from history_data
+    # Compute SPY 200/50 SMA, 21 EMA, and price-distance metrics from history_data
     if history_data and "SPY" in history_data and len(history_data["SPY"]) >= 200:
         spy_bars   = history_data["SPY"]
         spy_closes = [b.close for b in spy_bars[-200:]]
@@ -134,6 +135,27 @@ def fetch_and_store(
             if len(spy_bars) >= 220:
                 spy_sma200_20d_ago = sum(b.close for b in spy_bars[-220:-20]) / 200
                 snapshot.spy_200sma_slope = round(spy_sma200 - spy_sma200_20d_ago, 4)
+            snapshot.spy_pct_above_200sma = round(
+                (spy_today.close - spy_sma200) / spy_sma200 * 100, 4
+            )
+
+        # SPY 50 SMA
+        spy_sma50 = sum(b.close for b in spy_bars[-50:]) / 50
+        snapshot.spy_50sma = round(spy_sma50, 4)
+        if spy_today:
+            snapshot.spy_pct_above_50sma = round(
+                (spy_today.close - spy_sma50) / spy_sma50 * 100, 4
+            )
+
+        # SPY 21 EMA (all available history for proper warm-up)
+        all_spy_closes = [b.close for b in spy_bars]
+        ema21_series   = _ema(all_spy_closes, 21)
+        spy_21ema      = ema21_series[-1]
+        snapshot.spy_21ema = round(spy_21ema, 4)
+        if spy_today:
+            snapshot.spy_pct_above_21ema = round(
+                (spy_today.close - spy_21ema) / spy_21ema * 100, 4
+            )
 
     # Fetch CBOE PCR data (non-fatal — missing data leaves defaults at 0.0)
     try:

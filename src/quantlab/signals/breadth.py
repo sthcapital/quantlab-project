@@ -103,6 +103,13 @@ class BreadthSnapshot:
     spy_above_200sma: bool  = True   # is SPY above its 200-day SMA
     spy_200sma_slope: float = 0.0    # slope of SPY 200 SMA over last 20 days
 
+    # SPY MA distance metrics (populated by update_breadth.py)
+    spy_21ema:            float = 0.0   # 21-period EMA of SPY closes
+    spy_50sma:            float = 0.0   # 50-period SMA of SPY closes
+    spy_pct_above_21ema:  float = 0.0   # (spy_close − spy_21ema) / spy_21ema * 100
+    spy_pct_above_50sma:  float = 0.0   # (spy_close − spy_50sma)  / spy_50sma  * 100
+    spy_pct_above_200sma: float = 0.0   # (spy_close − spy_sma200) / spy_sma200 * 100
+
     # Tape classification
     tape: str = "NEUTRAL"   # BULL / CORRECTION / RECOVERY / NEUTRAL / BEAR
 
@@ -456,10 +463,15 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
             ("dvol",               "DOUBLE DEFAULT 0.0"),
             ("uvol_dvol_ratio",    "DOUBLE DEFAULT 0.0"),
             ("pct_above_10sma",    "DOUBLE DEFAULT 0.0"),
-            ("equity_pcr",         "DOUBLE DEFAULT 0.0"),
-            ("index_pcr",          "DOUBLE DEFAULT 0.0"),
-            ("total_pcr",          "DOUBLE DEFAULT 0.0"),
-            ("pcr_regime",         "VARCHAR DEFAULT 'neutral'"),
+            ("equity_pcr",             "DOUBLE DEFAULT 0.0"),
+            ("index_pcr",              "DOUBLE DEFAULT 0.0"),
+            ("total_pcr",              "DOUBLE DEFAULT 0.0"),
+            ("pcr_regime",             "VARCHAR DEFAULT 'neutral'"),
+            ("spy_21ema",              "DOUBLE DEFAULT 0.0"),
+            ("spy_50sma",              "DOUBLE DEFAULT 0.0"),
+            ("spy_pct_above_21ema",    "DOUBLE DEFAULT 0.0"),
+            ("spy_pct_above_50sma",    "DOUBLE DEFAULT 0.0"),
+            ("spy_pct_above_200sma",   "DOUBLE DEFAULT 0.0"),
         ]:
             if _col not in _bh_cols:
                 con.execute(f"ALTER TABLE breadth_history ADD COLUMN {_col} {_def}")
@@ -475,9 +487,11 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
                 up_25pct_month, dn_25pct_month, up_50pct_month, dn_50pct_month,
                 up_13pct_34d, dn_13pct_34d,
                 uvol, dvol, uvol_dvol_ratio,
-                equity_pcr, index_pcr, total_pcr, pcr_regime
+                equity_pcr, index_pcr, total_pcr, pcr_regime,
+                spy_21ema, spy_50sma,
+                spy_pct_above_21ema, spy_pct_above_50sma, spy_pct_above_200sma
             ) VALUES (
-                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
             )
         """, [
             snapshot.date,
@@ -496,6 +510,9 @@ def save_breadth_snapshot(snapshot: BreadthSnapshot) -> None:
             snapshot.up_13pct_34d,  snapshot.dn_13pct_34d,
             snapshot.uvol, snapshot.dvol, snapshot.uvol_dvol_ratio,
             snapshot.equity_pcr, snapshot.index_pcr, snapshot.total_pcr, snapshot.pcr_regime,
+            snapshot.spy_21ema, snapshot.spy_50sma,
+            snapshot.spy_pct_above_21ema, snapshot.spy_pct_above_50sma,
+            snapshot.spy_pct_above_200sma,
         ])
         con.close()
     except Exception as e:
@@ -527,10 +544,15 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
                    COALESCE(dvol,              0.0)   AS dvol,
                    COALESCE(uvol_dvol_ratio,   0.0)   AS uvol_dvol_ratio,
                    COALESCE(pct_above_10sma,   0.0)   AS pct_above_10sma,
-                   COALESCE(equity_pcr,        0.0)   AS equity_pcr,
-                   COALESCE(index_pcr,         0.0)   AS index_pcr,
-                   COALESCE(total_pcr,         0.0)   AS total_pcr,
-                   COALESCE(pcr_regime, 'neutral')    AS pcr_regime
+                   COALESCE(equity_pcr,           0.0)   AS equity_pcr,
+                   COALESCE(index_pcr,            0.0)   AS index_pcr,
+                   COALESCE(total_pcr,            0.0)   AS total_pcr,
+                   COALESCE(pcr_regime,   'neutral')    AS pcr_regime,
+                   COALESCE(spy_21ema,            0.0)   AS spy_21ema,
+                   COALESCE(spy_50sma,            0.0)   AS spy_50sma,
+                   COALESCE(spy_pct_above_21ema,  0.0)   AS spy_pct_above_21ema,
+                   COALESCE(spy_pct_above_50sma,  0.0)   AS spy_pct_above_50sma,
+                   COALESCE(spy_pct_above_200sma, 0.0)   AS spy_pct_above_200sma
             FROM breadth_history
             ORDER BY date DESC LIMIT {n}
         """).fetchall()
@@ -562,6 +584,11 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
                 index_pcr=float(r[34] or 0.0),
                 total_pcr=float(r[35] or 0.0),
                 pcr_regime=str(r[36] or "neutral"),
+                spy_21ema=float(r[37] or 0.0),
+                spy_50sma=float(r[38] or 0.0),
+                spy_pct_above_21ema=float(r[39] or 0.0),
+                spy_pct_above_50sma=float(r[40] or 0.0),
+                spy_pct_above_200sma=float(r[41] or 0.0),
             )
             snapshots.append(s)
         return snapshots

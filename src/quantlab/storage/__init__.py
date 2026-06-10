@@ -327,7 +327,9 @@ def _ensure_schema(con) -> None:
             current_price       DOUBLE,
             unrealized_ret      DOUBLE,
             days_on_watch       INTEGER DEFAULT 0,
-            -- Status lifecycle: watching → triggered/stopped_out/expired
+            -- 2R price target (entry + 2*(entry - atr_stop)); NULL until computed
+            target_price        DOUBLE,
+            -- Status lifecycle: watching → triggered/stopped_out/expired/target_hit
             status              VARCHAR DEFAULT 'watching',
             date_updated        DATE,
             -- Audit / override notes
@@ -346,6 +348,15 @@ def _ensure_schema(con) -> None:
         ]:
             if _col not in _wl_cols:
                 con.execute(f"ALTER TABLE watchlist ADD COLUMN {_col} {_dtype}")
+        if "target_price" not in _wl_cols:
+            con.execute("ALTER TABLE watchlist ADD COLUMN target_price DOUBLE")
+            con.execute("""
+                UPDATE watchlist
+                SET target_price = entry_price + 2 * (entry_price - atr_stop)
+                WHERE atr_stop IS NOT NULL
+                  AND entry_price IS NOT NULL
+                  AND atr_stop < entry_price
+            """)
     except Exception:
         pass
 
@@ -389,6 +400,11 @@ def _ensure_schema(con) -> None:
             index_pcr               DOUBLE  DEFAULT 0.0,
             total_pcr               DOUBLE  DEFAULT 0.0,
             pcr_regime              VARCHAR DEFAULT 'neutral',
+            spy_21ema               DOUBLE  DEFAULT 0.0,
+            spy_50sma               DOUBLE  DEFAULT 0.0,
+            spy_pct_above_21ema     DOUBLE  DEFAULT 0.0,
+            spy_pct_above_50sma     DOUBLE  DEFAULT 0.0,
+            spy_pct_above_200sma    DOUBLE  DEFAULT 0.0,
             created_at              TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -412,10 +428,15 @@ def _ensure_schema(con) -> None:
             ("uvol",               "DOUBLE DEFAULT 0.0"),
             ("dvol",               "DOUBLE DEFAULT 0.0"),
             ("uvol_dvol_ratio",    "DOUBLE DEFAULT 0.0"),
-            ("equity_pcr",         "DOUBLE DEFAULT 0.0"),
-            ("index_pcr",          "DOUBLE DEFAULT 0.0"),
-            ("total_pcr",          "DOUBLE DEFAULT 0.0"),
-            ("pcr_regime",         "VARCHAR DEFAULT 'neutral'"),
+            ("equity_pcr",             "DOUBLE DEFAULT 0.0"),
+            ("index_pcr",              "DOUBLE DEFAULT 0.0"),
+            ("total_pcr",              "DOUBLE DEFAULT 0.0"),
+            ("pcr_regime",             "VARCHAR DEFAULT 'neutral'"),
+            ("spy_21ema",              "DOUBLE DEFAULT 0.0"),
+            ("spy_50sma",              "DOUBLE DEFAULT 0.0"),
+            ("spy_pct_above_21ema",    "DOUBLE DEFAULT 0.0"),
+            ("spy_pct_above_50sma",    "DOUBLE DEFAULT 0.0"),
+            ("spy_pct_above_200sma",   "DOUBLE DEFAULT 0.0"),
         ]:
             if _col not in _bh_cols:
                 con.execute(f"ALTER TABLE breadth_history ADD COLUMN {_col} {_def}")

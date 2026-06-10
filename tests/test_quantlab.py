@@ -7629,6 +7629,246 @@ class TestPcrFlatFileFallback:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# SPY MA distance metrics
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSpyMADistances:
+    """Tests for spy_pct_above_21ema / 50sma / 200sma computation."""
+
+    def test_spy_pct_above_21ema_above(self):
+        """SPY above 21 EMA → positive percentage."""
+        from quantlab.signals.breadth import _ema
+        # 21 closes at 100, then close at 110 → EMA lags at ~100.xxx, pct > 0
+        closes = [100.0] * 30 + [110.0]
+        ema21  = _ema(closes, 21)[-1]
+        pct    = (110.0 - ema21) / ema21 * 100
+        assert pct > 0.0
+
+    def test_spy_pct_above_21ema_below(self):
+        """SPY below 21 EMA → negative percentage."""
+        from quantlab.signals.breadth import _ema
+        closes = [100.0] * 30 + [90.0]
+        ema21  = _ema(closes, 21)[-1]
+        pct    = (90.0 - ema21) / ema21 * 100
+        assert pct < 0.0
+
+    def test_spy_pct_above_21ema_formula(self):
+        """Manual EMA formula check: seed=100, one step at 105."""
+        from quantlab.signals.breadth import _ema
+        k = 2 / 22  # period=21
+        ema_after_one = 100.0 * (1 - k) + 105.0 * k
+        closes = [100.0] * 1 + [105.0]
+        result = _ema(closes, 21)[-1]
+        assert abs(result - ema_after_one) < 1e-9
+        pct = (105.0 - result) / result * 100
+        assert pct > 0.0
+
+    def test_spy_pct_above_50sma(self):
+        """50 SMA = mean of last 50 closes; distance sign correct."""
+        closes_50 = [100.0] * 50
+        sma50 = sum(closes_50) / 50   # = 100.0
+        current = 102.0
+        pct = (current - sma50) / sma50 * 100
+        assert abs(pct - 2.0) < 1e-9
+
+    def test_spy_pct_above_200sma(self):
+        """200 SMA distance formula: (close - sma200) / sma200 * 100."""
+        sma200  = 400.0
+        current = 420.0
+        pct = (current - sma200) / sma200 * 100
+        assert abs(pct - 5.0) < 1e-9
+
+    def test_breadth_snapshot_spy_ma_fields_default_zero(self):
+        """New SPY MA fields default to 0.0."""
+        from quantlab.signals.breadth import BreadthSnapshot
+        s = BreadthSnapshot(date="2026-01-01")
+        assert s.spy_21ema == 0.0
+        assert s.spy_50sma == 0.0
+        assert s.spy_pct_above_21ema  == 0.0
+        assert s.spy_pct_above_50sma  == 0.0
+        assert s.spy_pct_above_200sma == 0.0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Momentum interpretation
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestMomentumInterpretation:
+    """Tests for momentum_interpretation() in scripts/generate_report.py."""
+
+    def _fn(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as gr
+        return gr.momentum_interpretation
+
+    def test_strong_accumulation(self):
+        text = self._fn()(100, 30, 60, 20)
+        assert "Strong accumulation" in text
+        assert "100" in text   # up count
+        assert "30" in text    # dn count
+
+    def test_moderate_positive(self):
+        text = self._fn()(60, 40, 40, 25)
+        assert "Moderate positive momentum" in text
+
+    def test_mixed(self):
+        text = self._fn()(50, 50, 30, 30)
+        assert "Mixed momentum" in text
+
+    def test_distribution(self):
+        text = self._fn()(20, 80, 15, 70)
+        assert "Distribution in progress" in text
+        assert "80" in text   # dn count
+        assert "20" in text   # up count
+
+    def test_34d_positive_confirm(self):
+        text = self._fn()(60, 30, 50, 20)
+        assert "confirms positive trend" in text
+
+    def test_34d_negative_confirm(self):
+        text = self._fn()(60, 30, 20, 50)
+        assert "confirms negative trend" in text
+
+    def test_34d_neutral(self):
+        text = self._fn()(60, 30, 35, 35)
+        assert "neutral" in text
+
+    def test_zero_dn_no_division_error(self):
+        text = self._fn()(50, 0, 30, 10)
+        assert "Strong accumulation" in text   # ratio = 50/1 = 50 > 2
+
+    def test_ratio_boundary_exactly_two(self):
+        # ratio = 2.0 → NOT > 2.0 → falls to moderate
+        text = self._fn()(40, 20, 30, 10)
+        assert "Moderate positive momentum" in text
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Target price and R-multiple
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestTargetPriceAndRMultiple:
+    """Tests for target_price computation on watchlist insert and R-multiple formula."""
+
+    def _make_scan_result(self, entry=100.0, stop=95.0, conviction=0.80):
+        from quantlab.execution import ScanResult
+        r = ScanResult(
+            symbol="TST", scan_date=date.today().isoformat(),
+            signal_type="breakout", signal=True,
+            entry_close=entry, indicator_value=None, lookback=20,
+            conviction_score=conviction,
+        )
+        r.atr_stop = stop
+        return r
+
+    def test_target_price_computed_on_insert(self, tmp_path):
+        import duckdb
+        from quantlab.storage import _ensure_schema
+        from quantlab.watchlist import add_to_watchlist
+        db = tmp_path / "wl.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.close()
+
+        import quantlab.watchlist as _wl
+        _orig_db = _wl.DB_PATH
+        import quantlab.storage as _st
+        _orig_st  = _st.DB_PATH
+        try:
+            _wl.DB_PATH = db
+            _st.DB_PATH = db
+            r = self._make_scan_result(entry=100.0, stop=95.0)
+            add_to_watchlist(r, min_conviction=0.70)
+            con2 = duckdb.connect(str(db))
+            row = con2.execute(
+                "SELECT entry_price, atr_stop, target_price FROM watchlist WHERE symbol='TST'"
+            ).fetchone()
+            con2.close()
+            assert row is not None
+            entry, stop, target = row
+            # 2R target: 100 + 2*(100-95) = 110
+            assert abs(target - 110.0) < 1e-6
+        finally:
+            _wl.DB_PATH = _orig_db
+            _st.DB_PATH = _orig_st
+
+    def test_target_price_none_when_stop_none(self, tmp_path):
+        import duckdb
+        from quantlab.storage import _ensure_schema
+        from quantlab.watchlist import add_to_watchlist
+        db = tmp_path / "wl2.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.close()
+
+        import quantlab.watchlist as _wl
+        import quantlab.storage as _st
+        _orig_wl, _orig_st = _wl.DB_PATH, _st.DB_PATH
+        try:
+            _wl.DB_PATH = db
+            _st.DB_PATH = db
+            r = self._make_scan_result(entry=100.0, stop=None)
+            r.atr_stop = None
+            add_to_watchlist(r, min_conviction=0.70)
+            con2 = duckdb.connect(str(db))
+            row = con2.execute(
+                "SELECT target_price FROM watchlist WHERE symbol='TST'"
+            ).fetchone()
+            con2.close()
+            assert row[0] is None
+        finally:
+            _wl.DB_PATH = _orig_wl
+            _st.DB_PATH = _orig_st
+
+    def test_r_multiple_positive(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as gr
+        # entry=100, stop=95, current=102.5 → risk=5, r=(2.5)/5=+0.5
+        assert abs(gr._compute_r_multiple(100.0, 95.0, 102.5) - 0.5) < 1e-9
+
+    def test_r_multiple_negative(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as gr
+        # entry=100, stop=95, current=97.5 → r=(-2.5)/5=-0.5
+        assert abs(gr._compute_r_multiple(100.0, 95.0, 97.5) - (-0.5)) < 1e-9
+
+    def test_r_multiple_zero_at_entry(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as gr
+        assert gr._compute_r_multiple(100.0, 95.0, 100.0) == 0.0
+
+    def test_r_multiple_none_when_stop_above_entry(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as gr
+        assert gr._compute_r_multiple(95.0, 100.0, 102.0) is None
+
+    def test_r_multiple_none_on_missing_inputs(self):
+        import sys
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        import generate_report as gr
+        assert gr._compute_r_multiple(None, 95.0, 102.0) is None
+        assert gr._compute_r_multiple(100.0, None, 102.0) is None
+        assert gr._compute_r_multiple(100.0, 95.0, None) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # IC Monitor
 # ══════════════════════════════════════════════════════════════════════════════
 

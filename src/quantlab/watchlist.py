@@ -124,6 +124,15 @@ def add_to_watchlist(
     watch_id   = f"{scan_result.symbol}_{today.isoformat()}"
     layers     = _layers_fired(scan_result)
 
+    # 2R price target: entry + 2 * (entry - stop)
+    _ep   = scan_result.entry_close
+    _stop = scan_result.atr_stop
+    target_price = (
+        round(_ep + 2 * (_ep - _stop), 4)
+        if _ep and _stop and _ep > _stop
+        else None
+    )
+
     try:
         con = get_db()
         # INSERT OR IGNORE keeps the first entry if run twice today
@@ -131,8 +140,8 @@ def add_to_watchlist(
             INSERT OR IGNORE INTO watchlist (
                 watch_id, symbol, date_added, entry_price, atr_stop,
                 conviction_score, signal_layers, lookback, signal_type,
-                status, date_updated, breadth_override_note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?)
+                target_price, status, date_updated, breadth_override_note
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?)
         """, [
             watch_id,
             scan_result.symbol,
@@ -143,6 +152,7 @@ def add_to_watchlist(
             layers,
             getattr(scan_result, "lookback", None),
             getattr(scan_result, "signal_type", None),
+            target_price,
             today.isoformat(),
             note,
         ])
@@ -192,7 +202,7 @@ def get_active_watchlist(db_path: str | None = None) -> list[dict[str, Any]]:
         "price_1d", "price_3d", "price_5d",
         "realized_ret_1d", "realized_ret_3d", "realized_ret_5d",
         "current_price", "unrealized_ret", "days_on_watch", "status", "date_updated",
-        "breadth_override_note",
+        "breadth_override_note", "target_price",
     ]
     try:
         import duckdb
@@ -279,8 +289,19 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
         unrealized = (current - entry_price) / entry_price if entry_price else 0.0
         days       = _trading_days_elapsed(date_added, today)
 
+        # 2R target price — stored value preferred; fall back to computed
+        target_price = entry.get("target_price")
+        if target_price is None and entry_price and atr_stop and entry_price > atr_stop:
+            target_price = entry_price + 2 * (entry_price - atr_stop)
+
         if atr_stop and current <= atr_stop:
             new_status = "stopped_out"
+        elif target_price and current >= target_price:
+            new_status = "target_hit"
+            logger.info(
+                "%s: 2R target hit at $%.2f — consider taking profits",
+                symbol, current,
+            )
         elif days >= 10:
             new_status = "expired"
         else:
