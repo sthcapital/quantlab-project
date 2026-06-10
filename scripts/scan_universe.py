@@ -59,6 +59,10 @@ def select_top_candidates(
         if earn is None or earn <= 0.0:
             continue
 
+        eps_g = getattr(r, "eps_growth", None)
+        if eps_g is not None and eps_g < -0.10:
+            continue
+
         iwl_e = iwl_state.get(r.symbol, {})
         opts  = bool(iwl_e.get("options_signal", False))
         vdu   = bool(iwl_e.get("volume_dry_up", False))

@@ -135,7 +135,13 @@ def _pcr_from_flat_file(trade_date: date) -> "tuple[float, float, float] | None"
         from quantlab.providers.flat_files import FlatFileProvider
         import pyarrow.parquet as pq
 
-        path = FlatFileProvider().options_cache_path(trade_date)
+        ff = FlatFileProvider()
+        path = ff.options_cache_path(trade_date)
+        if not path.exists():
+            try:
+                ff.download_options_day(trade_date)
+            except Exception:
+                return None
         if not path.exists():
             return None
 

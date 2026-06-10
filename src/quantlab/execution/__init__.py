@@ -151,6 +151,9 @@ class ScanResult:
     # "neutral"             — no near-term earnings event
     earnings_proximity: str = "neutral"
 
+    # YoY EPS growth rate from EDGAR cache (e.g. -1.48 = -148% decline)
+    eps_growth: float | None = None
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -309,6 +312,12 @@ def score_conviction(result: ScanResult) -> float:
     # PEG ratio — Boucher's fairly-valued-relative-to-growth filter
     if result.peg_score >= 0.7:
         score += 0.06
+
+    # Negative EPS veto: deeply deteriorating fundamentals suppress conviction
+    if (result.edgar_acceleration == 0.0
+            and result.eps_growth is not None
+            and result.eps_growth < -0.10):
+        score -= 0.15
 
     return max(0.0, min(score, 1.0))
 
@@ -741,6 +750,38 @@ def sector_filter(
     return results
 
 
+def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
+    """Module-level worker for parallel symbol scoring (multiprocessing-safe)."""
+    (symbol, spy_bars, signal_type, lookback, bars,
+     news_feat, edgar_accel, eps_growth, peg_score,
+     breadth_adj, breadth_override, macro_regime, vix_regime,
+     earnings_proximity) = args
+    try:
+        result = scan_symbol(
+            symbol=symbol,
+            bars=bars,
+            signal_type=signal_type,
+            lookback=lookback,
+            regime_bars=spy_bars,
+            news_features=news_feat,
+        )
+        if result is None:
+            return None
+        result.breadth_regime_adj  = breadth_adj
+        result.breadth_override    = breadth_override
+        result.macro_regime        = macro_regime
+        result.vix_regime          = vix_regime
+        result.edgar_acceleration  = edgar_accel
+        result.eps_growth          = eps_growth
+        result.peg_score           = peg_score
+        result.earnings_proximity  = earnings_proximity
+        result.conviction_score    = score_conviction(result)
+        return result
+    except Exception as exc:
+        logger.error("Worker error for %s: %s", symbol, exc)
+        return None
+
+
 def run_universe_scan(
     provider: MarketDataProvider,
     symbols: list[str],
@@ -772,23 +813,22 @@ def run_universe_scan(
     Returns:
         List of ScanResult sorted by conviction_score descending.
     """
+    import multiprocessing as _mp
     from contextlib import nullcontext
     from quantlab.news import fetch_news, compute_news_features
-    from quantlab.storage import append_trades_to_db
     from datetime import datetime
 
-    results = []
     total = len(symbols)
+    _symbol_data: list[tuple] = []
+    _macro_regime = "risk_on"
+    _vix_regime = "low"
 
     # Use the provider as a context manager when it supports one (e.g. IbkrProvider).
-    # This opens a single persistent TWS connection for all bar requests in this scan,
-    # eliminating the per-symbol connect/disconnect handshake (~2 s each).
-    # Providers without __enter__ (MockMarketDataProvider, PolygonProvider) fall
-    # through to nullcontext so this change is backward-compatible.
+    # Phase 1 (sequential): fetch bars, EDGAR, news, earnings proximity per symbol.
+    # Phase 2 (parallel): score all symbols using multiprocessing.Pool.
     _ctx = provider if hasattr(provider, "__enter__") else nullcontext()
     with _ctx:
         # Load latest breadth snapshot for regime adjustment and override flag.
-        # Non-fatal — scan proceeds with neutral breadth (adj=0, override=False).
         from quantlab.signals.breadth import get_latest_snapshot, breadth_regime_adjustment
         _breadth_snap = get_latest_snapshot()
         _breadth_adj, _breadth_override = breadth_regime_adjustment(_breadth_snap)
@@ -801,9 +841,6 @@ def run_universe_scan(
             )
 
         # Fetch macro context (CBOE VIX always; FRED if API key configured).
-        # Non-fatal — defaults to risk_on / low when unavailable.
-        _macro_regime = "risk_on"
-        _vix_regime = "low"
         _vix_close: float | None = None
         try:
             from datetime import timedelta as _td
@@ -842,6 +879,7 @@ def run_universe_scan(
         try:
             from quantlab.providers.edgar import (
                 get_edgar_acceleration as _get_edgar_accel,
+                get_edgar_eps_growth as _get_edgar_eps_growth,
                 get_next_earnings_date as _get_next_earnings,
                 get_last_earnings_result as _get_last_earnings,
                 count_trading_days as _count_trading_days,
@@ -849,6 +887,7 @@ def run_universe_scan(
             )
         except Exception:
             _get_edgar_accel = None           # type: ignore[assignment]
+            _get_edgar_eps_growth = None      # type: ignore[assignment]
             _get_next_earnings = None         # type: ignore[assignment]
             _get_last_earnings = None         # type: ignore[assignment]
             _count_trading_days = None        # type: ignore[assignment]
@@ -863,7 +902,6 @@ def run_universe_scan(
             _get_recent_earn_result = None  # type: ignore[assignment]
 
         # Fetch SPY bars once for regime filter and RS calculation.
-        # Failures are non-fatal — scan proceeds with regime_bullish=True and rs_score=0.
         spy_bars = None
         try:
             spy_bars = list(provider.get_daily_bars("SPY", start_date, end_date))
@@ -872,17 +910,19 @@ def run_universe_scan(
         except Exception as _spy_err:
             logger.debug("SPY bars unavailable (%s) — regime=bullish, RS scores=0", _spy_err)
 
+        # Phase 1: sequential — fetch all data needed for scoring.
+        # IBKR news and DuckDB queries cannot be parallelised; bars are collected here
+        # and passed to Phase 2 workers without further network/disk access.
         for i, symbol in enumerate(symbols, 1):
             try:
-                logger.info(f"[{i}/{total}] Scanning {symbol}...")
+                logger.info(f"[{i}/{total}] Fetching {symbol}...")
 
-                bars = provider.get_daily_bars(symbol, start_date, end_date)
+                bars = list(provider.get_daily_bars(symbol, start_date, end_date))
                 if not bars:
                     logger.warning(f"{symbol}: no bars returned")
                     continue
 
-                # Fetch EDGAR earnings acceleration (DuckDB-cached, 7-day TTL).
-                # Non-fatal — OHLCV inference used when EDGAR is unavailable.
+                # EDGAR earnings acceleration (DuckDB cache, 7-day TTL).
                 edgar_accel: float | None = None
                 if _get_edgar_accel is not None:
                     try:
@@ -890,8 +930,15 @@ def run_universe_scan(
                     except Exception as _ea_err:
                         logger.debug("%s: EDGAR acceleration unavailable: %s", symbol, _ea_err)
 
-                # PEG score from EDGAR cache (reads eps_diluted + eps_growth columns;
-                # no additional network request — 0.0 when cache miss).
+                # EPS growth rate from EDGAR cache.
+                _eps_growth: float | None = None
+                if _get_edgar_eps_growth is not None:
+                    try:
+                        _eps_growth = _get_edgar_eps_growth(symbol)
+                    except Exception:
+                        pass
+
+                # PEG score from EDGAR cache.
                 _peg_score: float = 0.0
                 if _get_edgar_peg_score is not None:
                     try:
@@ -899,7 +946,7 @@ def run_universe_scan(
                     except Exception as _pg_err:
                         logger.debug("%s: PEG score unavailable: %s", symbol, _pg_err)
 
-                # Fetch news if IBKR connection is provided
+                # News (IBKR sequential — connections cannot be shared across processes).
                 news_feat = None
                 if ibkr_connection is not None:
                     try:
@@ -913,7 +960,6 @@ def run_universe_scan(
                                 end_date.isoformat(),
                                 lookback_days=7,
                             )
-                            # Parse earnings beat/miss from headlines → earnings_results table
                             try:
                                 from quantlab.news.earnings_parser import (
                                     make_earnings_result,
@@ -935,90 +981,68 @@ def run_universe_scan(
                     except Exception as e:
                         logger.debug(f"{symbol} news fetch failed: {e}")
 
-                result = scan_symbol(
-                    symbol=symbol,
-                    bars=bars,
-                    signal_type=signal_type,
-                    lookback=lookback,
-                    regime_bars=spy_bars,   # enables regime filter + RS scoring
-                    news_features=news_feat,
-                )
-
-                if result is not None:
-                    # Apply breadth, macro, and EDGAR adjustments, then re-score
-                    result.breadth_regime_adj  = _breadth_adj
-                    result.breadth_override    = _breadth_override
-                    result.macro_regime        = _macro_regime
-                    result.vix_regime          = _vix_regime
-                    result.edgar_acceleration  = edgar_accel
-                    result.peg_score           = _peg_score
-
-                    # Earnings calendar proximity
-                    # Priority 1: real-time press release beat/miss (most authoritative)
-                    # Priority 2: EDGAR filing-based historical estimate (fallback)
-                    try:
-                        _proximity = "neutral"
-                        _used_real_time = False
-
-                        if _get_recent_earn_result is not None:
-                            _press = _get_recent_earn_result(symbol, max_days=5)
-                            if _press is not None:
-                                _used_real_time = True
-                                if _press.beat_score >= 0.7:
-                                    _proximity = "post_earnings_beat"
-                                elif _press.beat_score <= 0.3:
-                                    _proximity = "post_earnings_miss"
-                                # 0.3 < score < 0.7 → neutral (mixed signals)
-                                logger.debug(
-                                    "%s: press-release beat_score=%.2f → %s",
-                                    symbol, _press.beat_score, _proximity,
-                                )
-
-                        if not _used_real_time:
-                            # EDGAR fallback: pre-earnings proximity + historical beat
-                            if _get_next_earnings is not None:
-                                _next = _get_next_earnings(symbol)
-                                if _next:
-                                    _next_date, _days_until = _next
-                                    if 0 <= _days_until <= 5:
-                                        _proximity = "pre_earnings"
-                            if _proximity == "neutral" and (
-                                _get_last_earnings is not None
-                                and _count_trading_days is not None
-                            ):
-                                _last = _get_last_earnings(symbol)
-                                if _last:
-                                    _last_date, _was_beat = _last
-                                    _days_since = _count_trading_days(
-                                        _last_date, end_date
-                                    )
-                                    if 0 <= _days_since <= 5:
-                                        _proximity = (
-                                            "post_earnings_beat"
-                                            if _was_beat else "post_earnings_miss"
-                                        )
-
-                        result.earnings_proximity = _proximity
-                        if _proximity != "neutral":
-                            logger.info(
-                                "%s: earnings_proximity=%s", symbol, _proximity
+                # Earnings calendar proximity (DuckDB sequential).
+                _proximity = "neutral"
+                try:
+                    _used_real_time = False
+                    if _get_recent_earn_result is not None:
+                        _press = _get_recent_earn_result(symbol, max_days=5)
+                        if _press is not None:
+                            _used_real_time = True
+                            if _press.beat_score >= 0.7:
+                                _proximity = "post_earnings_beat"
+                            elif _press.beat_score <= 0.3:
+                                _proximity = "post_earnings_miss"
+                            logger.debug(
+                                "%s: press-release beat_score=%.2f → %s",
+                                symbol, _press.beat_score, _proximity,
                             )
-                    except Exception as _ep_err:
-                        logger.debug(
-                            "%s: earnings_proximity unavailable: %s", symbol, _ep_err
-                        )
+                    if not _used_real_time:
+                        if _get_next_earnings is not None:
+                            _next = _get_next_earnings(symbol)
+                            if _next:
+                                _next_date, _days_until = _next
+                                if 0 <= _days_until <= 5:
+                                    _proximity = "pre_earnings"
+                        if _proximity == "neutral" and (
+                            _get_last_earnings is not None
+                            and _count_trading_days is not None
+                        ):
+                            _last = _get_last_earnings(symbol)
+                            if _last:
+                                _last_date, _was_beat = _last
+                                _days_since = _count_trading_days(_last_date, end_date)
+                                if 0 <= _days_since <= 5:
+                                    _proximity = (
+                                        "post_earnings_beat" if _was_beat
+                                        else "post_earnings_miss"
+                                    )
+                    if _proximity != "neutral":
+                        logger.info("%s: earnings_proximity=%s", symbol, _proximity)
+                except Exception as _ep_err:
+                    logger.debug("%s: earnings_proximity unavailable: %s", symbol, _ep_err)
 
-                    result.conviction_score    = score_conviction(result)
-                    if edgar_accel is not None:
-                        logger.debug(
-                            "%s: edgar_accel=%.2f  ohlcv_accel=%.2f",
-                            symbol, edgar_accel, result.earnings_acceleration,
-                        )
-                    results.append(result)
+                _symbol_data.append((
+                    symbol, spy_bars, signal_type, lookback, bars,
+                    news_feat, edgar_accel, _eps_growth, _peg_score,
+                    _breadth_adj, _breadth_override, _macro_regime, _vix_regime,
+                    _proximity,
+                ))
 
             except Exception as e:
-                logger.error(f"{symbol}: scan error — {e}")
+                logger.error(f"{symbol}: data fetch error — {e}")
                 continue
+
+    # Phase 2: parallel scoring — pure computation, no network or DuckDB calls.
+    # DuckDB connections cannot be shared across processes; all DB work is done above.
+    n_workers = max(1, _mp.cpu_count() - 1)
+    if n_workers > 1 and len(_symbol_data) > 1:
+        with _mp.Pool(n_workers) as pool:
+            scored = pool.map(_scan_symbol_worker, _symbol_data)
+    else:
+        scored = [_scan_symbol_worker(args) for args in _symbol_data]
+
+    results = [r for r in scored if r is not None]
 
     # Sort by conviction score, highest first
     results.sort(key=lambda r: r.conviction_score, reverse=True)

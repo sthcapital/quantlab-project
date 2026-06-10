@@ -7463,6 +7463,103 @@ class TestSelectTopCandidates:
         assert sectors.count("Health Care") == 2
         assert len(selected) == 5
 
+    def test_negative_eps_growth_excluded(self):
+        """Symbols with eps_growth < -0.10 must be excluded regardless of other scores."""
+        fn = self._load()
+        r = self._make_result("KRC", conviction=0.80, stage=2, edgar_accel=0.0)
+        r.eps_growth = -1.48  # deeply negative like the real KRC case
+        iwl = {"KRC": self._iwl_entry(options=True)}
+        assert fn([r], iwl, lambda s: True) == []
+
+    def test_borderline_eps_growth_excluded(self):
+        """eps_growth exactly -0.11 (just past the -0.10 threshold) is excluded."""
+        fn = self._load()
+        r = self._make_result("BAD", conviction=0.80)
+        r.eps_growth = -0.11
+        iwl = {"BAD": self._iwl_entry(options=True)}
+        assert fn([r], iwl, lambda s: True) == []
+
+    def test_eps_growth_just_inside_threshold_passes(self):
+        """eps_growth = -0.09 (within -10% gate) should not be blocked by the gate."""
+        fn = self._load()
+        r = self._make_result("OK", conviction=0.80)
+        r.eps_growth = -0.09
+        iwl = {"OK": self._iwl_entry(options=True)}
+        assert len(fn([r], iwl, lambda s: True)) == 1
+
+    def test_eps_growth_none_does_not_block(self):
+        """eps_growth=None (EDGAR unavailable) must not trigger the gate."""
+        fn = self._load()
+        r = self._make_result("NOEDR", conviction=0.80)
+        r.eps_growth = None
+        iwl = {"NOEDR": self._iwl_entry(options=True)}
+        assert len(fn([r], iwl, lambda s: True)) == 1
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PCR flat-file fallback
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPcrFlatFileFallback:
+    """Tests for _pcr_from_flat_file() in cboe.py."""
+
+    def test_pcr_computed_correctly_from_parquet(self, tmp_path):
+        """_pcr_from_flat_file reads a cached parquet and returns correct PCR values."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        from datetime import date
+        from unittest.mock import patch, MagicMock
+        from quantlab.providers.cboe import _pcr_from_flat_file, _INDEX_UNDERLYINGS
+
+        trade_date = date(2026, 6, 9)
+
+        # Build a fake options parquet: 300 equity puts, 400 equity calls,
+        # 50 index puts (SPX), 100 index calls (SPX)
+        table = pa.table({
+            "option_type": ["P", "P", "C", "C", "P",   "C"],
+            "volume":      [100.0, 200.0, 150.0, 250.0, 50.0, 100.0],
+            "underlying":  ["AAPL", "MSFT", "AAPL", "MSFT", "SPX", "SPX"],
+        })
+        fake_parquet = tmp_path / f"options_{trade_date.isoformat()}.parquet"
+        pq.write_table(table, str(fake_parquet))
+
+        mock_ff = MagicMock()
+        mock_ff.options_cache_path.return_value = fake_parquet
+
+        with patch("quantlab.providers.flat_files.FlatFileProvider", return_value=mock_ff):
+            result = _pcr_from_flat_file(trade_date)
+
+        assert result is not None
+        eq_pcr, total_pcr, idx_pcr = result
+
+        # equity: puts=300, calls=400 → 0.75
+        assert abs(eq_pcr - 0.75) < 0.01, f"eq_pcr={eq_pcr}"
+        # index: SPX puts=50, calls=100 → 0.50
+        assert abs(idx_pcr - 0.50) < 0.01, f"idx_pcr={idx_pcr}"
+        # total: puts=350, calls=500 → 0.70
+        assert abs(total_pcr - 0.70) < 0.01, f"total_pcr={total_pcr}"
+        # All PCR values must be non-zero
+        assert eq_pcr > 0.0
+        assert idx_pcr > 0.0
+        assert total_pcr > 0.0
+
+    def test_pcr_nonexistent_file_returns_none(self, tmp_path):
+        """_pcr_from_flat_file returns None when the options file cannot be downloaded."""
+        from datetime import date
+        from unittest.mock import patch, MagicMock
+        from quantlab.providers.cboe import _pcr_from_flat_file
+
+        trade_date = date(2026, 6, 7)  # a Saturday — no file
+
+        mock_ff = MagicMock()
+        mock_ff.options_cache_path.return_value = tmp_path / "nonexistent.parquet"
+        mock_ff.download_options_day.side_effect = Exception("NoSuchKey")
+
+        with patch("quantlab.providers.flat_files.FlatFileProvider", return_value=mock_ff):
+            result = _pcr_from_flat_file(trade_date)
+
+        assert result is None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # IC Monitor

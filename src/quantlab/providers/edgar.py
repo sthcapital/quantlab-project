@@ -517,6 +517,27 @@ def get_edgar_acceleration(symbol: str, max_age_days: int = 7) -> Optional[float
         return None
 
 
+def get_edgar_eps_growth(symbol: str, max_age_days: int = 7) -> Optional[float]:
+    """Return cached YoY EPS growth rate for symbol from edgar_fundamentals, or None."""
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+
+        cutoff = (date.today() - timedelta(days=max_age_days)).isoformat()
+        con = duckdb.connect(str(DB_PATH))
+        _ensure_edgar_table(con)
+        row = con.execute(
+            "SELECT eps_growth FROM edgar_fundamentals "
+            "WHERE symbol = ? AND fetch_date >= ? "
+            "ORDER BY fetch_date DESC LIMIT 1",
+            [symbol, cutoff],
+        ).fetchone()
+        con.close()
+        return float(row[0]) if row is not None and row[0] is not None else None
+    except Exception:
+        return None
+
+
 # ── Scoring ───────────────────────────────────────────────────────────────────
 
 # ── Earnings calendar helpers ─────────────────────────────────────────────────
