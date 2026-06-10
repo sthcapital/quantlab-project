@@ -498,8 +498,26 @@ def main() -> None:
         except Exception as _cl_err:
             print(f"  watchlist cleanup warning: {_cl_err}")
 
-        # ── Add top-5 to paper watchlist ─────────────────────────────────────
-        added = sum(1 for item in top5 if add_to_watchlist(item[0]))
+        # ── Build set of symbols already on watchlist (duplicate guard) ─────
+        already_watching: set[str] = set()
+        try:
+            import duckdb as _ddb2
+            from quantlab.storage import DB_PATH as _DB2
+            _con2 = _ddb2.connect(str(_DB2))
+            _rows = _con2.execute(
+                "SELECT symbol FROM watchlist WHERE status='watching'"
+            ).fetchall()
+            already_watching = {row[0] for row in _rows}
+            _con2.close()
+        except Exception:
+            pass
+
+        # ── Add top-5 to paper watchlist (skip if already tracking) ──────────
+        added = sum(
+            1 for item in top5
+            if item[0].symbol not in already_watching
+            and add_to_watchlist(item[0])
+        )
         n_qual = len([
             r for r in results
             if r.stage == 2 and _is_common_stock(r.symbol) and r.conviction_score >= 0.70
