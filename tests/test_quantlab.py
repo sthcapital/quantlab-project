@@ -6007,6 +6007,216 @@ class TestEdgarYoYMetrics:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Adjusted EPS from 8-K press releases (quantlab.providers.edgar)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAdjustedEpsFrom8K:
+    """Tests for fetch_adjusted_eps_from_8k, _parse_adjusted_eps, and the
+    adj_eps_yoy_pct preference in compute_earnings_acceleration.
+    All mocked — no network access required.
+    """
+
+    # ── _parse_adjusted_eps ───────────────────────────────────────────────────
+
+    def test_parse_cvs_pattern(self):
+        from quantlab.providers.edgar import _parse_adjusted_eps
+        text = "Adjusted EPS of $2.57 increased from $2.25 in the prior year period."
+        current, prior = _parse_adjusted_eps(text)
+        assert current == pytest.approx(2.57)
+        assert prior   == pytest.approx(2.25)
+
+    def test_parse_earnings_per_share_pattern(self):
+        from quantlab.providers.edgar import _parse_adjusted_eps
+        text = "Adjusted earnings per share of $1.45 for the quarter."
+        current, prior = _parse_adjusted_eps(text)
+        assert current == pytest.approx(1.45)
+        assert prior is None
+
+    def test_parse_dollar_first_pattern(self):
+        from quantlab.providers.edgar import _parse_adjusted_eps
+        text = "Company delivered $3.12 adjusted EPS in Q2."
+        current, prior = _parse_adjusted_eps(text)
+        assert current == pytest.approx(3.12)
+        assert prior is None
+
+    def test_parse_no_match_returns_none(self):
+        from quantlab.providers.edgar import _parse_adjusted_eps
+        assert _parse_adjusted_eps("Revenue grew 15% year over year.") == (None, None)
+        assert _parse_adjusted_eps("") == (None, None)
+
+    def test_parse_compared_to_variant(self):
+        from quantlab.providers.edgar import _parse_adjusted_eps
+        text = "Adjusted EPS of $4.10 compared to $3.80 in the prior-year quarter."
+        current, prior = _parse_adjusted_eps(text)
+        assert current == pytest.approx(4.10)
+        assert prior   == pytest.approx(3.80)
+
+    def test_strip_html_then_parse(self):
+        from quantlab.providers.edgar import _parse_adjusted_eps, _strip_html
+        html = "<p><b>Adjusted EPS of $2.57</b> increased from $2.25 in the prior year.</p>"
+        current, prior = _parse_adjusted_eps(_strip_html(html))
+        assert current == pytest.approx(2.57)
+        assert prior   == pytest.approx(2.25)
+
+    # ── fetch_adjusted_eps_from_8k (mocked HTTP) ──────────────────────────────
+
+    def test_fetch_cvs_full_flow(self, monkeypatch):
+        """submissions → index → press release → (2.57, 2.25)."""
+        import quantlab.providers.edgar as _edgar
+        import requests as _req
+
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        PRESS_RELEASE = (
+            "Adjusted EPS of $2.57 increased from $2.25 in the prior year period."
+        )
+
+        class _R:
+            def __init__(self, data): self._d = data; self.text = data if isinstance(data, str) else ""
+            def raise_for_status(self): pass
+            def json(self): return self._d
+
+        INDEX_HTML = (
+            '<td scope="row">EX-99.1</td>'
+            '<td scope="row">'
+            '<a href="/Archives/edgar/data/64803/000006480326042428/cvs_ex99x1q1-26.htm">'
+            "cvs_ex99x1q1-26.htm</a></td>"
+        )
+
+        def mock_get(url, headers=None, timeout=30):
+            if "submissions" in url:
+                return _R({"filings": {"recent": {
+                    "form":            ["8-K"],
+                    "filingDate":      ["2026-05-06"],
+                    "accessionNumber": ["0000064803-26-042428"],
+                    "items":           ["2.02,9.01"],
+                }}})
+            if "index.html" in url:
+                return _R(INDEX_HTML)
+            if "cvs_ex99x1q1-26.htm" in url:
+                return _R(PRESS_RELEASE)
+            raise ValueError(f"Unexpected URL: {url}")
+
+        monkeypatch.setattr(_req, "get", mock_get)
+        result = _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS")
+        assert result == pytest.approx((2.57, 2.25))
+
+    def test_fetch_no_recent_8k_returns_none(self, monkeypatch):
+        """No 8-K in submissions → (None, None)."""
+        import quantlab.providers.edgar as _edgar
+        import requests as _req
+
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        class _R:
+            def raise_for_status(self): pass
+            def json(self): return {"filings": {"recent": {
+                "form":            ["10-Q", "10-K"],
+                "filingDate":      ["2026-01-15", "2025-10-20"],
+                "accessionNumber": ["0000064803-26-000001", "0000064803-25-000002"],
+            }}}
+
+        monkeypatch.setattr(_req, "get", lambda url, headers=None, timeout=30: _R())
+        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None)
+
+    def test_fetch_8k_outside_90_days_returns_none(self, monkeypatch):
+        """8-K exists but older than 90 days → (None, None)."""
+        import quantlab.providers.edgar as _edgar
+        import requests as _req
+
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        class _R:
+            def raise_for_status(self): pass
+            def json(self): return {"filings": {"recent": {
+                "form":            ["8-K"],
+                "filingDate":      ["2025-01-01"],  # > 90 days ago
+                "accessionNumber": ["0000064803-25-000001"],
+            }}}
+
+        monkeypatch.setattr(_req, "get", lambda url, headers=None, timeout=30: _R())
+        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None)
+
+    def test_fetch_no_ex991_returns_none(self, monkeypatch):
+        """8-K present but no EX-99.1 in filing index → (None, None)."""
+        import quantlab.providers.edgar as _edgar
+        import requests as _req
+
+        monkeypatch.setattr("time.sleep", lambda s: None)
+
+        class _R:
+            def __init__(self, data): self._d = data; self.text = ""
+            def raise_for_status(self): pass
+            def json(self): return self._d
+
+        def mock_get(url, headers=None, timeout=30):
+            if "submissions" in url:
+                return _R({"filings": {"recent": {
+                    "form": ["8-K"], "filingDate": ["2026-05-06"],
+                    "accessionNumber": ["0000064803-26-042428"],
+                    "items": ["2.02,9.01"],
+                }}})
+            if "index.html" in url:
+                # HTML with only the 8-K form doc — no EX-99.1 present
+                return _R(
+                    '<td scope="row">8-K</td>'
+                    '<td scope="row"><a href="/Archives/edgar/data/64803/000006480326042428/main8k.htm">'
+                    "main8k.htm</a></td>"
+                )
+            raise ValueError(f"Unexpected: {url}")
+
+        monkeypatch.setattr(_req, "get", mock_get)
+        assert _edgar.fetch_adjusted_eps_from_8k("0000064803", "CVS") == (None, None)
+
+    # ── compute_earnings_acceleration prefers adj_eps_yoy_pct ────────────────
+
+    def test_adj_eps_overrides_gaap_eps_yoy(self):
+        """adj_eps_yoy_pct=0.75 (75%) should override GAAP eps_yoy_pct=0.10 (10%)."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
+
+        snap = FundamentalSnapshot(
+            ticker="TEST", cik="0", as_of=date.today(),
+            eps_yoy_pct=0.10,
+            eps_yoy_history=[0.10],
+            adj_eps_yoy_pct=0.75,   # O'Neil 70–100% band → base 0.8
+        )
+        score = compute_earnings_acceleration(snap)
+        assert score == pytest.approx(0.80, abs=1e-4)   # adj wins, not GAAP 0.1
+
+    def test_gaap_fallback_when_adj_eps_is_none(self):
+        """When adj_eps_yoy_pct is None, GAAP eps_yoy drives the score."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
+
+        snap = FundamentalSnapshot(
+            ticker="TEST", cik="0", as_of=date.today(),
+            eps_yoy_pct=0.10,
+            eps_yoy_history=[0.10],
+            adj_eps_yoy_pct=None,
+        )
+        score = compute_earnings_acceleration(snap)
+        assert score == pytest.approx(0.10, abs=1e-4)   # 0–20% band
+
+    def test_adj_eps_with_acceleration_bonus(self):
+        """adj_eps_yoy_pct + is_accelerating=True adds the +0.10 bonus."""
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
+
+        snap = FundamentalSnapshot(
+            ticker="TEST", cik="0", as_of=date.today(),
+            adj_eps_yoy_pct=0.75,
+            is_accelerating=True,
+        )
+        score = compute_earnings_acceleration(snap)
+        assert score == pytest.approx(0.90, abs=1e-4)   # 0.8 + 0.1 accel bonus
+
+    def test_snapshot_adj_fields_default_none(self):
+        """New FundamentalSnapshot fields default to None."""
+        from quantlab.providers.edgar import FundamentalSnapshot
+        snap = FundamentalSnapshot(ticker="X", cik="0", as_of=date.today())
+        assert snap.adj_eps is None
+        assert snap.adj_eps_yoy_pct is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Book-derived edge improvements — stage classification, volume validation,
 # PEG ratio, volume dry-up  (Weinstein / Minervini / O'Neil / Boucher / Darvas)
 # ══════════════════════════════════════════════════════════════════════════════

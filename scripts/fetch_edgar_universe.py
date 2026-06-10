@@ -37,6 +37,7 @@ from quantlab.providers.edgar import (
     _ensure_edgar_table,
     _save_edgar_cache,
     compute_earnings_acceleration,
+    fetch_adjusted_eps_from_8k,
     fetch_fundamentals,
 )
 from quantlab.storage import DB_PATH
@@ -94,6 +95,19 @@ def _process_symbol(symbol: str, force: bool, force_null: bool, con) -> str:
 
     try:
         snap = fetch_fundamentals(symbol, metrics=_FETCH_METRICS)
+
+        # Enrich with adjusted (non-GAAP) EPS from 8-K press release when available
+        try:
+            adj_eps, prior_adj_eps = fetch_adjusted_eps_from_8k(snap.cik, symbol)
+            if adj_eps is not None:
+                snap.adj_eps = adj_eps
+                if prior_adj_eps is not None and abs(prior_adj_eps) >= 1e-9:
+                    snap.adj_eps_yoy_pct = round(
+                        (adj_eps - prior_adj_eps) / abs(prior_adj_eps), 6
+                    )
+        except Exception:
+            pass
+
         score      = compute_earnings_acceleration(snap)
         consecutive = _count_consecutive_beats(
             snap.eps_history or snap.net_income_history

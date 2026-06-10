@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import functools
 import logging
+import re
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Optional
@@ -16,6 +19,26 @@ _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _FACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
 _SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik}.json"
 _HEADERS = {"User-Agent": "QuantLab Research quantlab@sthcapital.com"}
+
+# ── Rate limiter — max 8 req/sec per SEC EDGAR fair-use policy ────────────────
+_EDGAR_LOCK = threading.Lock()
+_EDGAR_LAST_REQ: float = 0.0
+_EDGAR_MIN_INTERVAL: float = 1.0 / 8  # 125 ms between requests
+
+
+def _edgar_get(url: str, timeout: int = 30) -> requests.Response:
+    """Rate-limited GET for SEC EDGAR — enforces ≤ 8 req/sec globally."""
+    global _EDGAR_LAST_REQ
+    with _EDGAR_LOCK:
+        elapsed = time.monotonic() - _EDGAR_LAST_REQ
+        wait = _EDGAR_MIN_INTERVAL - elapsed
+        if wait > 0:
+            time.sleep(wait)
+        _EDGAR_LAST_REQ = time.monotonic()
+    resp = requests.get(url, headers=_HEADERS, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
 
 DEFAULT_METRICS = [
     "revenue", "net_income", "eps_diluted", "total_assets",
@@ -77,6 +100,9 @@ class FundamentalSnapshot:
     eps_yoy_history: list[float] = field(default_factory=list)      # last 4 quarters, oldest-first
     # True when BOTH revenue AND eps YoY growth rates are increasing for 2+ consecutive quarters
     is_accelerating: bool = False
+    # Adjusted (non-GAAP) EPS from most recent 8-K press release (Exhibit 99.1)
+    adj_eps: Optional[float] = None
+    adj_eps_yoy_pct: Optional[float] = None   # (current - prior) / abs(prior)
 
 
 # ── CIK lookup — cached for process lifetime ──────────────────────────────────
@@ -122,11 +148,15 @@ def _ensure_edgar_table(con) -> None:
             PRIMARY KEY (symbol, fetch_date)
         )
     """)
-    # Migration: add eps_diluted when table already existed without it
+    # Auto-migration: add columns absent in earlier schema versions
     try:
         cols = {r[1] for r in con.execute("PRAGMA table_info(edgar_fundamentals)").fetchall()}
         if "eps_diluted" not in cols:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_diluted DOUBLE")
+        if "adj_eps" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN adj_eps DOUBLE")
+        if "adj_eps_yoy_pct" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN adj_eps_yoy_pct DOUBLE")
     except Exception:
         pass
 
@@ -182,8 +212,9 @@ def _save_edgar_cache(
             """
             INSERT OR REPLACE INTO edgar_fundamentals
                 (symbol, fetch_date, acceleration_score, revenue_growth,
-                 eps_growth, consecutive_beats, eps_diluted)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 eps_growth, consecutive_beats, eps_diluted,
+                 adj_eps, adj_eps_yoy_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 symbol,
@@ -193,6 +224,8 @@ def _save_edgar_cache(
                 _eps_growth,
                 consecutive_beats,
                 snap.eps_diluted,
+                snap.adj_eps,
+                snap.adj_eps_yoy_pct,
             ],
         )
         con.close()
@@ -658,6 +691,148 @@ def get_last_earnings_result(
         return None
 
 
+# ── Adjusted EPS from 8-K press releases ─────────────────────────────────────
+
+_ADJ_EPS_PATTERNS = [
+    re.compile(r'[Aa]djusted\s+(?:diluted\s+)?EPS\s+of\s+\$(\d+\.\d+)'),
+    re.compile(r'[Aa]djusted\s+(?:diluted\s+)?earnings\s+per\s+share\s+of\s+\$(\d+\.\d+)'),
+    re.compile(r'\$(\d+\.\d+)\s+(?:adjusted|non-GAAP)\s+(?:diluted\s+)?EPS'),
+]
+
+# Combined: captures current and prior-year EPS in one match
+# Handles "Adjusted EPS of $X.XX increased from $Y.YY" and "compared to $Y.YY"
+_ADJ_EPS_WITH_PRIOR_PATTERN = re.compile(
+    r'[Aa]djusted\s+(?:diluted\s+)?EPS\s+of\s+\$(\d+\.\d+).{0,80}?'
+    r'(?:from|compared to)\s+\$(\d+\.\d+)',
+    re.DOTALL,
+)
+
+
+def _strip_html(html: str) -> str:
+    """Strip HTML tags and decode common entities (no external dependency)."""
+    text = re.sub(r'<[^>]+>', ' ', html)
+    for entity, char in (('&amp;', '&'), ('&nbsp;', ' '), ('&lt;', '<'), ('&gt;', '>')):
+        text = text.replace(entity, char)
+    return re.sub(r'\s+', ' ', text)
+
+
+def _parse_adjusted_eps(text: str) -> tuple[Optional[float], Optional[float]]:
+    """Extract (current_adj_eps, prior_adj_eps) from press release text."""
+    m = _ADJ_EPS_WITH_PRIOR_PATTERN.search(text)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except (ValueError, IndexError):
+            pass
+
+    for pattern in _ADJ_EPS_PATTERNS:
+        m = pattern.search(text)
+        if m:
+            try:
+                return float(m.group(1)), None
+            except (ValueError, IndexError):
+                continue
+
+    return (None, None)
+
+
+def fetch_adjusted_eps_from_8k(
+    cik: str, symbol: str
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Parse adjusted/non-GAAP EPS from the most recent EDGAR 8-K Exhibit 99.1.
+
+    Searches for the most recent 8-K filed within 90 days, locates Exhibit 99.1
+    (earnings press release), and parses adjusted EPS via regex.
+
+    Args:
+        cik:    Zero-padded 10-digit CIK string (e.g. "0000064803" for CVS).
+        symbol: Ticker symbol — used for logging only.
+
+    Returns:
+        (current_adj_eps, prior_adj_eps) or (None, None) if not found.
+    """
+    cutoff = date.today() - timedelta(days=90)
+    cik_int = str(int(cik))  # strip leading zeros for EDGAR archive URLs
+
+    # Step 1: submissions API — find most recent 8-K within 90 days
+    try:
+        data = _edgar_get(_SUBMISSIONS_URL.format(cik=cik)).json()
+    except Exception as exc:
+        logger.debug("%s: fetch_adjusted_eps_from_8k submissions failed: %s", symbol, exc)
+        return (None, None)
+
+    recent       = data.get("filings", {}).get("recent", {})
+    forms        = recent.get("form", [])
+    filing_dates = recent.get("filingDate", [])
+    acc_numbers  = recent.get("accessionNumber", [])
+    # items: e.g. "2.02,9.01" for earnings release; absent/empty for older filings
+    items_list   = recent.get("items", [""] * len(forms))
+
+    target_acc: Optional[str] = None
+    for form, filed_str, acc, items in zip(forms, filing_dates, acc_numbers, items_list):
+        if form not in ("8-K", "8-K/A"):
+            continue
+        # Skip non-earnings 8-Ks when items info is available.
+        # Item 2.02 = Results of Operations; 7.01 = Regulation FD disclosure.
+        items_str = str(items)
+        if items_str and not any(x in items_str for x in ("2.02", "7.01")):
+            continue
+        try:
+            filed = date.fromisoformat(filed_str)
+        except Exception:
+            continue
+        if filed < cutoff:
+            break  # list is newest-first; past the 90-day window
+        target_acc = acc
+        break  # first qualifying 8-K is the most recent one
+
+    if target_acc is None:
+        logger.debug("%s: no earnings 8-K found within 90 days", symbol)
+        return (None, None)
+
+    # Step 2: filing index HTML — locate Exhibit 99.1 filename
+    acc_nodashes = target_acc.replace("-", "")
+    index_url = (
+        f"https://www.sec.gov/Archives/edgar/data/{cik_int}"
+        f"/{acc_nodashes}/{target_acc}-index.html"
+    )
+    try:
+        idx_html = _edgar_get(index_url).text
+    except Exception as exc:
+        logger.debug("%s: 8-K index fetch failed: %s", symbol, exc)
+        return (None, None)
+
+    # Parse index HTML: find the row with type EX-99 or EX-99.1 and extract the
+    # direct archive href (not wrapped in XBRL viewer /ix?doc= prefix).
+    ex991_url: Optional[str] = None
+    m_ex = re.search(
+        r'>EX-99(?:\.1)?</td>\s*<td[^>]*>\s*<a\s+href="(/Archives/edgar/data/[^"]+\.htm)"',
+        idx_html, re.I,
+    )
+    if m_ex:
+        ex991_url = f"https://www.sec.gov{m_ex.group(1)}"
+
+    if ex991_url is None:
+        logger.debug("%s: Exhibit 99.1 not found in 8-K filing index", symbol)
+        return (None, None)
+
+    # Step 3: fetch press release and parse adjusted EPS
+    try:
+        pr_text = _edgar_get(ex991_url, timeout=60).text
+    except Exception as exc:
+        logger.debug("%s: Exhibit 99.1 fetch failed: %s", symbol, exc)
+        return (None, None)
+
+    result = _parse_adjusted_eps(_strip_html(pr_text))
+    if result[0] is not None:
+        logger.debug(
+            "%s: adjusted EPS from 8-K: current=%.2f  prior=%s",
+            symbol, result[0], result[1],
+        )
+    return result
+
+
 def format_yoy_summary(snap: FundamentalSnapshot, score: float) -> str:
     """Return a one-line YoY summary for display in scripts and demo output.
 
@@ -721,8 +896,12 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
                 snap.eps_yoy_pct = _eps_yoy_direct
 
     # ── YoY path (preferred when ≥ 5 quarters of data available) ─────────────
-    # Prioritise EPS YoY; fall back to revenue YoY only when EPS is unavailable.
-    yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
+    # Prefer adjusted EPS YoY (non-GAAP, from 8-K press release) over GAAP eps_yoy;
+    # fall back to revenue_yoy when neither is available.
+    if snap.adj_eps_yoy_pct is not None:
+        yoy_history: list[float] = [snap.adj_eps_yoy_pct]
+    else:
+        yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
     if yoy_history:
         latest_yoy = yoy_history[-1]
         if latest_yoy <= 0:
