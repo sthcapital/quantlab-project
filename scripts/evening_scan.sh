@@ -170,16 +170,24 @@ SCAN_ARGS=(
     --secondary-lookback "$SECONDARY_LOOKBACK"
     --save-db
     --add-to-watchlist
-    --with-options
 )
+if [[ -n "${POLYGON_API_KEY:-}" ]]; then
+    SCAN_ARGS+=(--with-options)
+else
+    log "WARNING: POLYGON_API_KEY not set — skipping --with-options"
+fi
 if [[ -n "$TWS_UP" ]]; then
     SCAN_ARGS+=(--with-news)
 else
     SCAN_ARGS+=(--no-news)
 fi
 
+log "Running: python scripts/scan_universe.py ${SCAN_ARGS[*]}"
 SCAN_OUTPUT="$(python scripts/scan_universe.py "${SCAN_ARGS[@]}" 2>&1 \
-               | tee -a "$LOG_FILE")" || true
+               | tee -a "$LOG_FILE")"
+if [[ -z "$SCAN_OUTPUT" ]]; then
+    log "ERROR: scan produced no output — check $LOG_FILE for details"
+fi
 
 # ── Extract high-conviction symbols ─────────────────────────────────────────────
 _PARSE_SCRIPT='
