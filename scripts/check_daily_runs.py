@@ -6,15 +6,17 @@ within its expected time window.  Exits with code 1 if any critical job
 is missing so the script can be used in monitoring / alerting pipelines.
 
 Critical jobs (exit code 1 when absent):
-    Morning scan   — 08:30–09:30 ET   (cron: 13:00 UTC)
+    Morning check  — 08:30–09:15 ET   (cron: 12:45 UTC)
+    Evening scan   — 17:00–17:45 ET   (cron: 21:00 UTC Mon-Fri / 22:00 UTC Sun)
     EOD tracker    — 16:00–17:00 ET   (cron: 20:30 UTC)
 
 Advisory jobs (reported but do not affect exit code):
-    Breadth update — 16:00–18:00 ET   (runs 5 min after EOD tracker)
+    Breadth update — 17:00–18:30 ET   (runs inside evening scan)
 
 Output format:
-    [OK]      Morning scan    ran at 09:00 AM ET
-    [OK]      EOD tracker     ran at 04:30 PM ET  (outside window: 05:05 PM)
+    [OK]      Morning check   ran at 08:45 AM ET
+    [OK]      Evening scan    ran at 05:05 PM ET
+    [OK]      EOD tracker     ran at 04:30 PM ET
     [MISSING] Breadth update  not found for 2026-06-05
 
 Log timestamp format (America/New_York local time):
@@ -87,22 +89,33 @@ class JobSpec:
 
 JOBS: list[JobSpec] = [
     JobSpec(
-        name     = "Morning scan",
+        name     = "Morning check",
         patterns = [
-            "Starting universe scan",           # from daily_scan.sh log()
-            "QuantLab Daily Pre-Market Scan",   # header printed by daily_scan.sh
-            "QuantLab Universe Scanner",         # header from scan_universe.py
+            "QuantLab Morning Check",           # header printed by morning.sh
+            "Morning Check complete",           # footer of morning.sh
+            "Breadth tape (cached)",            # step 1 separator in morning.sh
+            "Morning summary",                  # step 4 separator in morning.sh
         ],
-        window   = (8, 30, 9, 30),
+        window   = (8, 30, 9, 15),
+        critical = True,
+    ),
+    JobSpec(
+        name     = "Evening scan",
+        patterns = [
+            "Starting universe scan",           # from evening_scan.sh log()
+            "QuantLab Evening Scan",            # header printed by evening_scan.sh
+            "QuantLab Universe Scanner",        # header from scan_universe.py
+        ],
+        window   = (17, 0, 17, 45),
         critical = True,
     ),
     JobSpec(
         name     = "EOD tracker",
         patterns = [
-            "EOD tracker complete",             # from morning.sh nohup script
-            "EOD tracker —",               # — separator in nohup script
+            "EOD tracker complete",             # separator in nohup script
+            "EOD tracker —",                    # separator variant
             "Forward Return Tracker",           # header from track_forward_returns.py
-            "EOD tracker ——",         # variant
+            "EOD tracker ——",                   # variant
         ],
         window   = (16, 0, 17, 0),
         critical = True,
@@ -110,12 +123,12 @@ JOBS: list[JobSpec] = [
     JobSpec(
         name     = "Breadth update",
         patterns = [
-            "Breadth update complete",          # from morning.sh nohup script
-            "Breadth Update  —",           # header from update_breadth.py
-            "Breadth update —",            # variant in separator line
+            "Breadth update complete",          # separator in nohup script
+            "Breadth Update  —",                # header from update_breadth.py
+            "Breadth update —",                 # variant in separator line
             "tape=",                            # from BreadthSnapshot.summary_line()
         ],
-        window   = (16, 0, 18, 0),
+        window   = (17, 0, 18, 30),
         critical = False,
     ),
 ]

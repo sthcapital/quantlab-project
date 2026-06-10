@@ -4511,28 +4511,37 @@ class TestMorningShScript:
         assert p.exists()
         assert os.access(p, os.X_OK) or True  # may not be +x in CI
 
-    def test_nohup_used_for_background_jobs(self):
+    def test_no_full_universe_scan(self):
+        """morning.sh must NOT launch the full universe scan — that runs at 5 PM."""
         content = self._script_path().read_text()
-        assert "nohup bash" in content, "Background jobs must use nohup"
-
-    def test_disown_used_after_nohup(self):
-        content = self._script_path().read_text()
-        assert "disown" in content, "Background PIDs must be disowned"
-
-    def test_no_bare_subshell_background(self):
-        """Old ( ... ) & pattern without nohup must not appear for background jobs."""
-        import re
-        content = self._script_path().read_text()
-        # Look for ')  &' or ') &' at end of compound command (the old risky pattern)
-        # Allow for lines that are part of _schedule function body
-        bare_bg = re.findall(r'^\s*\)\s*&\s*$', content, re.MULTILINE)
-        assert len(bare_bg) == 0, (
-            f"Found {len(bare_bg)} bare subshell background(s) without nohup"
+        assert "scan_universe.py" not in content, (
+            "morning.sh must not call scan_universe.py — full scan is evening_scan.sh"
+        )
+        assert "daily_scan.sh" not in content, (
+            "morning.sh must not call daily_scan.sh — that script is retired"
         )
 
-    def test_temp_script_self_deletes(self):
+    def test_calls_breadth_no_polygon(self):
+        """morning.sh must update breadth rolling metrics without a Polygon fetch."""
         content = self._script_path().read_text()
-        assert 'rm -f "\\$0"' in content, "Temp scripts should self-delete on completion"
+        assert "update_breadth.py" in content, "morning.sh must call update_breadth.py"
+        assert "--no-polygon" in content, "morning.sh must use --no-polygon (cached data only)"
+
+    def test_no_bare_subshell_background(self):
+        """No bare ( ... ) & pattern — morning is synchronous."""
+        import re
+        content = self._script_path().read_text()
+        bare_bg = re.findall(r'^\s*\)\s*&\s*$', content, re.MULTILINE)
+        assert len(bare_bg) == 0, (
+            f"Found {len(bare_bg)} bare subshell background(s) in morning.sh"
+        )
+
+    def test_references_evening_scan(self):
+        """morning.sh header must reference evening_scan.sh so the operator knows where results come from."""
+        content = self._script_path().read_text()
+        assert "evening_scan.sh" in content, (
+            "morning.sh must reference evening_scan.sh in its header"
+        )
 
     def test_syntax_valid(self):
         import subprocess, sys
@@ -4542,11 +4551,11 @@ class TestMorningShScript:
         )
         assert result.returncode == 0, f"Syntax error:\n{result.stderr}"
 
-    def test_dev_null_stdin_for_nohup(self):
+    def test_calls_watchlist_status(self):
+        """morning.sh must check watchlist stop levels."""
         content = self._script_path().read_text()
-        assert "< /dev/null" in content, (
-            "nohup processes should redirect stdin from /dev/null "
-            "to prevent accidental terminal reads"
+        assert "watchlist_status.py" in content, (
+            "morning.sh must call watchlist_status.py to check stop levels"
         )
 
 
@@ -4621,35 +4630,35 @@ class TestCheckDailyRuns:
     def test_find_job_exact_pattern_match(self):
         from datetime import date, time
         m = self._import()
-        spec = m.JOBS[0]   # Morning scan
+        spec = m.JOBS[0]   # Morning check
         today = [
-            "[2026-06-05 09:01:33] Starting universe scan ...",
-            "2026-06-05 09:01:33  INFO  ib_insync.client  Connecting",
+            "[2026-06-05 08:46:12] QuantLab Morning Check",
+            "2026-06-05 08:46:12  INFO  update_breadth  rolling recompute",
         ]
         found, run_time = m.find_job(today, spec)
         assert found is True
-        assert run_time == time(9, 1, 33)
+        assert run_time == time(8, 46, 12)
 
     def test_find_job_timestamp_from_nearby_line(self):
         """Pattern on line N, timestamp on line N-1."""
         from datetime import date, time
         m = self._import()
-        spec = m.JOBS[0]   # Morning scan
+        spec = m.JOBS[0]   # Morning check
         today = [
-            "[2026-06-05 09:00:05] Pre-flight OK",
-            "  QuantLab Daily Pre-Market Scan",   # no timestamp on this line
-            "  Universe : sp500_sample",
+            "[2026-06-05 08:46:00] Pre-flight OK",
+            "  QuantLab Morning Check",   # no timestamp on this line
+            "  (Lightweight — full scan runs at 5:00 PM ET)",
         ]
         found, run_time = m.find_job(today, spec)
         assert found is True
-        assert run_time == time(9, 0, 5)   # picked up from preceding line
+        assert run_time == time(8, 46, 0)   # picked up from preceding line
 
     def test_find_job_not_found(self):
         m = self._import()
-        spec = m.JOBS[1]   # EOD tracker
+        spec = m.JOBS[1]   # Evening scan
         today = [
-            "[2026-06-05 09:01:00] Starting universe scan ...",
-            "  Scan complete: 50 symbols processed",
+            "[2026-06-05 08:46:00] QuantLab Morning Check",
+            "  Morning Check complete",
         ]
         found, run_time = m.find_job(today, spec)
         assert found is False
@@ -4658,7 +4667,7 @@ class TestCheckDailyRuns:
     def test_find_job_found_without_timestamp(self):
         """Pattern found but no timestamp on any nearby line."""
         m = self._import()
-        spec = m.JOBS[2]   # Breadth update
+        spec = m.JOBS[3]   # Breadth update
         today = [
             "  Breadth Update  — 2026-06-05",   # date but no HH:MM:SS
             "  A=1847 D=842 | up4%=234",
@@ -4673,9 +4682,10 @@ class TestCheckDailyRuns:
         from datetime import date
         m = self._import()
         log = self._write_log(tmp_path, [
-            "[2026-06-05 09:02:00] Starting universe scan ...",
+            "[2026-06-05 08:46:00] QuantLab Morning Check",
+            "[2026-06-05 17:02:00] Starting universe scan ...",
             "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
-            "── [16:35] Breadth update complete — 2026-06-05 16:50:00",
+            "── [17:10] Breadth update complete — 2026-06-05 17:10:00",
         ])
         code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
         assert code == 0
@@ -4684,8 +4694,9 @@ class TestCheckDailyRuns:
         from datetime import date
         m = self._import()
         log = self._write_log(tmp_path, [
-            # Morning scan present, EOD missing
-            "[2026-06-05 09:02:00] Starting universe scan ...",
+            # Morning check and evening scan present, EOD missing
+            "[2026-06-05 08:46:00] QuantLab Morning Check",
+            "[2026-06-05 17:02:00] Starting universe scan ...",
         ])
         code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
         assert code == 1
@@ -4694,7 +4705,8 @@ class TestCheckDailyRuns:
         from datetime import date
         m = self._import()
         log = self._write_log(tmp_path, [
-            "[2026-06-05 09:02:00] Starting universe scan ...",
+            "[2026-06-05 08:46:00] QuantLab Morning Check",
+            "[2026-06-05 17:02:00] Starting universe scan ...",
             "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
             # Breadth update MISSING — advisory only
         ])
@@ -4720,10 +4732,11 @@ class TestCheckDailyRuns:
         from datetime import date
         m = self._import()
         log = self._write_log(tmp_path, [
-            # Morning scan at 10:30 AM (outside 8:30-9:30 window)
-            "[2026-06-05 10:30:00] Starting universe scan ...",
+            # Morning check at 10:30 AM (outside 8:30-9:15 window — late but present)
+            "[2026-06-05 10:30:00] QuantLab Morning Check",
+            "[2026-06-05 17:05:00] Starting universe scan ...",
             "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
-            "── [16:35] Breadth update complete — 2026-06-05 16:50:00",
+            "── [17:10] Breadth update complete — 2026-06-05 17:10:00",
         ])
         code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
         assert code == 0   # [LATE] is advisory, not a failure
@@ -4746,10 +4759,10 @@ class TestCheckDailyRuns:
     def test_in_window_true_at_boundary(self):
         from datetime import time
         m = self._import()
-        spec = m.JOBS[0]   # Morning scan: 08:30–09:30
+        spec = m.JOBS[0]   # Morning check: 08:30–09:15
         assert spec.in_window(time(8, 30))  is True   # start boundary
         assert spec.in_window(time(9, 0))   is True   # midpoint
-        assert spec.in_window(time(9, 30))  is True   # end boundary
+        assert spec.in_window(time(9, 15))  is True   # end boundary
 
     def test_in_window_false_outside(self):
         from datetime import time
