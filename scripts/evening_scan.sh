@@ -177,7 +177,7 @@ else
     log "WARNING: POLYGON_API_KEY not set — skipping --with-options"
 fi
 if [[ -n "$TWS_UP" ]]; then
-    SCAN_ARGS+=(--with-news)
+    # news is enabled by default — no flag needed
 else
     SCAN_ARGS+=(--no-news)
 fi
