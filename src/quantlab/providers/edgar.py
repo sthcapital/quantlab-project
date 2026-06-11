@@ -305,12 +305,15 @@ def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
 
 
 def _remove_annual_outliers(values: list[float]) -> list[float]:
-    """Remove interior values that are >2.5x both adjacent values.
+    """Remove values that are >2.5x all neighbors — catches annual totals
+    slipping through the duration filter when EDGAR XBRL start-date
+    metadata is absent or mis-tagged.
 
-    Annual totals (~4x a quarterly figure) occasionally slip through the
-    duration filter when EDGAR XBRL start-date metadata is absent or
-    mis-tagged.  This secondary check catches them without touching
-    endpoint values (which have only one neighbor).
+    Interior values are compared against both adjacent values.  Endpoint
+    values (first/last) have only one adjacent value, so they are compared
+    against their three nearest neighbors to resist seasonal quarterly
+    variation (annual totals are ~4x quarterly; seasonal spikes rarely
+    exceed 2x the surrounding quarters).
     """
     if len(values) < 3:
         return values
@@ -323,6 +326,20 @@ def _remove_annual_outliers(values: list[float]) -> list[float]:
             continue
         if curr_abs > 2.5 * prev_abs and curr_abs > 2.5 * next_abs:
             to_remove.add(i)
+    # Endpoint check: annual totals that land at the head or tail of the
+    # sorted array have only one adjacent value and are missed by the loop
+    # above.  Compare each endpoint against its three nearest neighbors.
+    if len(values) >= 4:
+        n = len(values)
+        for ep_idx, ref_range in (
+            (n - 1, range(n - 4, n - 1)),  # last value vs. 3 preceding
+            (0,     range(1, 4)),           # first value vs. 3 following
+        ):
+            ep_abs = abs(values[ep_idx])
+            refs = [abs(values[j]) for j in ref_range if 0 <= j < n]
+            valid = [r for r in refs if r > 1e-9]
+            if valid and ep_abs > 2.5 * max(valid):
+                to_remove.add(ep_idx)
     return [v for i, v in enumerate(values) if i not in to_remove]
 
 
@@ -417,6 +434,7 @@ def fetch_fundamentals(
 
     if "revenue" in metrics:
         h = _extract_periods(facts, "revenue", effective_periods)
+        h = _remove_annual_outliers(h)  # secondary defense: re-checks endpoints missed inside _extract_periods
         if h:
             snap.revenue = h[-1]
             snap.revenue_qoq_growth = _qoq_growth(h)

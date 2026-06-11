@@ -6398,12 +6398,31 @@ class TestAdjustedEpsFrom8K:
         assert _remove_annual_outliers([5.0]) == [5.0]
         assert _remove_annual_outliers([5.0, 6.0]) == [5.0, 6.0]
 
-    def test_remove_annual_outliers_endpoints_not_removed(self):
-        """First and last values are never removed (only one neighbor)."""
+    def test_remove_annual_outliers_endpoints_not_removed_when_large_neighbors(self):
+        """Endpoints survive when a neighboring value is also large (no net 2.5x gap)."""
         from quantlab.providers.edgar import _remove_annual_outliers
-        # 25 at position 0 and 24 at last position — should NOT be removed
+        # 25 at index 0 and 24 at last position — each is included in the other's
+        # neighbor set, so neither exceeds 2.5x max(neighbors).
         values = [25.0, 6.0, 7.0, 24.0]
         assert _remove_annual_outliers(values) == values
+
+    def test_remove_annual_outliers_annual_at_tail_removed(self):
+        """Annual total at the last position is caught by the endpoint check."""
+        from quantlab.providers.edgar import _remove_annual_outliers
+        # Q1/Q2/Q3 ~ 6-7, annual total (4x) at tail
+        values = [6.0, 7.0, 6.5, 27.0]
+        result = _remove_annual_outliers(values)
+        assert 27.0 not in result
+        assert result == [6.0, 7.0, 6.5]
+
+    def test_remove_annual_outliers_annual_at_head_removed(self):
+        """Annual total at the first position is caught by the endpoint check."""
+        from quantlab.providers.edgar import _remove_annual_outliers
+        # Annual total (4x) at head, followed by quarterly values
+        values = [27.0, 6.0, 7.0, 6.5]
+        result = _remove_annual_outliers(values)
+        assert 27.0 not in result
+        assert result == [6.0, 7.0, 6.5]
 
     def test_extract_periods_filters_annual_durations(self):
         """_extract_periods drops observations with duration > 120 days."""
