@@ -203,7 +203,20 @@ def _tick(v) -> str:
 
 
 def _stage_lbl(n: int) -> str:
-    return {1: "1·Base", 2: "2·Adv", 3: "3·Top", 4: "4·Dec"}.get(n, "?")
+    return {1: "1·Base", 2: "2", 3: "3·Top", 4: "4·Dec"}.get(n, "?")
+
+
+def _rev_pct(v) -> str:
+    """Format revenue_growth for display; cap outliers >±200% as 'N/A'."""
+    if v is None:
+        return "—"
+    try:
+        f = float(v)
+        if f > 2.0 or f < -1.0:
+            return "N/A"
+        return f"{f * 100:+.1f}%"
+    except (TypeError, ValueError):
+        return "—"
 
 
 # ── Footer callback ────────────────────────────────────────────────────────────
@@ -534,7 +547,7 @@ def _candidate_table(
         wr     = (f"WR:{bkt['win_rate']*100:.0f}%"
                   if bkt.get("win_rate") is not None else "")
         rev_v  = rev_map.get(en["symbol"])
-        rev_str = _pct(rev_v) if rev_v is not None else "—"
+        rev_str = _rev_pct(rev_v)
 
         if show_rev:
             rows.append([
@@ -600,10 +613,13 @@ def _alert_section(
     S: dict,
     candidates: list[dict],
     backtest_map: dict,
+    revenue_map: dict | None = None,
 ) -> list:
     top5 = [c for c in candidates if c.get("consecutive_days", 1) >= 2][:5]
     if not top5:
         return []
+
+    rev_map = revenue_map or {}
 
     e: list = []
     e.append(Spacer(1, 0.2 * inch))
@@ -627,6 +643,7 @@ def _alert_section(
         signal_line = (
             f"Stage: {_stage_lbl(stage)}   |   Conviction: {_fmt(en.get('conviction_score'))}"
             f"   |   EPS YoY: {_pct(en.get('earnings_score'))}"
+            f"   |   Rev YoY: {_rev_pct(rev_map.get(sym))}"
             f"   |   PEG: {_fmt(en.get('peg_score'))}"
         )
         detail_line = (
@@ -661,10 +678,16 @@ def _alert_section(
 
 # ── Basing Candidates (Stage 1) section ──────────────────────────────────────
 
-def _basing_table(S: dict, basing_cands: list[dict]) -> list:
+def _basing_table(
+    S: dict,
+    basing_cands: list[dict],
+    revenue_map: dict | None = None,
+) -> list:
     """Render 'Basing Candidates — Weekend Watchlist' for Stage 1 stocks."""
     if not basing_cands:
         return []
+
+    rev_map = revenue_map or {}
 
     e: list = []
     e.append(Spacer(1, 0.2 * inch))
@@ -677,8 +700,8 @@ def _basing_table(S: dict, basing_cands: list[dict]) -> list:
     ))
     e.append(Spacer(1, 0.08 * inch))
 
-    headers = ["#", "Symbol", "Days", "Conv", "Opts", "VDU", "EPS %", "PEG", "Notes"]
-    cw = [0.28, 0.72, 0.45, 0.50, 0.38, 0.38, 0.62, 0.45, 2.30]
+    headers = ["#", "Symbol", "Days", "Conv", "Opts", "VDU", "EPS %", "Rev %", "PEG", "Notes"]
+    cw = [0.28, 0.72, 0.45, 0.50, 0.38, 0.38, 0.62, 0.55, 0.45, 1.75]
     col_widths = [w * inch for w in cw]
 
     rows = [headers]
@@ -691,6 +714,7 @@ def _basing_table(S: dict, basing_cands: list[dict]) -> list:
             _tick(en.get("options_signal", False)),
             _tick(en.get("volume_dry_up", False)),
             _pct(en.get("earnings_score")),
+            _rev_pct(rev_map.get(en["symbol"])),
             _fmt(en.get("peg_score")),
             "",
         ])
@@ -703,7 +727,7 @@ def _basing_table(S: dict, basing_cands: list[dict]) -> list:
         ("FONTNAME",      (1, 1), (1, -1),  "Helvetica-Bold"),
         ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
         ("ALIGN",         (1, 0), (1, -1),  "LEFT"),
-        ("ALIGN",         (8, 0), (8, -1),  "LEFT"),
+        ("ALIGN",         (9, 0), (9, -1),  "LEFT"),
         ("ROWBACKGROUNDS",(0, 1), (-1, -1), [white, C_LGRAY]),
         ("GRID",          (0, 0), (-1, -1), 0.3, C_MGRAY),
         ("LINEBELOW",     (0, 0), (-1, 0),  1.0, C_DGRAY),
@@ -767,6 +791,31 @@ def _load_revenue_map(symbols: list[str], db_path: str | None = None) -> dict:
         for sym, rev in rows:
             if sym not in result:
                 result[sym] = rev
+        return result
+    except Exception:
+        return {}
+
+
+def _load_eps_map(symbols: list[str], db_path: str | None = None) -> dict:
+    """Return {symbol: eps_growth} from the edgar_fundamentals cache."""
+    if not symbols:
+        return {}
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(db_path or str(DB_PATH))
+        ph  = ",".join("?" * len(symbols))
+        rows = con.execute(
+            f"SELECT symbol, eps_growth FROM edgar_fundamentals "
+            f"WHERE symbol IN ({ph}) "
+            f"ORDER BY fetch_date DESC",
+            symbols,
+        ).fetchall()
+        con.close()
+        result: dict = {}
+        for sym, eps in rows:
+            if sym not in result:
+                result[sym] = eps
         return result
     except Exception:
         return {}
@@ -851,13 +900,26 @@ def generate(
     # ── Fetch data ─────────────────────────────────────────────────────────────
     iwl          = InstitutionalWatchlist(db_path=db_path)
     # Main table: Stage 2 advancing stocks only (defensive filter; upsert already routes)
-    candidates   = [c for c in iwl.get_candidates() if c.get("stage", 0) == 2]
+    _cands_pre   = [c for c in iwl.get_candidates() if c.get("stage", 0) == 2]
     # Basing section: Stage 1 stocks from the separate basing_watchlist table
     basing_cands = iwl.get_basing_candidates()
     breadth      = get_latest_snapshot()
-    symbols      = [c["symbol"] for c in candidates]
+
+    # EPS gate: exclude symbols with deeply negative earnings growth at report layer.
+    # This prevents fundamentally deteriorating stocks (e.g. eps_growth < -10%) from
+    # appearing in the candidate table even if they passed technical conviction thresholds.
+    _pre_syms    = [c["symbol"] for c in _cands_pre]
+    _eps_map     = _load_eps_map(_pre_syms, db_path)
+    candidates   = [
+        c for c in _cands_pre
+        if _eps_map.get(c["symbol"]) is None or _eps_map[c["symbol"]] >= -0.10
+    ]
+
+    symbols         = [c["symbol"] for c in candidates]
     backtest_map    = _load_backtest_map(symbols, db_path)
     revenue_map     = _load_revenue_map(symbols, db_path)
+    basing_symbols  = [c["symbol"] for c in basing_cands]
+    basing_rev_map  = _load_revenue_map(basing_symbols, db_path)
     open_positions  = _load_open_positions(db_path)
     n_multi         = sum(1 for c in candidates if c.get("consecutive_days", 1) >= 2)
 
@@ -892,9 +954,9 @@ def generate(
                     vix_close=vix_close)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map, revenue_map)
-        story += _alert_section(S, candidates, backtest_map)
+        story += _alert_section(S, candidates, backtest_map, revenue_map)
     if basing_cands:
-        story += _basing_table(S, basing_cands)
+        story += _basing_table(S, basing_cands, basing_rev_map)
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
 
