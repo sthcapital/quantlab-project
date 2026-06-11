@@ -154,6 +154,16 @@ class ScanResult:
     # YoY EPS growth rate from EDGAR cache (e.g. -1.48 = -148% decline)
     eps_growth: float | None = None
 
+    # ADR% — Average Daily Range % over last 20 bars (volatility filter)
+    adr_pct: float | None = None
+    adr_expansion_rate: float | None = None  # (adr_last5 - adr_prior15) / adr_prior15
+
+    # RS rank percentile across scanned universe (0-1; computed post-Phase-1)
+    rs_percentile: float = 0.0
+
+    # Unified weighted composite signal: 0-1 explosive-breakout probability
+    explosion_score: float = 0.0
+
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
 
@@ -218,6 +228,10 @@ def score_conviction(result: ScanResult) -> float:
 
     # Stage 3 (topping) and Stage 4 (declining) are never long candidates
     if result.stage in (3, 4):
+        return 0.0
+
+    # ADR% hard floor — insufficient volatility means no explosive-move potential
+    if result.adr_pct is not None and result.adr_pct < 1.5:
         return 0.0
 
     score = 0.30  # base: signal fired
@@ -319,7 +333,85 @@ def score_conviction(result: ScanResult) -> float:
             and result.eps_growth < -0.10):
         score -= 0.15
 
+    # ADR% soft penalty: low volatility names rarely produce explosive breakouts
+    if result.adr_pct is not None and result.adr_pct < 2.0:
+        score -= 0.20
+
     return max(0.0, min(score, 1.0))
+
+
+def compute_adr_pct(bars) -> float | None:
+    """Average Daily Range % over the last 20 bars.
+
+    ADR% = 100 * mean(H/L - 1) over last 20 bars.
+    Returns None when fewer than 20 bars are available.
+    """
+    window = list(bars)[-20:]
+    if len(window) < 20:
+        return None
+    ratios = [b.high / b.low - 1.0 for b in window if b.low > 0]
+    if len(ratios) < 20:
+        return None
+    return 100.0 * sum(ratios) / len(ratios)
+
+
+def _compute_adr_expansion_rate(bars) -> float | None:
+    """ADR expansion rate: (ADR of last 5 bars - ADR of prior 15) / prior 15.
+
+    Positive = ADR expanding (momentum building); negative = contracting.
+    Returns None when fewer than 20 bars are available.
+    """
+    window = list(bars)[-20:]
+    if len(window) < 20:
+        return None
+
+    def _adr(subset) -> float | None:
+        ratios = [b.high / b.low - 1.0 for b in subset if b.low > 0]
+        return sum(ratios) / len(ratios) if ratios else None
+
+    last5   = _adr(window[-5:])
+    prior15 = _adr(window[:15])
+    if last5 is None or prior15 is None or prior15 < 1e-9:
+        return None
+    return (last5 - prior15) / prior15
+
+
+def compute_explosion_score(
+    earnings_acceleration: float,
+    rs_percentile: float,
+    rel_volume: float | None,
+    is_stage2: bool,
+    options_flow: float,
+    adr_expansion_rate: float | None,
+    peg_score: float,
+) -> float:
+    """Unified weighted composite signal for explosive breakout probability.
+
+    Weights (sum to 1.0):
+        0.25  earnings_acceleration   (0–1)
+        0.20  RS percentile rank      (0–1)
+        0.18  relative volume norm    (0–1)
+        0.15  Stage 2 confirmation    (0 or 1)
+        0.10  options call flow       (0–1)
+        0.07  ADR expansion norm      (0–1)
+        0.05  PEG quality             (0–1)
+    """
+    # Relative volume: normalize 0.5× → 3.5× to 0.0 → 1.0
+    rv_norm = min(1.0, max(0.0, ((rel_volume or 1.0) - 0.5) / 3.0))
+    # ADR expansion: normalize [-1, +1] range to [0, 1]
+    adr_exp  = adr_expansion_rate if adr_expansion_rate is not None else 0.0
+    adr_norm = min(1.0, max(0.0, (adr_exp + 1.0) / 2.0))
+
+    raw = (
+        0.25 * min(1.0, max(0.0, earnings_acceleration))
+        + 0.20 * min(1.0, max(0.0, rs_percentile))
+        + 0.18 * rv_norm
+        + 0.15 * (1.0 if is_stage2 else 0.0)
+        + 0.10 * min(1.0, max(0.0, options_flow))
+        + 0.07 * adr_norm
+        + 0.05 * min(1.0, max(0.0, peg_score))
+    )
+    return round(min(1.0, max(0.0, raw)), 4)
 
 
 def historical_edge_score(
@@ -755,7 +847,7 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
     (symbol, spy_bars, signal_type, lookback, bars,
      news_feat, edgar_accel, eps_growth, peg_score,
      breadth_adj, breadth_override, macro_regime, vix_regime,
-     earnings_proximity) = args
+     earnings_proximity, adr_pct, rs_percentile) = args
     try:
         result = scan_symbol(
             symbol=symbol,
@@ -775,6 +867,20 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
         result.eps_growth          = eps_growth
         result.peg_score           = peg_score
         result.earnings_proximity  = earnings_proximity
+        result.adr_pct             = adr_pct
+        result.rs_percentile       = rs_percentile
+        _adr_expansion             = _compute_adr_expansion_rate(bars)
+        result.adr_expansion_rate  = _adr_expansion
+        _opt = result.options_score if result.options_score > 0 else result.options_conviction
+        result.explosion_score     = compute_explosion_score(
+            earnings_acceleration = edgar_accel or result.earnings_acceleration,
+            rs_percentile         = rs_percentile,
+            rel_volume            = result.rel_volume,
+            is_stage2             = result.stage == 2,
+            options_flow          = _opt,
+            adr_expansion_rate    = _adr_expansion,
+            peg_score             = peg_score,
+        )
         result.conviction_score    = score_conviction(result)
         return result
     except Exception as exc:
@@ -947,12 +1053,16 @@ def run_universe_scan(
                     except Exception:
                         pass
 
+                # ADR% (Average Daily Range) — volatility filter
+                _adr = compute_adr_pct(bars)
+
                 if edgar_accel is not None:
                     _eps_pct = f"{_eps_growth * 100:+.0f}%" if _eps_growth is not None else "N/A"
                     _rev_pct = f"{_rev_growth * 100:+.0f}%" if _rev_growth is not None else "N/A"
+                    _adr_str = f"{_adr:.1f}%" if _adr is not None else "N/A"
                     logger.debug(
-                        "%s: edgar_accel=%.2f  eps_yoy=%s  rev_yoy=%s",
-                        symbol, edgar_accel, _eps_pct, _rev_pct,
+                        "%s: edgar_accel=%.2f  eps_yoy=%s  rev_yoy=%s  adr=%s",
+                        symbol, edgar_accel, _eps_pct, _rev_pct, _adr_str,
                     )
 
                 # PEG score from EDGAR cache.
@@ -1043,12 +1153,35 @@ def run_universe_scan(
                     symbol, spy_bars, signal_type, lookback, bars,
                     news_feat, edgar_accel, _eps_growth, _peg_score,
                     _breadth_adj, _breadth_override, _macro_regime, _vix_regime,
-                    _proximity,
+                    _proximity, _adr, 0.0,  # rs_percentile placeholder; filled below
                 ))
 
             except Exception as e:
                 logger.error(f"{symbol}: data fetch error — {e}")
                 continue
+
+    # Compute RS percentile rank across the scanned universe from 12-month bar returns.
+    _rs_returns: dict[str, float] = {}
+    for _item in _symbol_data:
+        _sym  = _item[0]
+        _bars = _item[4]
+        if len(_bars) >= 252:
+            _rs_ret = (_bars[-1].close - _bars[-252].close) / _bars[-252].close
+        elif len(_bars) >= 2:
+            _rs_ret = (_bars[-1].close - _bars[0].close) / _bars[0].close
+        else:
+            _rs_ret = 0.0
+        _rs_returns[_sym] = _rs_ret
+    _sorted_syms = sorted(_rs_returns, key=lambda s: _rs_returns[s])
+    _n_rs = len(_sorted_syms)
+    _rs_pct_map: dict[str, float] = (
+        {sym: (i + 1) / _n_rs for i, sym in enumerate(_sorted_syms)} if _n_rs > 0 else {}
+    )
+    # Patch rs_percentile (element 15) into each worker tuple
+    _symbol_data = [
+        (*item[:15], _rs_pct_map.get(item[0], 0.0))
+        for item in _symbol_data
+    ]
 
     # Phase 2: parallel scoring — pure computation, no network or DuckDB calls.
     # DuckDB connections cannot be shared across processes; all DB work is done above.

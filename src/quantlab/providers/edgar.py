@@ -43,6 +43,7 @@ def _edgar_get(url: str, timeout: int = 30) -> requests.Response:
 DEFAULT_METRICS = [
     "revenue", "net_income", "eps_diluted", "total_assets",
     "total_debt", "operating_cashflow", "capex", "shares_out",
+    "gross_profit",
 ]
 
 # US-GAAP concept candidates tried in order (first match wins)
@@ -68,6 +69,10 @@ _GAAP_FIELDS: dict[str, list[str]] = {
     "operating_cashflow": ["NetCashProvidedByUsedInOperatingActivities"],
     "capex": ["PaymentsToAcquirePropertyPlantAndEquipment"],
     "shares_out": ["CommonStockSharesOutstanding"],
+    "gross_profit": [
+        "GrossProfit",
+        "GrossProfitLoss",
+    ],
 }
 
 
@@ -104,6 +109,8 @@ class FundamentalSnapshot:
     adj_eps: Optional[float] = None
     adj_eps_yoy_pct: Optional[float] = None   # (current - prior) / abs(prior)
     eps_surprise_pct: Optional[float] = None  # (adj_eps - consensus) / abs(consensus)
+    # Gross margin trend: (latest_gm - gm_4q_ago); positive = expanding margins
+    gross_margin_trend: Optional[float] = None
 
 
 # ── CIK lookup — cached for process lifetime ──────────────────────────────────
@@ -160,6 +167,8 @@ def _ensure_edgar_table(con) -> None:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN adj_eps_yoy_pct DOUBLE")
         if "eps_surprise_pct" not in cols:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_surprise_pct DOUBLE")
+        if "gross_margin" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN gross_margin DOUBLE")
     except Exception:
         pass
 
@@ -216,8 +225,8 @@ def _save_edgar_cache(
             INSERT OR REPLACE INTO edgar_fundamentals
                 (symbol, fetch_date, acceleration_score, revenue_growth,
                  eps_growth, consecutive_beats, eps_diluted,
-                 adj_eps, adj_eps_yoy_pct, eps_surprise_pct)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 adj_eps, adj_eps_yoy_pct, eps_surprise_pct, gross_margin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 symbol,
@@ -230,6 +239,7 @@ def _save_edgar_cache(
                 snap.adj_eps,
                 snap.adj_eps_yoy_pct,
                 snap.eps_surprise_pct,
+                snap.gross_margin_trend,
             ],
         )
         con.close()
@@ -432,10 +442,12 @@ def fetch_fundamentals(
     facts = resp.json().get("facts", {})
     snap = FundamentalSnapshot(ticker=ticker, cik=cik, as_of=date.today())
 
+    _rev_history: list[float] = []
     if "revenue" in metrics:
         h = _extract_periods(facts, "revenue", effective_periods)
         h = _remove_annual_outliers(h)  # secondary defense: re-checks endpoints missed inside _extract_periods
         if h:
+            _rev_history = h
             snap.revenue = h[-1]
             snap.revenue_qoq_growth = _qoq_growth(h)
             snap.revenue_yoy_history = _yoy_growth_series(h)
@@ -485,6 +497,11 @@ def fetch_fundamentals(
         h = _extract_periods(facts, "shares_out", effective_periods)
         if h:
             snap.shares_out = h[-1]
+
+    if "gross_profit" in metrics:
+        gp_h = _extract_periods(facts, "gross_profit", effective_periods)
+        if gp_h and _rev_history:
+            snap.gross_margin_trend = _compute_gross_margin_trend(gp_h, _rev_history)
 
     # is_accelerating: both revenue AND eps YoY growth rates increasing for 2+ quarters.
     # Falls back to net_income YoY when eps data is unavailable.
@@ -1014,6 +1031,40 @@ def format_yoy_summary(snap: FundamentalSnapshot, score: float) -> str:
     )
 
 
+def _compute_gross_margin_trend(
+    gp_history: list[float],
+    rev_history: list[float],
+) -> Optional[float]:
+    """YoY gross margin trend: (latest_gm - gm_4q_ago). Requires ≥5 aligned quarters."""
+    n = min(len(gp_history), len(rev_history))
+    if n < 5:
+        return None
+    gp = gp_history[-n:]
+    rv = rev_history[-n:]
+    margins: list[Optional[float]] = []
+    for gp_q, rv_q in zip(gp, rv):
+        margins.append(gp_q / rv_q if abs(rv_q) > 1e-9 else None)
+    if margins[-1] is None or margins[-5] is None:
+        return None
+    return round(margins[-1] - margins[-5], 6)  # type: ignore[operator]
+
+
+def _gross_margin_modifier(gm_trend: Optional[float]) -> float:
+    """Gross-margin trend adjustment applied on top of the EPS-based score.
+
+    Expanding margins confirm quality; contracting margins signal cost pressure.
+    """
+    if gm_trend is None:
+        return 0.0
+    if gm_trend > 0.02:
+        return 0.05
+    if gm_trend < -0.05:
+        return -0.20
+    if gm_trend < -0.02:
+        return -0.10
+    return 0.0
+
+
 def _revenue_quality_modifier(revenue_yoy_pct: Optional[float]) -> float:
     """
     Revenue-quality adjustment applied on top of the EPS-based score.
@@ -1117,7 +1168,8 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
             base = 1.0   # >100%  — explosive
         bonus = 0.10 if snap.is_accelerating else 0.0
         rev_mod = _revenue_quality_modifier(snap.revenue_yoy_pct)
-        return round(min(1.0, max(0.0, base + bonus + rev_mod)), 4)
+        gm_mod  = _gross_margin_modifier(snap.gross_margin_trend)
+        return round(min(1.0, max(0.0, base + bonus + rev_mod + gm_mod)), 4)
 
     # ── Legacy QoQ fallback (< 5 quarters of data) ───────────────────────────
     history = snap.eps_history if len(snap.eps_history) >= 3 else snap.net_income_history

@@ -380,7 +380,7 @@ _IWL_COLS = [
     "symbol", "first_seen", "last_seen", "consecutive_days", "stage",
     "conviction_score", "entry_price", "options_signal", "volume_dry_up",
     "earnings_score", "peg_score", "breakout_volume_score", "tape", "notes",
-    "updated_at",
+    "updated_at", "explosion_score",
 ]
 
 
@@ -459,6 +459,7 @@ class InstitutionalWatchlist:
             getattr(scan_result, "unusual_options_score", 0.0) >= 0.5
             or getattr(scan_result, "options_score", 0.0) >= 0.6
         )
+        explosion_score = getattr(scan_result, "explosion_score", 0.0)
 
         tape = ""
         try:
@@ -485,13 +486,13 @@ class InstitutionalWatchlist:
                         (symbol, first_seen, last_seen, consecutive_days, stage,
                          conviction_score, entry_price, options_signal, volume_dry_up,
                          earnings_score, peg_score, breakout_volume_score, tape, notes,
-                         updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', CURRENT_TIMESTAMP)
+                         updated_at, explosion_score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', CURRENT_TIMESTAMP, ?)
                     """,
                     [
                         symbol, today_str, today_str, consecutive_days, stage,
                         stored_conviction, entry_price, options_signal, volume_dry_up,
-                        earnings_score, peg_score, bvs, tape,
+                        earnings_score, peg_score, bvs, tape, explosion_score,
                     ],
                 )
             else:
@@ -510,14 +511,15 @@ class InstitutionalWatchlist:
                         last_seen=?, consecutive_days=?, stage=?,
                         conviction_score=?, entry_price=?, options_signal=?,
                         volume_dry_up=?, earnings_score=?, peg_score=?,
-                        breakout_volume_score=?, tape=?, updated_at=CURRENT_TIMESTAMP
+                        breakout_volume_score=?, tape=?, updated_at=CURRENT_TIMESTAMP,
+                        explosion_score=?
                     WHERE symbol=?
                     """,
                     [
                         today_str, consecutive_days, stage,
                         stored_conviction, entry_price, options_signal,
                         volume_dry_up, earnings_score, peg_score, bvs, tape,
-                        symbol,
+                        explosion_score, symbol,
                     ],
                 )
             con.close()

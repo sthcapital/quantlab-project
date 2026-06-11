@@ -7987,3 +7987,136 @@ class TestICMonitor:
         # Should print at least the header and one signal row
         assert "Signal" in captured.out
         assert "INSUFFICIENT" in captured.out
+
+
+# ── Task 3: ADR%, gross margin trend, ExplosionScore ─────────────────────────
+
+class TestComputeAdrPct:
+
+    def _make_bar(self, low: float, high_pct: float) -> Bar:
+        """Build a Bar with H/L giving the desired H/L ratio."""
+        from datetime import date
+        h = low * (1.0 + high_pct)
+        return Bar(as_of=date(2025, 1, 1), open=low, high=h, low=low, close=h, volume=1_000_000)
+
+    def test_correct_value(self):
+        """ADR% = 100 * mean(H/L - 1) over last 20 bars."""
+        from quantlab.execution import compute_adr_pct
+        # Each bar has H/L - 1 = 0.03 → ADR% = 3.0
+        bars = [self._make_bar(100.0, 0.03) for _ in range(20)]
+        result = compute_adr_pct(bars)
+        assert result is not None
+        assert abs(result - 3.0) < 1e-9
+
+    def test_uses_last_20_of_longer_series(self):
+        """ADR% uses only the last 20 bars from a longer series."""
+        from quantlab.execution import compute_adr_pct
+        # First 5 bars have large range, last 20 have 2% range
+        early = [self._make_bar(100.0, 0.10) for _ in range(5)]
+        recent = [self._make_bar(100.0, 0.02) for _ in range(20)]
+        result = compute_adr_pct(early + recent)
+        assert result is not None
+        assert abs(result - 2.0) < 1e-9
+
+    def test_none_when_insufficient_bars(self):
+        """Returns None when fewer than 20 bars are available."""
+        from quantlab.execution import compute_adr_pct
+        bars = [self._make_bar(100.0, 0.03) for _ in range(19)]
+        assert compute_adr_pct(bars) is None
+
+    def test_none_on_empty(self):
+        from quantlab.execution import compute_adr_pct
+        assert compute_adr_pct([]) is None
+
+
+class TestGrossMarginTrend:
+
+    def test_expanding_margins(self):
+        """Expanding gross margin detected from sequential quarterly data."""
+        from quantlab.providers.edgar import _compute_gross_margin_trend
+        # Revenue flat at 100; gross profit rising 50→60 over 5 quarters
+        rev  = [100.0, 100.0, 100.0, 100.0, 100.0]
+        gp   = [50.0,  52.0,  54.0,  57.0,  60.0]
+        result = _compute_gross_margin_trend(gp, rev)
+        assert result is not None
+        # trend = 0.60 - 0.50 = 0.10
+        assert abs(result - 0.10) < 1e-6
+
+    def test_contracting_margins(self):
+        """Contracting gross margin detected correctly."""
+        from quantlab.providers.edgar import _compute_gross_margin_trend
+        rev  = [100.0, 100.0, 100.0, 100.0, 100.0]
+        gp   = [60.0,  58.0,  56.0,  54.0,  50.0]
+        result = _compute_gross_margin_trend(gp, rev)
+        assert result is not None
+        assert abs(result - (-0.10)) < 1e-6
+
+    def test_none_when_insufficient_data(self):
+        """Returns None when fewer than 5 aligned quarters are available."""
+        from quantlab.providers.edgar import _compute_gross_margin_trend
+        assert _compute_gross_margin_trend([50, 55], [100, 100]) is None
+        assert _compute_gross_margin_trend([], []) is None
+
+
+class TestComputeExplosionScore:
+
+    def test_all_max_inputs_returns_1(self):
+        """All inputs at maximum yields explosion score of 1.0."""
+        from quantlab.execution import compute_explosion_score
+        score = compute_explosion_score(
+            earnings_acceleration=1.0,
+            rs_percentile=1.0,
+            rel_volume=4.0,     # > 3.5 → normalises to 1.0
+            is_stage2=True,
+            options_flow=1.0,
+            adr_expansion_rate=1.0,  # → normalises to 1.0
+            peg_score=1.0,
+        )
+        assert score == 1.0
+
+    def test_all_zero_inputs_returns_0(self):
+        """All-zero inputs yields 0.0 except the ADR expansion neutral midpoint."""
+        from quantlab.execution import compute_explosion_score
+        score = compute_explosion_score(
+            earnings_acceleration=0.0,
+            rs_percentile=0.0,
+            rel_volume=0.5,     # normalises to 0.0
+            is_stage2=False,
+            options_flow=0.0,
+            adr_expansion_rate=-1.0,  # normalises to 0.0
+            peg_score=0.0,
+        )
+        assert score == 0.0
+
+    def test_weights_sum_to_1(self):
+        """The component weights defined in the function sum exactly to 1.0."""
+        weights = [0.25, 0.20, 0.18, 0.15, 0.10, 0.07, 0.05]
+        assert abs(sum(weights) - 1.0) < 1e-10
+
+    def test_clamps_above_1(self):
+        """Score is clamped to 1.0 even with super-max inputs."""
+        from quantlab.execution import compute_explosion_score
+        score = compute_explosion_score(
+            earnings_acceleration=2.0,
+            rs_percentile=2.0,
+            rel_volume=100.0,
+            is_stage2=True,
+            options_flow=5.0,
+            adr_expansion_rate=10.0,
+            peg_score=10.0,
+        )
+        assert score <= 1.0
+
+    def test_clamps_below_0(self):
+        """Score is clamped to 0.0 with negative inputs."""
+        from quantlab.execution import compute_explosion_score
+        score = compute_explosion_score(
+            earnings_acceleration=-5.0,
+            rs_percentile=-5.0,
+            rel_volume=0.0,
+            is_stage2=False,
+            options_flow=-5.0,
+            adr_expansion_rate=-10.0,
+            peg_score=-5.0,
+        )
+        assert score >= 0.0

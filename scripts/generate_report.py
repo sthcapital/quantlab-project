@@ -526,13 +526,13 @@ def _candidate_table(
     show_rev  = n_cands > 0 and (n_rev_cov / n_cands) > 0.20
 
     if show_rev:
-        headers   = ["#", "Symbol", "Stage", "Days", "Conv", "Opts", "VDU",
+        headers   = ["#", "Symbol", "Stage", "Days", "Expl", "Conv", "Opts", "VDU",
                      "EPS %", "Rev %", "PEG", "Notes"]
-        cw        = [0.28, 0.72, 0.60, 0.40, 0.50, 0.38, 0.38, 0.55, 0.55, 0.45, 1.47]
+        cw        = [0.28, 0.72, 0.60, 0.40, 0.40, 0.50, 0.38, 0.38, 0.55, 0.55, 0.45, 1.07]
     else:
-        headers   = ["#", "Symbol", "Stage", "Days", "Conv", "Opts", "VDU",
+        headers   = ["#", "Symbol", "Stage", "Days", "Expl", "Conv", "Opts", "VDU",
                      "EPS %", "PEG", "Notes"]
-        cw        = [0.28, 0.72, 0.60, 0.40, 0.50, 0.38, 0.38, 0.62, 0.45, 1.95]
+        cw        = [0.28, 0.72, 0.60, 0.40, 0.40, 0.50, 0.38, 0.38, 0.62, 0.45, 1.55]
     col_widths = [w * inch for w in cw]
     _notes_col = len(headers) - 1   # last column index
 
@@ -555,6 +555,7 @@ def _candidate_table(
                 en["symbol"],
                 _stage_lbl(stage),
                 f"{days}d",
+                _fmt(en.get("explosion_score")),
                 _fmt(en.get("conviction_score")),
                 _tick(opts),
                 _tick(en.get("volume_dry_up")),
@@ -569,6 +570,7 @@ def _candidate_table(
                 en["symbol"],
                 _stage_lbl(stage),
                 f"{days}d",
+                _fmt(en.get("explosion_score")),
                 _fmt(en.get("conviction_score")),
                 _tick(opts),
                 _tick(en.get("volume_dry_up")),

@@ -477,9 +477,18 @@ def _ensure_schema(con) -> None:
             breakout_volume_score FLOAT,
             tape                  TEXT DEFAULT '',
             notes                 TEXT DEFAULT '',
-            updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            explosion_score       FLOAT DEFAULT 0.0
         )
     """)
+
+    # Migration: add explosion_score to institutional_watchlist for pre-existing DBs
+    try:
+        _iwl_cols = {r[1] for r in con.execute("PRAGMA table_info(institutional_watchlist)").fetchall()}
+        if "explosion_score" not in _iwl_cols:
+            con.execute("ALTER TABLE institutional_watchlist ADD COLUMN explosion_score FLOAT DEFAULT 0.0")
+    except Exception:
+        pass
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS basing_watchlist (
@@ -497,9 +506,18 @@ def _ensure_schema(con) -> None:
             breakout_volume_score FLOAT,
             tape                  TEXT DEFAULT '',
             notes                 TEXT DEFAULT '',
-            updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            explosion_score       FLOAT DEFAULT 0.0
         )
     """)
+
+    # Migration: add explosion_score to basing_watchlist for pre-existing DBs
+    try:
+        _bw_cols = {r[1] for r in con.execute("PRAGMA table_info(basing_watchlist)").fetchall()}
+        if "explosion_score" not in _bw_cols:
+            con.execute("ALTER TABLE basing_watchlist ADD COLUMN explosion_score FLOAT DEFAULT 0.0")
+    except Exception:
+        pass
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS daily_reports (
