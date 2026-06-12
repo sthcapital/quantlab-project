@@ -484,9 +484,21 @@ def _ensure_schema(con) -> None:
             min_volume          DOUBLE,
             min_dollar_volume   DOUBLE,
             optionable_only     BOOLEAN,
-            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            gate_accepted       BOOLEAN
         )
     """)
+
+    # Migration: gate_accepted marks builds that passed the universe sanity
+    # gate (NULL = pre-gate row, deliberately excluded from the gate baseline
+    # because pre-gate history contains partial-day degenerate builds —
+    # 457–2,325 symbol swings, 2026-06-04..11).
+    try:
+        _uh_cols = {r[1] for r in con.execute("PRAGMA table_info(universe_history)").fetchall()}
+        if "gate_accepted" not in _uh_cols:
+            con.execute("ALTER TABLE universe_history ADD COLUMN gate_accepted BOOLEAN")
+    except Exception:
+        pass
 
     con.execute("""
         CREATE TABLE IF NOT EXISTS institutional_watchlist (

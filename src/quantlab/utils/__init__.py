@@ -92,6 +92,15 @@ DEFAULT_CONFIG = {
         # Cross-sectional gate percentile: "unusual" = the day's scores
         # strictly above this percentile (90 → ~top decile, ≤ ~10%/day).
         "options_unusual_percentile": 90.0,
+        # Universe build stability (2026-06-12 incident: builds against
+        # partial-day Polygon grouped data produced 457–2,325 symbol swings).
+        # Floor on raw grouped-ticker count — below this the response is
+        # treated as mid-publication/truncated and the build walks back a day.
+        "universe_min_grouped_rows": 8000,
+        # Post-build sanity gate: refuse to replace the cache when final_count
+        # deviates more than this fraction from the trailing 10-accepted-build
+        # median.  A stale-but-sane universe beats a fresh-but-degenerate one.
+        "universe_gate_max_deviation": 0.15,
     },
     "news": {
         "provider_codes": "BRFG+BRFUPDN+DJNL",

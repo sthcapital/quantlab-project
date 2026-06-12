@@ -958,6 +958,33 @@ def _options_signal_rate(
             f"{n_legacy / total:.1%} (legacy scorer)")
 
 
+def _universe_gate_warning(report_date: date, db_path: str | None = None) -> str | None:
+    """
+    WARNING string when the universe sanity gate refused the build for
+    ``report_date`` (universe_history.gate_accepted = FALSE) — the scan ran
+    on a prior day's universe.  None when the build was accepted or absent.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+        row = con.execute(
+            "SELECT final_count FROM universe_history "
+            "WHERE date = ? AND gate_accepted = FALSE",
+            [report_date],
+        ).fetchone()
+        con.close()
+    except Exception:
+        return None
+    if row is None:
+        return None
+    return (
+        f"WARNING: UNIVERSE GATE refused the {report_date} build "
+        f"(degenerate count {row[0]:,}) — scan ran on the prior day's "
+        f"universe; streak counters treated this day as neutral."
+    )
+
+
 def _options_pipeline_warning(
     candidates: list[dict],
     basing_cands: list[dict],
@@ -1087,6 +1114,14 @@ def generate(
     if opts_warning:
         print(f"  {opts_warning}")
 
+    # Universe sanity-gate refusal — the scan ran on a prior day's universe
+    gate_warning = _universe_gate_warning(report_date, db_path)
+    if gate_warning:
+        print(f"  {gate_warning}")
+
+    header_warnings = [w for w in (opts_warning, gate_warning) if w]
+    header_warning = "<br/>".join(header_warnings) if header_warnings else None
+
     # Day's options signal rate — saturation drift must be visible immediately
     opts_rate = _options_signal_rate(report_date, db_path)
     if opts_rate:
@@ -1104,7 +1139,7 @@ def generate(
 
     story: list = []
     story += _page1(S, report_date, breadth, len(candidates), n_multi, open_positions,
-                    vix_close=vix_close, warning=opts_warning,
+                    vix_close=vix_close, warning=header_warning,
                     options_rate=opts_rate, regime_gate=regime_gate)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map, revenue_map)

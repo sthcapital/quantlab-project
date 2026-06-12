@@ -175,6 +175,7 @@ class UniverseStats:
     min_volume: float        = DEFAULT_MIN_VOLUME
     min_dollar_volume: float = DEFAULT_MIN_DOLLAR_VOL
     optionable_only: bool    = True
+    gate_accepted: bool      = True   # False = sanity gate refused this build
 
     def summary(self) -> str:
         """One-line human-readable filter summary for scan output."""
@@ -187,6 +188,101 @@ class UniverseStats:
         if self.optionable_only:
             parts.append("options confirmed")
         return " | ".join(parts)
+
+
+# ── Build-time data completeness / sanity gate ────────────────────────────────
+# 2026-06-12 incident: universe builds ran pre-market against Polygon's
+# same-day grouped aggregates, which are PARTIAL until well after the close.
+# Two observed variants of the same root cause:
+#   - full ticker set with partial volumes (06-10 build saw a median 17% of
+#     final dollar-volume) → volume gates cut 50%+ of the market
+#   - truncated ticker set with final values, read mid-publication (06-04
+#     build saw 457 of ~11k tickers)
+# Result: 457 → 2,325 → 1,694 → 1,079 → 1,477 symbol swings on fixed filters.
+
+def most_recent_completed_session(trade_date: date, now=None) -> date:
+    """
+    Resolve ``trade_date`` to the most recent trading session whose grouped
+    aggregates are guaranteed final.
+
+    Same-day data is only trusted after 18:00 ET (close + 2h publication
+    buffer); before that the previous trading day's confirmed-final data is
+    used.  Universe composition doesn't change intraday, so yesterday's
+    filtered list is valid for today's scan.
+
+    Args:
+        trade_date: The date the universe is being built for.
+        now:        Current ET datetime (injectable for tests; defaults to
+                    America/New_York wall clock).
+    """
+    from datetime import datetime, time as _time
+    from quantlab.market_calendar import prev_trading_day, is_market_open
+
+    if now is None:
+        try:
+            import pytz
+            now = datetime.now(pytz.timezone("America/New_York"))
+        except Exception:
+            now = datetime.now()
+
+    d = trade_date if is_market_open(trade_date) else prev_trading_day(trade_date)
+    while d > now.date():
+        d = prev_trading_day(d)
+    if d == now.date() and now.time() < _time(18, 0):
+        d = prev_trading_day(d)
+    return d
+
+
+def universe_gate_check(
+    final_count: int,
+    baseline_median: float | None,
+    max_deviation: float = 0.15,
+) -> tuple[bool, str]:
+    """
+    Post-build sanity gate: does ``final_count`` look like a sane universe?
+
+    Returns ``(accepted, reason)``.  Refuses when the new count deviates more
+    than ``max_deviation`` from the trailing median of gate-accepted builds.
+    With no baseline yet (bootstrap), accepts.
+    """
+    if baseline_median is None or baseline_median <= 0:
+        return True, ""
+    deviation = (final_count - baseline_median) / baseline_median
+    if abs(deviation) > max_deviation:
+        return False, (
+            f"final_count {final_count} deviates {deviation:+.0%} from the "
+            f"trailing accepted-build median {baseline_median:.0f} "
+            f"(limit ±{max_deviation:.0%})"
+        )
+    return True, ""
+
+
+def gate_baseline_median(n_builds: int = 10, db_path=None) -> float | None:
+    """
+    Median final_count of the last ``n_builds`` gate-accepted universe builds.
+
+    Only rows with gate_accepted = TRUE count — pre-gate rows (NULL) include
+    the degenerate partial-day builds and must not seed the baseline.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH, _ensure_schema
+        con = duckdb.connect(str(db_path or DB_PATH))
+        _ensure_schema(con)
+        row = con.execute(
+            """
+            SELECT median(final_count) FROM (
+                SELECT final_count FROM universe_history
+                WHERE gate_accepted = TRUE
+                ORDER BY date DESC LIMIT ?
+            )
+            """,
+            [n_builds],
+        ).fetchone()
+        con.close()
+        return float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        return None
 
 
 # ── Pure filter functions (fully testable offline) ─────────────────────────────
@@ -688,6 +784,8 @@ class UniverseManager:
         optionable_only: bool = True,
         force_rebuild: bool   = False,
         polygon_api_key: str | None = None,
+        min_grouped_rows: int | None = None,
+        gate_max_deviation: float | None = None,
     ) -> tuple[list[str], UniverseStats]:
         """
         Build the tradeable universe for a given date.
@@ -702,6 +800,12 @@ class UniverseManager:
                               Pass None to skip options filtering (faster).
             optionable_only:  Apply IBKR options availability check.
             force_rebuild:    Ignore cache and rebuild from scratch.
+            min_grouped_rows: Completeness floor on the raw grouped-ticker
+                              count (None → scanner config, default 8000).
+                              Pass 0 to disable (tests with tiny fixtures).
+            gate_max_deviation: Sanity-gate deviation limit vs the trailing
+                              accepted-build median (None → scanner config,
+                              default 0.15).
 
         Returns:
             (symbols, stats) — symbol list sorted by dollar_volume desc,
@@ -714,13 +818,27 @@ class UniverseManager:
         import requests as _requests
         from quantlab.market_calendar import prev_trading_day as _prev_day
 
-        # ── Today's cache check ────────────────────────────────────────────────
+        # ── Resolve to the most recent COMPLETED session ───────────────────────
+        # Same-day grouped aggregates are partial until well after the close
+        # (see most_recent_completed_session) — never build a universe from
+        # an in-flight session.
+        fetch_date = most_recent_completed_session(trade_date)
+        if fetch_date != trade_date:
+            logger.info(
+                "Universe: session %s not complete/published yet — "
+                "building from %s (final data)",
+                trade_date, fetch_date,
+            )
+
+        # ── Cache check (requested date, then resolved fetch date) ────────────
         if not force_rebuild:
-            cached = load_universe_cache(trade_date)
-            if cached is not None:
-                symbols, stats = cached
-                logger.info("Universe cache hit for %s: %d symbols", trade_date, len(symbols))
-                return symbols, stats
+            for _cache_date in (trade_date, fetch_date):
+                cached = load_universe_cache(_cache_date)
+                if cached is not None:
+                    symbols, stats = cached
+                    logger.info("Universe cache hit for %s: %d symbols",
+                                _cache_date, len(symbols))
+                    return symbols, stats
 
         # ── Pre-flight: find most recent cached universe as fallback ───────────
         # Load BEFORE any Polygon call. When Polygon returns empty data (pre-market,
@@ -745,8 +863,19 @@ class UniverseManager:
         # Walk back through recent trading days until valid data is found.
         # Universe composition doesn't change intraday, so yesterday's filtered
         # list is valid for today's scan.
+        from quantlab.utils import get_config as _get_cfg
+        _scan_cfg = _get_cfg("scanner")
+        _min_grouped_rows = (
+            min_grouped_rows if min_grouped_rows is not None
+            else int(_scan_cfg.get("universe_min_grouped_rows", 8000))
+        )
+        _gate_max_dev = (
+            gate_max_deviation if gate_max_deviation is not None
+            else float(_scan_cfg.get("universe_gate_max_deviation", 0.15))
+        )
+
         _MAX_DAY_LOOKBACK = 5
-        actual_date = trade_date
+        actual_date = fetch_date
         grouped = None
 
         for _attempt in range(_MAX_DAY_LOOKBACK):
@@ -765,6 +894,20 @@ class UniverseManager:
             logger.info("Fetching grouped daily for %s ...", actual_date)
             try:
                 grouped = polygon_provider.get_grouped_daily(actual_date)
+                # Completeness floor: a grouped response far below the normal
+                # ~10-12k US tickers is a truncated/mid-publication read
+                # (06-04 incident: 457 tickers with final values) — never
+                # build from it.
+                if grouped and len(grouped) < _min_grouped_rows:
+                    logger.warning(
+                        "Universe: grouped daily for %s returned only %d "
+                        "tickers (< %d completeness floor) — likely "
+                        "mid-publication; trying previous trading day",
+                        actual_date, len(grouped), _min_grouped_rows,
+                    )
+                    grouped = None
+                    actual_date = _prev_day(actual_date)
+                    continue
                 if actual_date != trade_date:
                     logger.warning(
                         "Universe: %s unavailable — fell back to %s (%d raw tickers)",
@@ -887,6 +1030,32 @@ class UniverseManager:
         dvols = [dvol_by_sym.get(s, 0.0) for s in candidates]
         stats.final_count = len(candidates)
 
+        # ── Step 5.5: Sanity gate ──────────────────────────────────────────────
+        # Refuse to replace the cache when the new build deviates wildly from
+        # the trailing accepted-build median — keep the prior day's universe.
+        # A stale-but-sane universe beats a fresh-but-degenerate one.
+        baseline = gate_baseline_median()
+        gate_ok, gate_reason = universe_gate_check(
+            stats.final_count, baseline, _gate_max_dev,
+        )
+        stats.gate_accepted = gate_ok
+        if not gate_ok:
+            logger.warning("UNIVERSE GATE REFUSED: %s — cache NOT replaced", gate_reason)
+            print(f"  WARNING: UNIVERSE GATE REFUSED — {gate_reason}; "
+                  f"keeping prior universe")
+            # Record the refusal under the date being built FOR so the daily
+            # report and 6:15 health check can surface it.
+            stats.date = trade_date.isoformat()
+            self._save_stats_to_db(stats)
+            if _fallback is not None:
+                return _fallback
+            logger.warning(
+                "UNIVERSE GATE: no prior universe available — "
+                "using the flagged build (bootstrap)",
+            )
+            save_universe_cache(actual_date, candidates, dvols)
+            return candidates, stats
+
         # ── Step 6: Cache ──────────────────────────────────────────────────────
         save_universe_cache(actual_date, candidates, dvols)
         self._save_stats_to_db(stats)
@@ -905,14 +1074,16 @@ class UniverseManager:
                 INSERT OR REPLACE INTO universe_history (
                     date, total_raw, after_price, after_volume, after_dollar_vol,
                     after_symbol_filter, optionable_count, final_count,
-                    min_price, min_volume, min_dollar_volume, optionable_only
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    min_price, min_volume, min_dollar_volume, optionable_only,
+                    gate_accepted
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, [
                 stats.date, stats.total_raw, stats.after_price,
                 stats.after_volume, stats.after_dollar_vol,
                 stats.after_symbol_filter, stats.optionable_count,
                 stats.final_count, stats.min_price, stats.min_volume,
                 stats.min_dollar_volume, stats.optionable_only,
+                stats.gate_accepted,
             ])
             con.close()
         except Exception as exc:

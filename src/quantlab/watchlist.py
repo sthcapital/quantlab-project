@@ -33,17 +33,51 @@ logger = logging.getLogger(__name__)
 MIN_CONVICTION_FOR_WATCHLIST = 0.70
 
 
-def _trading_days_elapsed(from_date: date, to_date: date | None = None) -> int:
-    """Count Mon–Fri trading days between from_date (exclusive) and to_date (inclusive)."""
+def _trading_days_elapsed(
+    from_date: date,
+    to_date: date | None = None,
+    skip_dates: set[date] | None = None,
+) -> int:
+    """
+    Count Mon–Fri trading days between from_date (exclusive) and to_date (inclusive).
+
+    ``skip_dates`` are treated as NEUTRAL — they neither extend nor break a
+    streak's inactivity window.  Used for days when OUR universe build was
+    degenerate (sanity-gate refused): a symbol must not be pruned because the
+    infrastructure failed to scan it.
+    """
     if to_date is None:
         to_date = date.today()
     count = 0
     current = from_date + timedelta(days=1)
     while current <= to_date:
-        if current.weekday() < 5:   # Monday=0 … Friday=4
+        if current.weekday() < 5 and not (skip_dates and current in skip_dates):
             count += 1
         current += timedelta(days=1)
     return count
+
+
+def _degenerate_build_dates(con) -> set[date]:
+    """
+    Dates whose universe build was refused by the sanity gate
+    (universe_history.gate_accepted = FALSE).  These days are neutral for
+    streak/staleness accounting — the scan ran on degraded infrastructure,
+    not on a real read of the market.
+    """
+    try:
+        rows = con.execute(
+            "SELECT date FROM universe_history WHERE gate_accepted = FALSE"
+        ).fetchall()
+        out: set[date] = set()
+        for (d,) in rows:
+            if isinstance(d, str):
+                d = date.fromisoformat(d)
+            elif hasattr(d, "date") and not isinstance(d, date):
+                d = d.date()
+            out.add(d)
+        return out
+    except Exception:
+        return set()
 
 
 def _layers_fired(scan_result) -> str:
@@ -659,11 +693,16 @@ class InstitutionalWatchlist:
     def remove_stale(self, max_days_inactive: int = 5) -> int:
         """
         Remove symbols not seen in max_days_inactive trading days.
+
+        Days when the universe build was refused by the sanity gate are
+        NEUTRAL: they count toward neither activity nor inactivity, so a
+        symbol cannot lose its streak because our build was degenerate.
         Returns the count of removed rows.
         """
         today = date.today()
         try:
             con = self._con()
+            degenerate_days = _degenerate_build_dates(con)
             rows = con.execute(
                 "SELECT symbol, last_seen FROM institutional_watchlist"
             ).fetchall()
@@ -673,7 +712,9 @@ class InstitutionalWatchlist:
                     last_seen = date.fromisoformat(last_seen)
                 elif hasattr(last_seen, "date"):
                     last_seen = last_seen.date()
-                if _trading_days_elapsed(last_seen, today) > max_days_inactive:
+                if _trading_days_elapsed(
+                    last_seen, today, skip_dates=degenerate_days,
+                ) > max_days_inactive:
                     to_remove.append(sym)
             for sym in to_remove:
                 con.execute(

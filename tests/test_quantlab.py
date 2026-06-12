@@ -5178,7 +5178,7 @@ class TestUniverseManager:
 
         mgr = UniverseManager()
         symbols, _ = mgr.build_tradeable_universe(
-            d, MockPoly(), ib=None, optionable_only=False,
+            d, MockPoly(), ib=None, optionable_only=False, min_grouped_rows=0,
         )
         assert "AAPL" in symbols
         assert "VXX"  not in symbols
@@ -5342,6 +5342,7 @@ class TestUniverseManager:
         mgr = UniverseManager()
         symbols, stats = mgr.build_tradeable_universe(
             date(2026, 6, 5), MockPoly(), ib=None, optionable_only=False,
+            min_grouped_rows=0,
         )
         assert "AAPL" in symbols
         assert "CHEAP"  not in symbols
@@ -5400,6 +5401,7 @@ class TestUniverseManager:
         mgr = UniverseManager()
         symbols, stats = mgr.build_tradeable_universe(
             today, MockPoly403Then200(), ib=None, optionable_only=False,
+            min_grouped_rows=0,
         )
         assert symbols == ["AAPL"]
         assert stats.date == yesterday.isoformat()
@@ -5472,6 +5474,7 @@ class TestUniverseManager:
         mgr = UniverseManager()
         _, stats = mgr.build_tradeable_universe(
             today, MockPoly(), ib=None, optionable_only=False,
+            min_grouped_rows=0,
         )
         assert stats.date == prev.isoformat()
         assert stats.date != today.isoformat()

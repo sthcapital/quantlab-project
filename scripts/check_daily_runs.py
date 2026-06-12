@@ -178,6 +178,33 @@ def check_options_heartbeat(check_date: date, db_path: Path | None = None) -> in
     return int(n)
 
 
+def check_universe_gate(check_date: date, db_path: Path | None = None) -> bool | None:
+    """
+    Whether the universe sanity gate refused the build for ``check_date``.
+
+    Returns True when a universe_history row for the date has
+    gate_accepted = FALSE (the scan ran on a prior day's universe),
+    False when no refusal is recorded, and None when the DB is unreadable.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+    except Exception:
+        return None
+    try:
+        row = con.execute(
+            "SELECT 1 FROM universe_history "
+            "WHERE date = ? AND gate_accepted = FALSE",
+            [check_date],
+        ).fetchone()
+        return row is not None
+    except Exception:
+        return False   # table/column missing — no gate refusals recorded
+    finally:
+        con.close()
+
+
 # ── Log parsing ────────────────────────────────────────────────────────────────
 
 def read_log(path: Path) -> list[str]:
@@ -336,6 +363,21 @@ def check_and_report(
         else:
             results.append((_tag("[OK]", _GREEN),
                             f"{'Options heartbeat':<18} {n_snap} options_snapshots rows for {check_date}"))
+
+    # Universe sanity gate — advisory: a refusal means the scan deliberately
+    # ran on the prior day's universe instead of a degenerate fresh build.
+    if market_open:
+        gate_refused = check_universe_gate(check_date, db_path)
+        if gate_refused is None:
+            results.append((_tag("[WARN]", _YELLOW),
+                            f"{'Universe gate':<18} DuckDB unreadable — cannot verify"))
+        elif gate_refused:
+            results.append((_tag("[WARN]", _YELLOW),
+                            f"{'Universe gate':<18} build for {check_date} REFUSED "
+                            f"— scan used prior day's universe"))
+        else:
+            results.append((_tag("[OK]", _GREEN),
+                            f"{'Universe gate':<18} build accepted for {check_date}"))
 
     if not quiet:
         print()
