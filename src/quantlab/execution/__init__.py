@@ -970,6 +970,16 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
         # composite re-normalizes instead of treating absent data as 0.
         # Options fields default to None (never enriched); a measured 0.0
         # ("scored, no unusual flow") is real information and passes through.
+        #
+        # STRUCTURAL FACT (verified 2026-06-12, distribution stable at ~6%
+        # None before AND after the Optional-default change): options
+        # enrichment runs AFTER this worker and explosion_score is not
+        # recomputed post-enrichment, so call_flow_imbalance is None for
+        # every symbol at scoring time and the achievable component count is
+        # 6 of 7.  The 5-of-7 gate already prices that in — do not "fix" a
+        # report full of "—" here: that symptom comes from STALE watchlist
+        # rows not rescanned since before the composite existed (degenerate
+        # small universes), which refresh on the next signal or get pruned.
         _opt = (result.options_score if result.options_score is not None
                 else result.options_conviction)
         if edgar_accel is not None:
