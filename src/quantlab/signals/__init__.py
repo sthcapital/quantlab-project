@@ -245,12 +245,41 @@ def stage_classification(bars: Sequence[Bar], ma_period: int = 150) -> int:
 
 # ── Breakout volume quality (Weinstein) ───────────────────────────────────────
 
+def breakout_volume_ratio(bars: Sequence[Bar], period: int = 20) -> float | None:
+    """
+    Raw Weinstein breakout-volume ratio: breakout-bar volume ÷ base average.
+
+    The base average is the trailing ``period``-bar (default 20 ≈ 4 trading
+    weeks, Weinstein's weekly framing in daily bars) mean volume EXCLUDING the
+    breakout bar itself.  This is the same 20-bar volume baseline used by the
+    stage classifier's volume windows and by the dry-up detector
+    (volume_trend_score) so all base-volume comparisons share one yardstick.
+
+    Args:
+        bars:   Daily bar sequence; the last bar is the potential breakout bar.
+        period: Base comparison period (default 20 = 4 trading weeks).
+
+    Returns:
+        Ratio as a float (2.0 = Weinstein's minimum for a valid breakout),
+        or None when there is insufficient bar history (< period + 1 bars)
+        or the base average volume is zero.  None means "not measurable" and
+        must never be rendered or scored as a real 0.0.
+    """
+    if len(bars) < period + 1:
+        return None
+    avg_vol = sum(b.volume for b in bars[-period - 1:-1]) / period
+    if avg_vol == 0:
+        return None
+    return bars[-1].volume / avg_vol
+
+
 def volume_on_breakout_score(bars: Sequence[Bar], period: int = 20) -> float:
     """
     Score breakout volume quality per Weinstein's 2× minimum rule.
 
     Weinstein's rule: volume must be at least 2× the 4-week (20-day) average
-    on the breakout week/bar for a technically valid breakout.
+    on the breakout week/bar for a technically valid breakout.  Bands the raw
+    breakout_volume_ratio() — keep the two in sync.
 
     Args:
         bars:   Daily bar sequence; the last bar is the potential breakout bar.
@@ -262,13 +291,8 @@ def volume_on_breakout_score(bars: Sequence[Bar], period: int = 20) -> float:
         0.7 — volume 2–3× avg   (valid breakout — Weinstein minimum met)
         1.0 — volume > 3× avg   (institutional conviction — best breakouts)
     """
-    if len(bars) < period + 1:
-        return 0.0
-    avg_vol = sum(b.volume for b in bars[-period - 1:-1]) / period
-    if avg_vol == 0:
-        return 0.0
-    ratio = bars[-1].volume / avg_vol
-    if ratio < 1.0:
+    ratio = breakout_volume_ratio(bars, period)
+    if ratio is None or ratio < 1.0:
         return 0.0
     elif ratio < 2.0:
         return 0.3

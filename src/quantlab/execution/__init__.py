@@ -129,9 +129,12 @@ class ScanResult:
 
     # Breakout volume quality — Weinstein's 2× rule (set by scan_symbol)
     breakout_volume_score: float = 0.0   # volume_on_breakout_score() ≥ 0.7 → +0.08
+    # Raw breakout-volume ratio (breakout bar ÷ 20-bar base average) backing the
+    # banded score above; None = not measurable (insufficient bars / zero base)
+    breakout_volume_ratio: float | None = None
 
     # PEG ratio score — Boucher's filter (populated by run_universe_scan via EDGAR cache)
-    peg_score: float = 0.0   # peg_ratio_score() ≥ 0.7 → +0.06
+    peg_score: float | None = None   # peg_ratio_score() ≥ 0.7 → +0.06; None = not computable
 
     # EDGAR fundamentals (populated by run_universe_scan; None = unavailable)
     edgar_acceleration: float | None = None  # real score; falls back to earnings_acceleration
@@ -716,6 +719,7 @@ def scan_symbol(
         relative_volume as _rel_vol,
         stage_classification as _stage_cls,
         volume_on_breakout_score as _vol_breakout,
+        breakout_volume_ratio as _bv_ratio,
     )
     from quantlab.signals.wyckoff import (
         absorption_score as _absorption,
@@ -783,6 +787,7 @@ def scan_symbol(
     # Stage classification (Weinstein/Minervini) and breakout volume quality
     stage     = _stage_cls(bars)
     bvs       = _vol_breakout(bars)
+    bv_ratio  = _bv_ratio(bars)
 
     # News features
     n_count = 0
@@ -823,6 +828,7 @@ def scan_symbol(
         market_cap_tier=market_cap_tier(symbol),
         stage=stage,
         breakout_volume_score=bvs,
+        breakout_volume_ratio=bv_ratio,
     )
 
     result.conviction_score = score_conviction(result)
