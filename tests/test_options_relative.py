@@ -333,9 +333,14 @@ class TestReportSignalRate:
         MassiveOptionsProvider._ensure_table(con)
         for i in range(n_total):
             flagged = i < n_flagged
+            # Explicit column list — unnamed columns get their NULL defaults,
+            # so schema additions don't break this seed
             con.execute(
-                "INSERT OR REPLACE INTO options_snapshots VALUES "
-                "(?, ?, 100.0, 0.5, 0.2, ?, 0.85, 10, 5, ?, ?, ?, ?, ?, NULL)",
+                "INSERT OR REPLACE INTO options_snapshots "
+                "(symbol, snap_date, spot_price, pcr, iv_skew, unusual_calls, "
+                " options_score, call_count, put_count, call_volume, "
+                " put_volume, vol_zscore, rel_score, unusual_flag) "
+                "VALUES (?, ?, 100.0, 0.5, 0.2, ?, 0.85, 10, 5, ?, ?, ?, ?, ?)",
                 [f"SYM{i:03d}", snap_date, flagged,
                  5000.0 if relative else None,
                  3000.0 if relative else None,

@@ -29,7 +29,8 @@ All functions here are pure — no I/O, no provider dependencies.
 from __future__ import annotations
 
 import statistics
-from typing import Mapping, Sequence
+from datetime import date
+from typing import AbstractSet, Mapping, Sequence
 
 # Baseline shorter than this cannot support an "unusual for this symbol" claim.
 MIN_BASELINE_SESSIONS = 10
@@ -65,6 +66,11 @@ MIN_BASELINE_CONTRACTS = 75.0
 # callers tag such rows put_dominated in options_snapshots: they are future
 # short-side signal data (SHORT_SIGNAL_ENABLED is False, the record exists).
 MAX_GATE_PCR = 1.5
+
+# Episode lapse: a symbol unflagged for this many gated sessions ends its
+# flag episode; re-flagging after that starts a NEW episode with a new
+# first_flagged_date.  Shorter gaps are pauses inside the same campaign.
+FLAG_EPISODE_LAPSE_SESSIONS = 3
 
 # Z-score at which the volume component saturates at 1.0.
 _Z_SATURATION = 4.0
@@ -235,3 +241,94 @@ def cross_sectional_flags(
             if pcrs.get(sym) is None or pcrs[sym] <= max_pcr
         }
     return flagged
+
+
+# ── Flag freshness — episode and streak tracking ───────────────────────────────
+
+def flag_freshness(
+    flagged_today: bool,
+    today: date,
+    history: Sequence[tuple[date, bool | None, date | None]],
+    lapse_sessions: int = FLAG_EPISODE_LAPSE_SESSIONS,
+    skip_dates: AbstractSet[date] | None = None,
+) -> tuple[date | None, int]:
+    """
+    Compute (first_flagged_date, flag_streak) for today's gate result.
+
+    The unusual flag alone is memoryless: it cannot distinguish the FIRST day
+    flow appears (positioning starting while price still bases — the
+    highest-value event) from the Nth consecutive flagged day (campaign
+    confirmation early, crowding risk late).
+
+    Args:
+        flagged_today: today's gate verdict for the symbol.
+        today:         today's session date.
+        history:       prior sessions for the symbol, oldest first, as
+                       (session_date, unusual_flag, first_flagged_date).
+                       Rows with unusual_flag None (not gated that day) are
+                       neutral — they neither break a streak nor count
+                       toward an episode lapse.
+        lapse_sessions: gated-but-unflagged sessions after which the episode
+                       ends (re-flag starts a new episode).
+        skip_dates:    gate-refused / degenerate-universe dates — neutral,
+                       same convention as remove_stale's skip_dates.
+
+    Returns:
+        (first_flagged_date, flag_streak):
+          not flagged → (None, 0)
+          flagged     → streak = consecutive flagged sessions including
+                        today (any gated-unflagged session resets it), and
+                        first_flagged_date = episode start: today when the
+                        last flagged session was ≥ lapse_sessions gated
+                        sessions ago (or never), else inherited from it.
+    """
+    if not flagged_today:
+        return None, 0
+
+    skip = skip_dates or set()
+    sessions = [
+        (d, bool(fl), ff)
+        for d, fl, ff in history
+        if d < today and d not in skip and fl is not None
+    ]
+
+    # Streak: walk back through gated sessions while flagged
+    streak = 1
+    for _, fl, _ff in reversed(sessions):
+        if not fl:
+            break
+        streak += 1
+
+    # Episode: gap = gated-unflagged sessions since the last flagged one
+    gap = 0
+    prev_first: date | None = None
+    for d, fl, ff in reversed(sessions):
+        if fl:
+            prev_first = ff or d   # legacy rows may lack first_flagged_date
+            break
+        gap += 1
+
+    if prev_first is None or gap >= lapse_sessions:
+        return today, streak
+    return prev_first, streak
+
+
+def frozen_vs_live_zscores(
+    today_volume: float | None,
+    live_baseline: Sequence[float],
+    frozen_baseline: Sequence[float],
+) -> tuple[float | None, float | None]:
+    """
+    Baseline-inflation diagnostic — NEVER used for scoring.
+
+    A multi-day flag campaign inflates the symbol's own trailing baseline,
+    so persistent accumulation gradually un-flags itself.  This returns
+    (z_live, z_frozen): today's volume z-scored against the current trailing
+    baseline and against the baseline frozen at episode start.  A large
+    z_frozen − z_live spread measures the decay, so a future decision (e.g.
+    episode-frozen baselines) is made on data.
+    """
+    return (
+        volume_zscore(today_volume, live_baseline),
+        volume_zscore(today_volume, frozen_baseline),
+    )

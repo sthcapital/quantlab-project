@@ -167,16 +167,18 @@ def main() -> None:
             con.execute(
                 """
                 UPDATE options_snapshots
-                SET call_volume = ?, vol_zscore = ?, rel_score = ?,
-                    unusual_flag  = CASE WHEN ? IS NULL THEN NULL ELSE ? END,
-                    put_dominated = CASE WHEN ? IS NULL THEN NULL ELSE ? END
+                SET call_volume = ?, vol_zscore = ?, rel_score = ?
                 WHERE symbol = ? AND snap_date = ?
                 """,
                 [r["call_volume"], r["vol_zscore"], r["rel_score"],
-                 r["rel_score"], sym in flagged,
-                 r["rel_score"], sym in put_dominated, sym, session],
+                 sym, session],
             )
         con.close()
+        # Flags + put_dominated tag + flag freshness (first_flagged_date /
+        # flag_streak) all persist through the one shared writer
+        MassiveOptionsProvider(api_key="").mark_unusual_flags(
+            flagged, snap_date=session, put_dominated=put_dominated,
+        )
         print(f"Persisted rescored values for {len(results)} rows.")
     else:
         print("Dry run — use --write to persist.")

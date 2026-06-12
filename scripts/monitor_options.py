@@ -63,6 +63,63 @@ def _ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Streak length at which the baseline-inflation diagnostic logs — a campaign
+# this long has materially fed its own trailing baseline.
+_STREAK_DIAG_THRESHOLD = 5
+
+
+def _log_baseline_inflation(today: date) -> None:
+    """
+    DIAGNOSTIC ONLY — never changes scoring.
+
+    A multi-day flag campaign inflates the symbol's own 20-session baseline,
+    so persistent accumulation gradually un-flags itself.  For every symbol
+    with flag_streak ≥ threshold, log today's z against the live baseline
+    AND against the baseline frozen at episode start (first_flagged_date) —
+    making the decay measurable so a future decision (e.g. episode-frozen
+    baselines) is made on data.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        from quantlab.providers.flat_files import FlatFileProvider
+        from quantlab.signals.options_relative import frozen_vs_live_zscores
+
+        con = duckdb.connect(str(DB_PATH), read_only=True)
+        rows = con.execute(
+            """
+            SELECT symbol, flag_streak, first_flagged_date, call_volume
+            FROM options_snapshots
+            WHERE snap_date = ? AND flag_streak >= ?
+            ORDER BY flag_streak DESC
+            """,
+            [today, _STREAK_DIAG_THRESHOLD],
+        ).fetchall()
+        con.close()
+        if not rows:
+            return
+
+        flat = FlatFileProvider()
+        live_hist = flat.get_call_volume_history(today, n_sessions=20)
+        for sym, streak, episode_start, call_vol in rows:
+            if episode_start is None or call_vol is None:
+                continue
+            if hasattr(episode_start, "date") and not isinstance(episode_start, date):
+                episode_start = episode_start.date()
+            frozen_hist = flat.get_call_volume_history(episode_start, n_sessions=20)
+            z_live, z_frozen = frozen_vs_live_zscores(
+                call_vol,
+                [d.get(sym, 0.0) for d in live_hist],
+                [d.get(sym, 0.0) for d in frozen_hist],
+            )
+            _zl = f"{z_live:.2f}" if z_live is not None else "—"
+            _zf = f"{z_frozen:.2f}" if z_frozen is not None else "—"
+            print(f"  [diag] baseline inflation: {sym:<8} streak={streak}  "
+                  f"z_live={_zl}  z_frozen={_zf}  (episode {episode_start})")
+    except Exception as exc:
+        print(f"[{_ts()}] monitor_options: baseline-inflation diag failed: {exc}")
+
+
 def main() -> None:
     parser = ArgumentParser(description="Intraday options activity monitor.")
     parser.add_argument("--force",   action="store_true",
@@ -158,6 +215,7 @@ def main() -> None:
 
     if not args.dry_run:
         mp.mark_unusual_flags(flagged, put_dominated=put_dominated)
+        _log_baseline_inflation(today)
 
     for sym in sorted(flagged, key=lambda s: -(scores[s] or 0.0)):
         print(f"  ▲ {sym:<8}  rel_score={scores[sym]:.4f}")

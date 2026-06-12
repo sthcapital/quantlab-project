@@ -202,6 +202,25 @@ def _tick(v) -> str:
     return "✓" if v else "–"
 
 
+def _opts_cell(opts_signal, fresh: dict | None) -> str:
+    """
+    Opts column with flag freshness: "⚑" for a fresh flag (streak 1),
+    "⚑dN" for the Nth consecutive flagged session — first-day flow
+    (positioning starting while price still bases) reads differently from
+    campaign confirmation / crowding risk.
+
+    Floor-blocked and put-dominated names are not flagged, so they keep
+    their existing treatment (no glyph); rows without snapshot freshness
+    fall back to the legacy ✓/– tick.
+    """
+    if fresh and fresh.get("unusual_flag"):
+        streak = fresh.get("flag_streak") or 1
+        return "⚑" if streak <= 1 else f"⚑d{streak}"
+    if fresh is not None:
+        return "–"   # gated today, not flagged (incl. floor/PCR-blocked)
+    return _tick(opts_signal)
+
+
 def _stage_lbl(n: int) -> str:
     return {1: "1·Base", 2: "2", 3: "3·Top", 4: "4·Dec"}.get(n, "?")
 
@@ -550,6 +569,7 @@ def _candidate_table(
     candidates: list[dict],
     backtest_map: dict,
     revenue_map: dict | None = None,
+    freshness_map: dict | None = None,
 ) -> list:
     e: list = []
     e.append(PageBreak())
@@ -585,6 +605,8 @@ def _candidate_table(
         stage  = en.get("stage", 0)
         days   = en.get("consecutive_days", 1)
         opts   = en.get("options_signal", False)
+        _fresh = freshness_map.get(en["symbol"]) if freshness_map else None
+        opts_str = _opts_cell(opts, _fresh)
         bkt    = backtest_map.get(en["symbol"], {})
         wr     = (f"WR:{bkt['win_rate']*100:.0f}%"
                   if bkt.get("win_rate") is not None else "")
@@ -599,7 +621,7 @@ def _candidate_table(
                 f"{days}d",
                 _fmt(en.get("explosion_score")),
                 _fmt(en.get("conviction_score")),
-                _tick(opts),
+                opts_str,
                 _tick(en.get("volume_dry_up")),
                 _pct(en.get("earnings_score")),
                 rev_str,
@@ -614,7 +636,7 @@ def _candidate_table(
                 f"{days}d",
                 _fmt(en.get("explosion_score")),
                 _fmt(en.get("conviction_score")),
-                _tick(opts),
+                opts_str,
                 _tick(en.get("volume_dry_up")),
                 _pct(en.get("earnings_score")),
                 _fmt(en.get("peg_score")),
@@ -726,6 +748,7 @@ def _basing_table(
     S: dict,
     basing_cands: list[dict],
     revenue_map: dict | None = None,
+    freshness_map: dict | None = None,
 ) -> list:
     """Render 'Basing Candidates — Weekend Watchlist' for Stage 1 stocks."""
     if not basing_cands:
@@ -755,7 +778,8 @@ def _basing_table(
             en["symbol"],
             f"{en.get('consecutive_days', 1)}d",
             _fmt(en.get("conviction_score")),
-            _tick(en.get("options_signal", False)),
+            _opts_cell(en.get("options_signal", False),
+                       freshness_map.get(en["symbol"]) if freshness_map else None),
             _tick(en.get("volume_dry_up", False)),
             _pct(en.get("earnings_score")),
             _rev_pct(rev_map.get(en["symbol"])),
@@ -917,6 +941,43 @@ def _save_report_row(
 _DEFAULT_DIR = Path("/mnt/c/Users/hadda/Desktop/Daily Report")
 
 
+def _load_options_freshness(
+    report_date: date,
+    db_path: str | None = None,
+) -> dict[str, dict] | None:
+    """
+    Per-symbol flag freshness for the session: symbol → {unusual_flag,
+    flag_streak, first_flagged_date, put_dominated}.  None when the session
+    has no gated snapshot rows (pre-recalibration or monitor didn't run) —
+    callers then fall back to the legacy ✓/– rendering.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+        rows = con.execute(
+            "SELECT symbol, unusual_flag, flag_streak, first_flagged_date, "
+            "       put_dominated "
+            "FROM options_snapshots "
+            "WHERE snap_date = ? AND rel_score IS NOT NULL",
+            [report_date],
+        ).fetchall()
+        con.close()
+    except Exception:
+        return None
+    if not rows:
+        return None
+    return {
+        sym: {
+            "unusual_flag": flag,
+            "flag_streak": streak,
+            "first_flagged_date": first,
+            "put_dominated": put_dom,
+        }
+        for sym, flag, streak, first, put_dom in rows
+    }
+
+
 def _options_signal_rate(
     report_date: date,
     db_path: str | None = None,
@@ -933,6 +994,7 @@ def _options_signal_rate(
     for pre-recalibration sessions.  Returns None when the session has no
     options_snapshots rows at all.
     """
+    n_long_streak = 0
     try:
         import duckdb
         from quantlab.storage import DB_PATH
@@ -945,6 +1007,16 @@ def _options_signal_rate(
             "FROM options_snapshots WHERE snap_date = ?",
             [report_date],
         ).fetchone()
+        try:
+            # Baseline-inflation watch: campaigns this long have materially
+            # fed their own trailing baseline (column absent on old DBs)
+            n_long_streak = con.execute(
+                "SELECT COUNT(*) FROM options_snapshots "
+                "WHERE snap_date = ? AND flag_streak >= 5",
+                [report_date],
+            ).fetchone()[0]
+        except Exception:
+            n_long_streak = 0
         con.close()
     except Exception:
         return None
@@ -952,8 +1024,12 @@ def _options_signal_rate(
     if not total:
         return None
     if n_scored > 0:
-        return (f"Options: {n_flagged}/{n_scored} unusual, "
+        line = (f"Options: {n_flagged}/{n_scored} unusual, "
                 f"{n_flagged / n_scored:.1%}")
+        if n_long_streak:
+            line += (f"  |  {n_long_streak} streak≥5 "
+                     f"(baseline-inflation watch)")
+        return line
     return (f"Options: {n_legacy}/{total} unusual, "
             f"{n_legacy / total:.1%} (legacy scorer)")
 
@@ -1137,15 +1213,20 @@ def generate(
     if regime_gate:
         print(f"  regime gate: {regime_gate.summary()}")
 
+    # Flag freshness: ⚑ fresh / ⚑dN streak rendering in the Opts columns
+    freshness_map = _load_options_freshness(report_date, db_path)
+
     story: list = []
     story += _page1(S, report_date, breadth, len(candidates), n_multi, open_positions,
                     vix_close=vix_close, warning=header_warning,
                     options_rate=opts_rate, regime_gate=regime_gate)
     if candidates:
-        story += _candidate_table(S, candidates, backtest_map, revenue_map)
+        story += _candidate_table(S, candidates, backtest_map, revenue_map,
+                                  freshness_map=freshness_map)
         story += _alert_section(S, candidates, backtest_map, revenue_map)
     if basing_cands:
-        story += _basing_table(S, basing_cands, basing_rev_map)
+        story += _basing_table(S, basing_cands, basing_rev_map,
+                               freshness_map=freshness_map)
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
 

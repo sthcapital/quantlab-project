@@ -101,6 +101,9 @@ DEFAULT_CONFIG = {
         # (HST 2026-06-11: z=10, PCR 6.25).  Rows are tagged put_dominated
         # in options_snapshots as future short-side signal data.
         "options_gate_max_pcr": 1.5,
+        # Flag-episode lapse: unflagged for this many gated sessions ends the
+        # episode; a later re-flag starts a new one (new first_flagged_date).
+        "options_flag_episode_lapse_sessions": 3,
         # Universe build stability (2026-06-12 incident: builds against
         # partial-day Polygon grouped data produced 457–2,325 symbol swings).
         # Floor on raw grouped-ticker count — below this the response is

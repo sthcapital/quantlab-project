@@ -526,9 +526,73 @@ class MassiveOptionsProvider:
                         """,
                         [day, *put_dominated],
                     )
+            self._update_flag_freshness(con, day, flagged)
             con.close()
         except Exception as exc:
             logger.warning("mark_unusual_flags failed: %s", exc)
+
+    @staticmethod
+    def _update_flag_freshness(con, day: date, flagged: set[str]) -> None:
+        """
+        Persist first_flagged_date / flag_streak for every row gated on
+        ``day`` (rel_score NOT NULL).  Flagged rows get an episode start date
+        and a streak ≥ 1; gated-unflagged rows get (NULL, 0); ungated rows
+        stay NULL.  Gate-refused / degenerate-universe dates are neutral —
+        same skip_dates convention as watchlist.remove_stale.
+        """
+        from datetime import timedelta
+
+        from quantlab.signals.options_relative import flag_freshness
+        from quantlab.utils import get_config
+        from quantlab.watchlist import _degenerate_build_dates
+
+        lapse = int(get_config("scanner").get(
+            "options_flag_episode_lapse_sessions", 3))
+        skip = _degenerate_build_dates(con)
+
+        def _as_date(v):
+            if v is None or isinstance(v, date):
+                return v
+            if hasattr(v, "date"):
+                return v.date()
+            return date.fromisoformat(str(v)[:10])
+
+        # Prior-session flag history for every symbol (60 calendar days is
+        # ample for a 3-session lapse + any realistic streak)
+        hist_rows = con.execute(
+            """
+            SELECT symbol, snap_date, unusual_flag, first_flagged_date
+            FROM options_snapshots
+            WHERE snap_date < ? AND snap_date >= ?
+            ORDER BY snap_date
+            """,
+            [day, day - timedelta(days=60)],
+        ).fetchall()
+        history: dict[str, list] = {}
+        for sym, d, fl, ff in hist_rows:
+            history.setdefault(sym, []).append(
+                (_as_date(d), fl, _as_date(ff))
+            )
+
+        gated_today = [r[0] for r in con.execute(
+            "SELECT symbol FROM options_snapshots "
+            "WHERE snap_date = ? AND rel_score IS NOT NULL",
+            [day],
+        ).fetchall()]
+
+        for sym in gated_today:
+            first, streak = flag_freshness(
+                sym in flagged, day, history.get(sym, []),
+                lapse_sessions=lapse, skip_dates=skip,
+            )
+            con.execute(
+                """
+                UPDATE options_snapshots
+                SET first_flagged_date = ?, flag_streak = ?
+                WHERE symbol = ? AND snap_date = ?
+                """,
+                [first, streak, sym, day],
+            )
 
     def _load_relative_cache(self, symbol: str) -> Optional[dict]:
         """Return today's stored relative-score row, or None when not yet scored."""
@@ -736,6 +800,10 @@ class MassiveOptionsProvider:
             # Cleared the volume/liquidity gates but PCR > ceiling — a
             # put-dominated anomaly kept as future short-side signal data
             ("put_dominated", "BOOLEAN"),
+            # Flag freshness: episode start and consecutive flagged sessions
+            # (0 on gated-unflagged rows, NULL on ungated — MISSING ≠ ZERO)
+            ("first_flagged_date", "DATE"),
+            ("flag_streak", "INTEGER"),
         ):
             con.execute(
                 f"ALTER TABLE options_snapshots ADD COLUMN IF NOT EXISTS {col} {col_type}"
