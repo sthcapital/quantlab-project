@@ -8463,11 +8463,95 @@ class TestRegimePolicy:
         assert not bear.allow_entries
         assert bear.stop_tighten_factor < 1.0    # stops tightened
 
-    def test_unknown_tape_falls_back_to_neutral(self):
+    def test_unknown_tape_fails_closed(self):
+        """FAIL CLOSED: unknown/missing tape = no new entries (2026-06-12:
+        the old NEUTRAL fallback entered SNEX at half size while the
+        persisted tape said CORRECTION)."""
         from quantlab.risk.regime_policy import get_regime_rule
-        assert get_regime_rule(None) == get_regime_rule("NEUTRAL")
-        assert get_regime_rule("") == get_regime_rule("NEUTRAL")
-        assert get_regime_rule("garbage") == get_regime_rule("NEUTRAL")
+        for tape in (None, "", "garbage"):
+            rule = get_regime_rule(tape)
+            assert not rule.allow_entries
+            assert rule.size_factor == 0.0
+            assert rule.max_new_positions == 0
+            # Stops on OPEN positions are untouched — fail closed gates
+            # initiation only, it doesn't manufacture exits
+            assert rule.stop_tighten_factor == 1.0
+
+    def test_unknown_regime_blocks_all_candidates(self):
+        """UNKNOWN blocks entry: every qualified candidate is suppressed."""
+        from quantlab.risk.regime_policy import apply_regime_gate, get_regime_rule
+        items = [(_mk_result(s), 0.8, 4) for s in ("SNEX", "CVS", "VELO")]
+        entries, suppressed = apply_regime_gate(items, get_regime_rule(None))
+        assert entries == []
+        assert suppressed == ["SNEX", "CVS", "VELO"]
+
+    def test_session_tape_round_trip_classifier_to_gate(self, tmp_path):
+        """Regime string round-trip: the tape the classifier persists is the
+        tape the gate reads — same record, same string."""
+        import duckdb
+        from datetime import date as _date
+        from quantlab.storage import _ensure_schema
+        from quantlab.risk.regime_policy import get_regime_rule, load_session_tape
+        db = tmp_path / "test.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.execute(
+            "INSERT INTO breadth_history (date, tape) VALUES (?, 'CORRECTION')",
+            [_date(2026, 6, 12)],
+        )
+        con.close()
+        tape = load_session_tape(_date(2026, 6, 12), db_path=str(db))
+        assert tape == "CORRECTION"
+        assert get_regime_rule(tape).allow_entries is False
+
+    def test_gate_before_classifier_fails_closed(self, tmp_path):
+        """Ordering guarantee: no breadth row for the session → tape None →
+        UNKNOWN rule → no entries.  Hard dependency, not timing luck."""
+        import duckdb
+        from datetime import date as _date
+        from quantlab.storage import _ensure_schema
+        from quantlab.risk.regime_policy import (
+            apply_regime_gate, get_regime_rule, load_session_tape,
+        )
+        db = tmp_path / "test.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)   # table exists, no rows — classifier hasn't run
+        con.close()
+        tape = load_session_tape(_date(2026, 6, 12), db_path=str(db))
+        assert tape is None
+        rule = get_regime_rule(tape)
+        items = [(_mk_result("SNEX"), 0.8, 4)]
+        entries, suppressed = apply_regime_gate(items, rule)
+        assert entries == [] and suppressed == ["SNEX"]
+
+    def test_session_tape_walks_back_one_session(self, tmp_path):
+        """Sunday refresh reads Friday's persisted tape (max_back_sessions=1)."""
+        import duckdb
+        from datetime import date as _date
+        from quantlab.storage import _ensure_schema
+        from quantlab.risk.regime_policy import load_session_tape
+        db = tmp_path / "test.duckdb"
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.execute(
+            "INSERT INTO breadth_history (date, tape) VALUES (?, 'BULL')",
+            [_date(2026, 6, 12)],   # Friday
+        )
+        con.close()
+        # Saturday 06-13: session row absent, walks back to Friday
+        assert load_session_tape(_date(2026, 6, 13), db_path=str(db)) == "BULL"
+
+    def test_entry_confirmation_respects_options_gating_flag(self):
+        """The entry path must never grant options credit the qualification
+        path withholds: with gating disabled, an options-only candidate has
+        NO confirming signal; with it enabled, it does."""
+        from quantlab.risk.regime_policy import has_confirming_signal
+        r = _mk_result("SNEX", opts=0.9)
+        iwl_entry = {"options_signal": True, "volume_dry_up": False}
+        assert has_confirming_signal(r, iwl_entry,
+                                     options_gating_enabled=False) is False
+        assert has_confirming_signal(r, iwl_entry,
+                                     options_gating_enabled=True) is True
 
     def test_correction_blocks_all_entries(self):
         """CORRECTION: qualified candidates accumulate but none enter."""
@@ -8516,7 +8600,11 @@ class TestRegimePolicy:
 
     def test_confirming_signal_variants(self):
         from quantlab.risk.regime_policy import has_confirming_signal
-        assert has_confirming_signal(_mk_result("A", opts=0.7))               # options
+        # Options confirms only when gating is enabled (display-only contract)
+        assert has_confirming_signal(_mk_result("A", opts=0.7),
+                                     options_gating_enabled=True)
+        assert not has_confirming_signal(_mk_result("A", opts=0.7),
+                                         options_gating_enabled=False)
         assert has_confirming_signal(_mk_result("B", bvs=0.75))               # 2x breakout vol
         assert has_confirming_signal(_mk_result("C"), {"volume_dry_up": True})  # VDU
         assert not has_confirming_signal(_mk_result("D"))

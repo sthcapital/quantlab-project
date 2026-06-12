@@ -525,7 +525,7 @@ def main() -> None:
         from quantlab.watchlist import add_to_watchlist
         from quantlab.risk.regime_policy import (
             RegimeGateDecision, apply_regime_gate, get_regime_rule,
-            log_regime_gate,
+            load_session_tape, log_regime_gate,
         )
 
         # Build IWL state for confirming-signal fields (options, vdu, consecutive_days)
@@ -543,7 +543,17 @@ def main() -> None:
         # Scanning and IWL accumulation already happened above in ALL regimes;
         # this gate governs only position INITIATION (O'Neil/Minervini:
         # corrections build watchlists, not positions).
-        _tape = breadth_snap.tape if breadth_snap else ""
+        #
+        # The tape is read fresh from the PERSISTED breadth_history record —
+        # the same record the report renders — with retries for transient DB
+        # contention.  The scan-start in-memory snapshot is NOT trusted here:
+        # on 2026-06-12 a swallowed DuckDB lock error during concurrent scans
+        # made it None and the gate entered SNEX in a CORRECTION tape.
+        # Missing tape state for the session FAILS CLOSED (no new entries).
+        _tape = load_session_tape(date.today())
+        if _tape is None:
+            print("  WARNING: REGIME GATE FAIL-CLOSED — no persisted tape "
+                  "state for this session; UNKNOWN regime = no new entries")
         rule = get_regime_rule(_tape)
         entry_items, suppressed = apply_regime_gate(top5, rule, iwl_state)
         entry_symbols = {item[0].symbol for item in entry_items}

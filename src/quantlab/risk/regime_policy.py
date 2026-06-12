@@ -16,6 +16,11 @@ governs only what happens at ENTRY time:
                  managed normally (stops unchanged).
     BEAR       — no new long entries; stops on open positions tightened by
                  stop_tighten_factor.
+    UNKNOWN    — FAIL CLOSED: no new entries.  An unreadable/missing tape
+                 state is an infrastructure failure, not a market opinion —
+                 2026-06-12: a swallowed DuckDB lock error during concurrent
+                 scans read tape=None, the old NEUTRAL fallback entered SNEX
+                 at half size in a CORRECTION tape.
 
 Every gate decision is persisted to the regime_gate_log DuckDB table so the
 daily report can render it ("3 candidates qualified, 0 entered — regime
@@ -58,6 +63,11 @@ DEFAULT_REGIME_POLICY: dict[str, RegimeRule] = {
     "BEAR":       RegimeRule(allow_entries=False, size_factor=0.0,
                              max_new_positions=0, require_confirming=False,
                              stop_tighten_factor=0.5),
+    # FAIL CLOSED: unknown regime = no new entries.  Scanning and watchlist
+    # accumulation continue; only position initiation is blocked.
+    "UNKNOWN":    RegimeRule(allow_entries=False, size_factor=0.0,
+                             max_new_positions=0, require_confirming=False,
+                             stop_tighten_factor=1.0),
 }
 
 
@@ -67,23 +77,103 @@ def get_regime_rule(
 ) -> RegimeRule:
     """Return the RegimeRule for a tape state.
 
-    Unknown or missing tape (no breadth data) falls back to the NEUTRAL rule —
-    half size, top-3 — rather than assuming a bull market.
+    Unknown or missing tape FAILS CLOSED (no new entries) and logs loudly —
+    a missing tape state means the classifier's record was unreadable, which
+    is an infrastructure fault, not information about the market.  The old
+    NEUTRAL fallback entered positions on exactly such a fault (2026-06-12:
+    SNEX entered at half size while the persisted tape said CORRECTION).
     """
     p = policy or DEFAULT_REGIME_POLICY
-    return p.get((tape or "").upper(), p["NEUTRAL"])
+    key = (tape or "").upper()
+    if key not in p:
+        logger.warning(
+            "REGIME GATE FAIL-CLOSED: tape state %r is unknown — "
+            "no new entries this session", tape,
+        )
+        return p["UNKNOWN"]
+    return p[key]
+
+
+def load_session_tape(
+    session_date: date | None = None,
+    db_path: str | None = None,
+    max_back_sessions: int = 1,
+    retries: int = 3,
+    retry_wait: float = 2.0,
+) -> str | None:
+    """
+    Tape state for the session from the PERSISTED breadth_history record —
+    the same record the daily report renders, so gate and report can never
+    disagree about the regime.
+
+    Hard dependency, not timing luck: transient DuckDB errors (concurrent
+    scans — the 2026-06-12 failure mode) are retried, not swallowed into a
+    silent None.  Walks back at most ``max_back_sessions`` trading days
+    (covers the Sunday refresh reading Friday's row).  Returns None only
+    when no tape row exists for the session — callers must fail closed.
+    """
+    import time
+
+    from quantlab.market_calendar import prev_trading_day
+
+    d = session_date or date.today()
+    candidates = [d]
+    for _ in range(max_back_sessions):
+        candidates.append(prev_trading_day(candidates[-1]))
+
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            import duckdb
+            from quantlab.storage import DB_PATH
+            con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+            placeholders = ", ".join("?" for _ in candidates)
+            row = con.execute(
+                f"SELECT tape FROM breadth_history "
+                f"WHERE date IN ({placeholders}) ORDER BY date DESC LIMIT 1",
+                candidates,
+            ).fetchone()
+            con.close()
+            return row[0] if row and row[0] else None
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "load_session_tape attempt %d/%d failed (%s) — retrying",
+                attempt, retries, exc,
+            )
+            time.sleep(retry_wait)
+    logger.error(
+        "load_session_tape: all %d attempts failed (%s) — gate must fail closed",
+        retries, last_exc,
+    )
+    return None
 
 
 def has_confirming_signal(
     scan_result,
     iwl_entry: dict | None = None,
+    options_gating_enabled: bool | None = None,
 ) -> bool:
     """RECOVERY-entry confirmation: options activity OR breakout volume ≥ 2×
     average (breakout_volume_score ≥ 0.7 — Weinstein's 2× rule) OR volume
-    dry-up then expansion (IWL volume_dry_up flag)."""
+    dry-up then expansion (IWL volume_dry_up flag).
+
+    Options activity counts only when options_signal_gating_enabled is on
+    (None → scanner config) — the same display-only contract as
+    select_top_candidates.  The entry path must never grant credit the
+    qualification path withholds.
+    """
     iwl_entry = iwl_entry or {}
+    if options_gating_enabled is None:
+        try:
+            from quantlab.utils import get_config
+            options_gating_enabled = bool(
+                get_config("scanner").get("options_signal_gating_enabled", False)
+            )
+        except Exception:
+            options_gating_enabled = False
     _opt_score = getattr(scan_result, "options_score", None)
-    options = (
+    options = options_gating_enabled and (
         getattr(scan_result, "unusual_options_score", 0.0) >= 0.5
         or (_opt_score is not None and _opt_score >= 0.6)
         or bool(iwl_entry.get("options_signal", False))
