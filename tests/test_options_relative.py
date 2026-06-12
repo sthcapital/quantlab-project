@@ -205,6 +205,52 @@ class TestCrossSectionalFlags:
         scores, _ = _universe(100)
         assert len(cross_sectional_flags(scores)) == 10
 
+    # ── Liquidity floor (gate eligibility only) ───────────────────────────────
+
+    def test_tiny_baseline_blocked_from_flag(self):
+        """The EG case (2026-06-11): z=10 on a 24-contract baseline — one
+        hedger rolling a position, not accumulation.  Scored, but no flag."""
+        scores, zscores = _universe(100)
+        base_means = {sym: 500.0 for sym in scores}
+        base_means["S099"] = 24.0   # top score, illiquid baseline
+        flagged = cross_sectional_flags(
+            scores, zscores=zscores, baseline_means=base_means,
+        )
+        assert "S099" not in flagged
+        assert "S098" in flagged   # liquid neighbours unaffected
+
+    def test_baseline_at_floor_is_eligible(self):
+        scores, zscores = _universe(100)
+        base_means = {sym: 75.0 for sym in scores}   # exactly at the default floor
+        flagged = cross_sectional_flags(
+            scores, zscores=zscores, baseline_means=base_means,
+        )
+        assert len(flagged) == 10
+
+    def test_floor_configurable(self):
+        scores, zscores = _universe(100)
+        base_means = {sym: 50.0 for sym in scores}
+        assert cross_sectional_flags(
+            scores, zscores=zscores, baseline_means=base_means, min_baseline=40.0,
+        )   # all eligible at a 40-contract floor
+        assert cross_sectional_flags(
+            scores, zscores=zscores, baseline_means=base_means, min_baseline=60.0,
+        ) == set()
+
+    def test_unknown_baseline_mean_blocked(self):
+        """No baseline mean recorded → cannot make the liquidity claim → no flag."""
+        scores, zscores = _universe(100)
+        base_means = {sym: 500.0 for sym in scores}
+        base_means["S099"] = None
+        flagged = cross_sectional_flags(
+            scores, zscores=zscores, baseline_means=base_means,
+        )
+        assert "S099" not in flagged
+
+    def test_no_baseline_means_keeps_prior_behavior(self):
+        scores, zscores = _universe(100)
+        assert len(cross_sectional_flags(scores, zscores=zscores)) == 10
+
     def test_percentile_helper(self):
         vals = list(range(1, 101))
         assert percentile(vals, 50.0) == pytest.approx(50.5)

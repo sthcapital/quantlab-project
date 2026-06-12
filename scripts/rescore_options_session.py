@@ -102,9 +102,20 @@ def main() -> None:
             "legacy_score": legacy_score,
         }
 
-    scores  = {sym: r["rel_score"] for sym, r in results.items()}
-    zscores = {sym: r["vol_zscore"] for sym, r in results.items()}
-    flagged = cross_sectional_flags(scores, percentile_cut=pctl, zscores=zscores)
+    min_base = float(
+        get_config("scanner").get("options_min_baseline_contracts", 75)
+    )
+    scores     = {sym: r["rel_score"] for sym, r in results.items()}
+    zscores    = {sym: r["vol_zscore"] for sym, r in results.items()}
+    base_means = {sym: r["baseline_mean"] for sym, r in results.items()}
+    flagged = cross_sectional_flags(
+        scores, percentile_cut=pctl, zscores=zscores,
+        baseline_means=base_means, min_baseline=min_base,
+    )
+    # Floor-blocked: would have flagged on score+z alone — listed for review
+    floor_blocked = cross_sectional_flags(
+        scores, percentile_cut=pctl, zscores=zscores,
+    ) - flagged
 
     n_scored = sum(1 for v in scores.values() if v is not None)
     print(f"{'SYM':<8} {'CALL_VOL':>10} {'BASE_AVG':>10} {'VOL_Z':>7} "
@@ -114,6 +125,14 @@ def main() -> None:
         print(f"{sym:<8} {r['call_volume']:>10,.0f} {r['baseline_mean']:>10,.0f} "
               f"{r['vol_zscore']:>7.2f} {r['pcr']:>6.2f} {r['iv_skew']:>6.2f} "
               f"{r['rel_score']:>7.4f} {r['legacy_score']:>7.2f}")
+
+    if floor_blocked:
+        print(f"\nFloor-blocked (baseline avg < {min_base:g} contracts — "
+              f"scored/persisted, no gate credit):")
+        for sym in sorted(floor_blocked, key=lambda s: -(scores[s] or 0.0)):
+            r = results[sym]
+            print(f"  {sym:<8} base_avg={r['baseline_mean']:>8,.0f}  "
+                  f"vol_z={r['vol_zscore']:>6.2f}  rel={r['rel_score']:.4f}")
 
     rate = (len(flagged) / n_scored) if n_scored else 0.0
     print(f"\nOptions: {len(flagged)}/{n_scored} unusual, {rate:.1%}"

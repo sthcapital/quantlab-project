@@ -51,6 +51,14 @@ MIN_TODAY_CALL_VOLUME = 100.0
 # its own baseline, carried into the top decile by IV skew alone).
 MIN_FLAG_ZSCORE = 2.0
 
+# Liquidity floor for FLAG eligibility: a 20-session baseline average below
+# this many contracts cannot support an accumulation claim — EG flagged at
+# z = 10 on 9,043 contracts vs a 24-contract baseline (2026-06-11), where one
+# hedger rolling a position is indistinguishable from accumulation.  Symbols
+# below the floor are still scored, displayed, and persisted — they just
+# cannot receive the unusual flag / gate credit.
+MIN_BASELINE_CONTRACTS = 75.0
+
 # Z-score at which the volume component saturates at 1.0.
 _Z_SATURATION = 4.0
 
@@ -160,6 +168,8 @@ def cross_sectional_flags(
     min_universe: int = 10,
     zscores: Mapping[str, float | None] | None = None,
     min_zscore: float = MIN_FLAG_ZSCORE,
+    baseline_means: Mapping[str, float | None] | None = None,
+    min_baseline: float = MIN_BASELINE_CONTRACTS,
 ) -> set[str]:
     """
     Flag the top tail of the day's scores: symbols whose score is strictly
@@ -174,6 +184,12 @@ def cross_sectional_flags(
     flag.  On a quiet day the gate flags fewer than its decile rather than
     filling it with non-anomalies.  (The threshold is still computed over all
     scored symbols so the cut stays a stable day-level statistic.)
+
+    Liquidity floor: when ``baseline_means`` is provided, a symbol whose
+    trailing baseline average is below ``min_baseline`` contracts cannot
+    flag — at a 24-contract baseline a z = 10 spike is one hedger rolling a
+    position, not accumulation.  Such symbols are still scored and persisted;
+    they only lose gate credit.
 
     Symbols with score None (no baseline) are excluded from both the
     percentile computation and the flags.  Returns the empty set when fewer
@@ -191,5 +207,11 @@ def cross_sectional_flags(
         flagged = {
             sym for sym in flagged
             if zscores.get(sym) is not None and zscores[sym] >= min_zscore
+        }
+    if baseline_means is not None:
+        flagged = {
+            sym for sym in flagged
+            if baseline_means.get(sym) is not None
+            and baseline_means[sym] >= min_baseline
         }
     return flagged

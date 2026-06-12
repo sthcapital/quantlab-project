@@ -92,6 +92,10 @@ DEFAULT_CONFIG = {
         # Cross-sectional gate percentile: "unusual" = the day's scores
         # strictly above this percentile (90 → ~top decile, ≤ ~10%/day).
         "options_unusual_percentile": 90.0,
+        # Liquidity floor for gate eligibility: baseline average below this
+        # many contracts cannot flag (still scored/displayed/persisted).
+        # EG 2026-06-11: z=10 on a 24-contract baseline = one hedger rolling.
+        "options_min_baseline_contracts": 75,
         # Universe build stability (2026-06-12 incident: builds against
         # partial-day Polygon grouped data produced 457–2,325 symbol swings).
         # Floor on raw grouped-ticker count — below this the response is
