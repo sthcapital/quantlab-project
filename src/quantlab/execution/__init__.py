@@ -161,8 +161,11 @@ class ScanResult:
     # RS rank percentile across scanned universe (0-1; computed post-Phase-1)
     rs_percentile: float = 0.0
 
-    # Unified weighted composite signal: 0-1 explosive-breakout probability
-    explosion_score: float = 0.0
+    # Unified weighted composite signal: 0-1 explosive-breakout probability.
+    # None = not computable (fewer than EXPLOSION_MIN_COMPONENTS available).
+    explosion_score: float | None = None
+    # How many of the 7 composite components were measurable for this symbol.
+    explosion_components: int = 0
 
     # Computed conviction score (0.0 – 1.0)
     conviction_score: float = 0.0
@@ -324,7 +327,7 @@ def score_conviction(result: ScanResult) -> float:
         score += 0.08
 
     # PEG ratio — Boucher's fairly-valued-relative-to-growth filter
-    if result.peg_score >= 0.7:
+    if result.peg_score is not None and result.peg_score >= 0.7:
         score += 0.06
 
     # Negative EPS veto: deeply deteriorating fundamentals suppress conviction
@@ -376,15 +379,21 @@ def _compute_adr_expansion_rate(bars) -> float | None:
     return (last5 - prior15) / prior15
 
 
+# Minimum available components (of 7) for a composite to be meaningful.
+# Re-normalizing from 1-2 components creates false confidence — a thin-coverage
+# symbol must not outrank a fully-measured one on a single strong input.
+EXPLOSION_MIN_COMPONENTS = 5
+
+
 def compute_explosion_score(
-    earnings_acceleration: float,
-    rs_percentile: float,
+    earnings_acceleration: float | None,
+    rs_percentile: float | None,
     rel_volume_zscore: float | None,
-    stage2_regime: float,
-    call_flow_imbalance: float,
+    stage2_regime: float | None,
+    call_flow_imbalance: float | None,
     adr_expansion_rate: float | None,
-    peg_score: float,
-) -> float:
+    peg_score: float | None,
+) -> tuple[float | None, int]:
     """Unified weighted composite signal for explosive breakout probability.
 
     Base weights (sum to 1.0):
@@ -396,41 +405,57 @@ def compute_explosion_score(
         0.07  ADR expansion norm      (0–1)
         0.05  PEG quality             (0–1)
 
-    Components with 0.0 values are treated as unavailable and excluded;
-    remaining weights are re-normalized to sum to 1.0.  Returns 0.0 only
-    when ALL components are unavailable.
+    MISSING ≠ ZERO.  Every component is Optional: None means the metric could
+    not be measured (no EDGAR data, no options chain, unknown stage); a real
+    value — including 0.0 — is a measurement and participates in the weighted
+    sum.  Weights are re-normalized over non-None components only.
+
+    Gate: the score is None (not 0.0) unless at least EXPLOSION_MIN_COMPONENTS
+    components are available AND the two highest-weighted components
+    (earnings_acceleration, rs_percentile) are both present.
+
+    Returns:
+        (score, component_count) — score is None when below the gate;
+        component_count is always the number of available components.
     """
     # Relative volume: normalize raw vol (0.5x–3.5x) → 0.0–1.0
-    # None or 0.0 means the metric was not available
-    if rel_volume_zscore is None or rel_volume_zscore == 0.0:
-        rv_norm = 0.0
-    else:
-        rv_norm = min(1.0, max(0.0, (rel_volume_zscore - 0.5) / 3.0))
+    rv_norm = (
+        None if rel_volume_zscore is None
+        else min(1.0, max(0.0, (rel_volume_zscore - 0.5) / 3.0))
+    )
 
     # ADR expansion: normalize [-1, +1] → [0, 1]
-    # None or 0.0 means the metric was not computed
-    if adr_expansion_rate is None or adr_expansion_rate == 0.0:
-        adr_norm = 0.0
-    else:
-        adr_norm = min(1.0, max(0.0, (adr_expansion_rate + 1.0) / 2.0))
+    adr_norm = (
+        None if adr_expansion_rate is None
+        else min(1.0, max(0.0, (adr_expansion_rate + 1.0) / 2.0))
+    )
+
+    def _clamp(v: float | None) -> float | None:
+        return None if v is None else min(1.0, max(0.0, v))
 
     components = [
-        (min(1.0, max(0.0, earnings_acceleration)), 0.25),
-        (min(1.0, max(0.0, rs_percentile)),         0.20),
-        (rv_norm,                                    0.18),
-        (min(1.0, max(0.0, stage2_regime)),          0.15),
-        (min(1.0, max(0.0, call_flow_imbalance)),    0.10),
-        (adr_norm,                                   0.07),
-        (min(1.0, max(0.0, peg_score)),              0.05),
+        (_clamp(earnings_acceleration), 0.25),
+        (_clamp(rs_percentile),         0.20),
+        (rv_norm,                       0.18),
+        (_clamp(stage2_regime),         0.15),
+        (_clamp(call_flow_imbalance),   0.10),
+        (adr_norm,                      0.07),
+        (_clamp(peg_score),             0.05),
     ]
 
-    available = [(v, w) for v, w in components if v > 0.0]
-    if not available:
-        return 0.0
+    available = [(v, w) for v, w in components if v is not None]
+    n_available = len(available)
+
+    if n_available < EXPLOSION_MIN_COMPONENTS:
+        return None, n_available
+    if earnings_acceleration is None or rs_percentile is None:
+        # The two highest-weighted components anchor the composite; without
+        # them a re-normalized score overweights the secondary signals.
+        return None, n_available
 
     total_weight = sum(w for _, w in available)
     raw = sum(v * w / total_weight for v, w in available)
-    return round(min(1.0, max(0.0, raw)), 4)
+    return round(min(1.0, max(0.0, raw)), 4), n_available
 
 
 def historical_edge_score(
@@ -890,13 +915,23 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
         result.rs_percentile       = rs_percentile
         _adr_expansion             = _compute_adr_expansion_rate(bars)
         result.adr_expansion_rate  = _adr_expansion
+        # MISSING ≠ ZERO: each component is None when not measurable, so the
+        # composite re-normalizes instead of treating absent data as 0.
+        # Options scores use 0.0 as their "not computed" sentinel (enrichment
+        # runs post-scan), so 0.0 maps to None here.
         _opt = result.options_score if result.options_score > 0 else result.options_conviction
-        result.explosion_score     = compute_explosion_score(
-            earnings_acceleration = edgar_accel or result.earnings_acceleration,
-            rs_percentile         = rs_percentile,
+        if edgar_accel is not None:
+            _earn = edgar_accel
+        elif result.earnings_acceleration > 0:
+            _earn = result.earnings_acceleration  # OHLCV fallback; 0.0 = <4 events detected
+        else:
+            _earn = None
+        result.explosion_score, result.explosion_components = compute_explosion_score(
+            earnings_acceleration = _earn,
+            rs_percentile         = rs_percentile if rs_percentile else None,
             rel_volume_zscore     = result.rel_volume,
-            stage2_regime         = 1.0 if result.stage == 2 else 0.0,
-            call_flow_imbalance   = _opt,
+            stage2_regime         = None if result.stage == 0 else (1.0 if result.stage == 2 else 0.0),
+            call_flow_imbalance   = _opt if _opt > 0 else None,
             adr_expansion_rate    = _adr_expansion,
             peg_score             = peg_score,
         )
@@ -1084,8 +1119,8 @@ def run_universe_scan(
                         symbol, edgar_accel, _eps_pct, _rev_pct, _adr_str,
                     )
 
-                # PEG score from EDGAR cache.
-                _peg_score: float = 0.0
+                # PEG score from EDGAR cache (None = not computable).
+                _peg_score: float | None = None
                 if _get_edgar_peg_score is not None:
                     try:
                         _peg_score = _get_edgar_peg_score(symbol, bars[-1].close)

@@ -139,12 +139,15 @@ def print_dashboard(
         print(f"  Op. cash flow  : {_mm(fs.operating_cashflow)}")
         print(f"  CapEx          : {_mm(fs.capex)}")
         print(f"  Shares out     : {_mm(fs.shares_out)}")
-        accel_label = (
-            "accelerating ↑" if fs.is_accelerating
-            else "decelerating" if accel < 0.45
-            else "neutral"
-        )
-        print(f"  Earnings accel : {accel:.2f}  ({accel_label})")
+        if accel is None:
+            print("  Earnings accel : --  (insufficient history)")
+        else:
+            accel_label = (
+                "accelerating ↑" if fs.is_accelerating
+                else "decelerating" if accel < 0.45
+                else "neutral"
+            )
+            print(f"  Earnings accel : {accel:.2f}  ({accel_label})")
 
     print()
 

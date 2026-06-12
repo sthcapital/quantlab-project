@@ -841,7 +841,7 @@ def append_scan_results(scan_id: str, results: list) -> None:
                 getattr(r, "sector", ""), getattr(r, "sector_cluster", False),
                 getattr(r, "rs_score", 0.0), getattr(r, "edgar_acceleration", None),
                 getattr(r, "breakout_volume_score", 0.0),
-                getattr(r, "peg_score", 0.0), getattr(r, "stage", 0),
+                getattr(r, "peg_score", None), getattr(r, "stage", 0),
             ])
         con.close()
     except Exception as e:

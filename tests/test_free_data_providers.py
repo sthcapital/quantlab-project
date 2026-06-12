@@ -247,16 +247,18 @@ class TestEdgar:
         assert snap.eps_history == []
         assert snap.net_income_history == []
 
-    def test_compute_earnings_acceleration_neutral_insufficient_data(self):
+    def test_compute_earnings_acceleration_none_when_no_data(self):
+        """No earnings history at all → None (unavailable), not a neutral score."""
         from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
         snap = FundamentalSnapshot(ticker="X", cik="0", as_of=date(2026, 1, 1))
-        assert compute_earnings_acceleration(snap) == pytest.approx(0.5)
+        assert compute_earnings_acceleration(snap) is None
 
-    def test_compute_earnings_acceleration_neutral_two_points(self):
+    def test_compute_earnings_acceleration_none_two_points(self):
+        """Two data points are below the 3-quarter minimum → None."""
         from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
         snap = FundamentalSnapshot(ticker="X", cik="0", as_of=date(2026, 1, 1))
         snap.eps_history = [1.0, 1.1]
-        assert compute_earnings_acceleration(snap) == pytest.approx(0.5)
+        assert compute_earnings_acceleration(snap) is None
 
     def test_compute_earnings_acceleration_accelerating(self):
         from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
@@ -471,7 +473,7 @@ class TestEdgarCache:
         """Cache hit should return without making any HTTP calls."""
         from quantlab.providers.edgar import get_edgar_acceleration
 
-        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=0.65):
+        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=(True, 0.65)):
             with patch("quantlab.providers.edgar.fetch_fundamentals") as mock_fetch:
                 result = get_edgar_acceleration("AAPL")
 
@@ -486,7 +488,7 @@ class TestEdgarCache:
         snap = FundamentalSnapshot(ticker="AAPL", cik="0000320193", as_of=date(2026, 1, 1))
         snap.eps_history = [1.0, 1.10, 1.32]  # accelerating
 
-        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=None):
+        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=(False, None)):
             with patch("quantlab.providers.edgar.fetch_fundamentals", return_value=snap):
                 with patch("quantlab.providers.edgar._save_edgar_cache") as mock_save:
                     result = get_edgar_acceleration("AAPL")
@@ -499,7 +501,7 @@ class TestEdgarCache:
         """Network/lookup failure should return None, not raise."""
         from quantlab.providers.edgar import get_edgar_acceleration
 
-        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=None):
+        with patch("quantlab.providers.edgar._load_edgar_cache", return_value=(False, None)):
             with patch(
                 "quantlab.providers.edgar.fetch_fundamentals",
                 side_effect=ValueError("Ticker not found in SEC filing index: ZZZZ"),

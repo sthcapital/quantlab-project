@@ -173,8 +173,13 @@ def _ensure_edgar_table(con) -> None:
         pass
 
 
-def _load_edgar_cache(symbol: str, max_age_days: int) -> Optional[float]:
-    """Return cached acceleration_score if within max_age_days, else None."""
+def _load_edgar_cache(symbol: str, max_age_days: int) -> tuple[bool, Optional[float]]:
+    """Return (cache_hit, acceleration_score) for a fresh cache row.
+
+    A hit with a NULL score means the last fetch found no usable fundamentals
+    (e.g. a 20-F/40-F foreign filer) — callers must treat that as "unavailable"
+    without re-fetching every scan.
+    """
     try:
         import duckdb
         from quantlab.storage import DB_PATH
@@ -191,34 +196,41 @@ def _load_edgar_cache(symbol: str, max_age_days: int) -> Optional[float]:
             [symbol, cutoff],
         ).fetchone()
         con.close()
-        return float(row[0]) if row is not None else None
+        if row is None:
+            return False, None
+        return True, (float(row[0]) if row[0] is not None else None)
     except Exception as exc:
         logger.debug("EDGAR cache lookup failed for %s: %s", symbol, exc)
-        return None
+        return False, None
 
 
 def _save_edgar_cache(
     symbol: str,
     snap: FundamentalSnapshot,
-    acceleration_score: float,
+    acceleration_score: Optional[float],
     consecutive_beats: int,
 ) -> None:
-    """Write EDGAR-derived metrics to the edgar_fundamentals cache table. Non-fatal."""
+    """Write EDGAR-derived metrics to the edgar_fundamentals cache table. Non-fatal.
+
+    MISSING ≠ ZERO: growth rates that could not be computed (e.g. 20-F/40-F
+    foreign filers whose facts never appear under 10-K/10-Q forms) are stored
+    as NULL, never 0.0 — a literal 0.0 means measured zero growth and would
+    poison both display ("+0.0%") and scoring.
+    """
     try:
         import duckdb
         from quantlab.storage import DB_PATH
 
         con = duckdb.connect(str(DB_PATH))
         _ensure_edgar_table(con)
-        # Prefer YoY growth rates; fall back to QoQ; store 0.0 (not NULL) when
-        # only one quarter of data is available so the scorer never fails silently.
+        # Prefer YoY growth rates; fall back to QoQ; NULL when neither exists.
         _rev_growth = (
             snap.revenue_yoy_pct if snap.revenue_yoy_pct is not None
-            else (snap.revenue_qoq_growth if snap.revenue_qoq_growth is not None else 0.0)
+            else snap.revenue_qoq_growth
         )
         _eps_growth = (
             snap.eps_yoy_pct if snap.eps_yoy_pct is not None
-            else (snap.eps_qoq_growth if snap.eps_qoq_growth is not None else 0.0)
+            else snap.eps_qoq_growth
         )
         con.execute(
             """
@@ -362,7 +374,22 @@ def _qoq_growth(history: list[float]) -> Optional[float]:
     return round((curr - prev) / abs(prev), 6)
 
 
-def _yoy_growth_series(history: list[float], max_quarters: int = 4) -> list[float]:
+# YoY outlier bounds — shared by the report display cap and diagnostic logging.
+# Upside: growth beyond +200% is suppressed from display as implausible.
+# Downside: YoY revenue cannot mathematically fall below −100%, so a literal
+# ±200% bound would never fire on declines — the artifact zone instead starts
+# at −90%.  Real businesses almost never lose >90% of revenue YoY; such values
+# are usually period-mismatch bugs (annual vs quarterly) or one-off prior-year
+# items, so both tails are capped and the raw inputs logged for diagnosis.
+YOY_OUTLIER_HI = 2.0
+YOY_OUTLIER_LO = -0.90
+
+
+def _yoy_growth_series(
+    history: list[float],
+    max_quarters: int = 4,
+    label: str = "",
+) -> list[float]:
     """
     Compute year-over-year (same-quarter) growth rates from quarterly history.
 
@@ -372,6 +399,7 @@ def _yoy_growth_series(history: list[float], max_quarters: int = 4) -> list[floa
     Args:
         history:      Quarterly values oldest-first (from _extract_periods).
         max_quarters: Maximum number of YoY rates to return.
+        label:        "TICKER.metric" tag for outlier diagnostics (optional).
 
     Returns:
         List of YoY growth rates, oldest-first. Empty if insufficient data.
@@ -384,7 +412,16 @@ def _yoy_growth_series(history: list[float], max_quarters: int = 4) -> list[floa
         curr = history[i]
         if abs(prior) < 1e-9:
             continue
-        rates.append((curr - prior) / abs(prior))
+        rate = (curr - prior) / abs(prior)
+        if rate > YOY_OUTLIER_HI or rate < YOY_OUTLIER_LO:
+            # Log the raw period values so real collapses can be told apart
+            # from period-mismatch artifacts (annual totals vs quarterly).
+            logger.warning(
+                "YoY outlier %s: rate=%+.1f%%  current=%s  prior_year=%s "
+                "(check for period mismatch)",
+                label or "(unlabelled)", rate * 100, curr, prior,
+            )
+        rates.append(rate)
     return rates[-max_quarters:]
 
 
@@ -450,7 +487,7 @@ def fetch_fundamentals(
             _rev_history = h
             snap.revenue = h[-1]
             snap.revenue_qoq_growth = _qoq_growth(h)
-            snap.revenue_yoy_history = _yoy_growth_series(h)
+            snap.revenue_yoy_history = _yoy_growth_series(h, label=f"{ticker}.revenue")
             snap.revenue_yoy_pct = (
                 snap.revenue_yoy_history[-1] if snap.revenue_yoy_history else None
             )
@@ -468,7 +505,7 @@ def fetch_fundamentals(
             snap.eps_diluted = h[-1]
             snap.eps_history = h
             snap.eps_qoq_growth = _qoq_growth(h)
-            snap.eps_yoy_history = _yoy_growth_series(h)
+            snap.eps_yoy_history = _yoy_growth_series(h, label=f"{ticker}.eps")
             snap.eps_yoy_pct = (
                 snap.eps_yoy_history[-1] if snap.eps_yoy_history else None
             )
@@ -505,7 +542,9 @@ def fetch_fundamentals(
 
     # is_accelerating: both revenue AND eps YoY growth rates increasing for 2+ quarters.
     # Falls back to net_income YoY when eps data is unavailable.
-    _eps_yoy = snap.eps_yoy_history or _yoy_growth_series(snap.net_income_history)
+    _eps_yoy = snap.eps_yoy_history or _yoy_growth_series(
+        snap.net_income_history, label=f"{ticker}.net_income"
+    )
     _rev_yoy = snap.revenue_yoy_history
     snap.is_accelerating = (
         bool(_rev_yoy) and bool(_eps_yoy)
@@ -532,9 +571,14 @@ def get_edgar_acceleration(symbol: str, max_age_days: int = 7) -> Optional[float
     Returns:
         float 0–1 when data is available, None on any failure.
     """
-    cached = _load_edgar_cache(symbol, max_age_days)
-    if cached is not None:
-        logger.debug("%s: EDGAR acceleration from cache: %.4f", symbol, cached)
+    hit, cached = _load_edgar_cache(symbol, max_age_days)
+    if hit:
+        # A cached NULL means the last fetch found no usable fundamentals
+        # (foreign filer / no quarterly facts) — honour it without re-fetching.
+        if cached is None:
+            logger.debug("%s: EDGAR acceleration cached as unavailable", symbol)
+        else:
+            logger.debug("%s: EDGAR acceleration from cache: %.4f", symbol, cached)
         return cached
 
     try:
@@ -543,8 +587,8 @@ def get_edgar_acceleration(symbol: str, max_age_days: int = 7) -> Optional[float
         consecutive = _count_consecutive_beats(snap.eps_history or snap.net_income_history)
         _save_edgar_cache(symbol, snap, score, consecutive)
         logger.debug(
-            "%s: EDGAR acceleration fetched: %.4f  consecutive_beats=%d",
-            symbol, score, consecutive,
+            "%s: EDGAR acceleration fetched: %s  consecutive_beats=%d",
+            symbol, f"{score:.4f}" if score is not None else "unavailable", consecutive,
         )
         return score
     except Exception as exc:
@@ -1092,9 +1136,11 @@ def _revenue_quality_modifier(revenue_yoy_pct: Optional[float]) -> float:
     return -0.30
 
 
-def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
+def compute_earnings_acceleration(snap: FundamentalSnapshot) -> Optional[float]:
     """
     Score 0.0–1.0 reflecting year-over-year earnings growth and acceleration trend.
+    Returns None when the snapshot contains no usable earnings history at all
+    (MISSING ≠ ZERO — e.g. foreign 20-F/40-F filers with no 10-K/10-Q facts).
 
     Uses YoY same-quarter comparison (eliminates seasonal QoQ bias).
     Falls back to the legacy QoQ acceleration method when fewer than 5 quarters
@@ -1174,7 +1220,8 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> float:
     # ── Legacy QoQ fallback (< 5 quarters of data) ───────────────────────────
     history = snap.eps_history if len(snap.eps_history) >= 3 else snap.net_income_history
     if len(history) < 3:
-        return 0.5
+        # Not enough data to measure anything — unavailable, not neutral.
+        return None
 
     a, b, c = history[-3], history[-2], history[-1]
     if abs(a) < 1e-9 or abs(b) < 1e-9:
@@ -1233,13 +1280,15 @@ def get_edgar_peg_score(
     symbol: str,
     entry_close: float,
     max_age_days: int = 7,
-) -> float:
+) -> Optional[float]:
     """
     Return an approximate PEG score using EDGAR-cached quarterly EPS data.
 
     Computes trailing P/E = entry_close / (eps_diluted_quarterly × 4) and
     divides by the cached YoY EPS growth rate (eps_growth column).  Returns
-    0.0 when the cache is stale, data is absent, or EPS is non-positive.
+    None when the PEG is not computable — cache stale, data absent, or EPS /
+    growth non-positive (MISSING ≠ ZERO: a real 0.0 means PEG > 1.5, i.e.
+    measured-overvalued, and must stay distinct from "no data").
 
     Does not make a network request — reads from the DuckDB edgar_fundamentals
     cache populated by get_edgar_acceleration().
@@ -1262,13 +1311,13 @@ def get_edgar_peg_score(
         con.close()
 
         if row is None or row[0] is None or row[1] is None:
-            return 0.0
+            return None
 
         eps_yoy_decimal = float(row[0])   # stored as decimal, e.g. 0.47 = 47%
         eps_diluted_q   = float(row[1])   # most recent quarterly EPS
 
         if eps_yoy_decimal <= 0 or eps_diluted_q <= 0:
-            return 0.0
+            return None   # PEG indeterminate for negative EPS or shrinking earnings
 
         annual_eps  = eps_diluted_q * 4
         trailing_pe = entry_close / annual_eps
@@ -1278,4 +1327,4 @@ def get_edgar_peg_score(
 
     except Exception as exc:
         logger.debug("get_edgar_peg_score failed for %s: %s", symbol, exc)
-        return 0.0
+        return None

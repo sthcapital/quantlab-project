@@ -5914,11 +5914,11 @@ class TestEdgarYoYMetrics:
         score = compute_earnings_acceleration(snap)
         assert score > 0.5  # QoQ acceleration → above neutral
 
-    def test_legacy_fallback_neutral_when_too_few_quarters(self):
+    def test_legacy_fallback_none_when_too_few_quarters(self):
         from quantlab.providers.edgar import compute_earnings_acceleration
-        # Only 2 quarters — can't do QoQ either
+        # Only 2 quarters — can't do QoQ either: unavailable, not neutral
         snap = self._snap(eps_history=[1.0, 1.2])
-        assert compute_earnings_acceleration(snap) == pytest.approx(0.5, abs=1e-4)
+        assert compute_earnings_acceleration(snap) is None
 
     # ── fetch_fundamentals populates YoY fields ───────────────────────────────
 
@@ -6733,13 +6733,14 @@ class TestPegRatioScore:
         )
         assert score_conviction(high) - score_conviction(low) == pytest.approx(0.06, abs=1e-9)
 
-    def test_scan_result_peg_score_defaults_zero(self):
+    def test_scan_result_peg_score_defaults_none(self):
+        """Default is None (not computed) — never a literal 0.0 score."""
         r = ScanResult(
             symbol="AAPL", scan_date="2026-06-08",
             signal_type="breakout", signal=True,
             entry_close=200.0, indicator_value=None, lookback=20,
         )
-        assert r.peg_score == 0.0
+        assert r.peg_score is None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -8099,9 +8100,9 @@ class TestGrossMarginTrend:
 class TestComputeExplosionScore:
 
     def test_all_max_inputs_returns_1(self):
-        """All inputs at maximum yields explosion score of 1.0."""
+        """All inputs at maximum yields explosion score of 1.0 with 7 components."""
         from quantlab.execution import compute_explosion_score
-        score = compute_explosion_score(
+        score, n = compute_explosion_score(
             earnings_acceleration=1.0,
             rs_percentile=1.0,
             rel_volume_zscore=4.0,     # > 3.5 → normalises to 1.0
@@ -8111,11 +8112,12 @@ class TestComputeExplosionScore:
             peg_score=1.0,
         )
         assert score == 1.0
+        assert n == 7
 
-    def test_all_zero_inputs_returns_0(self):
-        """All-zero/missing inputs yields 0.0 (no available components)."""
+    def test_all_zero_measurements_score_0_not_none(self):
+        """Real zero measurements are NOT missing — full component count, score 0.0."""
         from quantlab.execution import compute_explosion_score
-        score = compute_explosion_score(
+        score, n = compute_explosion_score(
             earnings_acceleration=0.0,
             rs_percentile=0.0,
             rel_volume_zscore=0.5,     # normalises to 0.0
@@ -8125,6 +8127,87 @@ class TestComputeExplosionScore:
             peg_score=0.0,
         )
         assert score == 0.0
+        assert n == 7
+
+    def test_all_missing_returns_none(self):
+        """All-None inputs yields (None, 0) — never a fake 0.0 score."""
+        from quantlab.execution import compute_explosion_score
+        score, n = compute_explosion_score(
+            earnings_acceleration=None,
+            rs_percentile=None,
+            rel_volume_zscore=None,
+            stage2_regime=None,
+            call_flow_imbalance=None,
+            adr_expansion_rate=None,
+            peg_score=None,
+        )
+        assert score is None
+        assert n == 0
+
+    def test_ebc_case_missing_components_renormalize(self):
+        """EBC regression: strong fundamentals + missing options/ADR must yield a
+        high re-normalized score, not 0.00."""
+        from quantlab.execution import compute_explosion_score
+        score, n = compute_explosion_score(
+            earnings_acceleration=1.0,   # EPS +100% YoY, rev-confirmed
+            rs_percentile=0.7,
+            rel_volume_zscore=1.2,
+            stage2_regime=1.0,
+            call_flow_imbalance=None,    # options not computed
+            adr_expansion_rate=None,     # ADR window unavailable
+            peg_score=1.0,               # deeply undervalued vs growth
+        )
+        assert n == 5
+        assert score is not None
+        assert score > 0.5
+
+    def test_thin_coverage_below_gate_returns_none(self):
+        """Below EXPLOSION_MIN_COMPONENTS → None, regardless of input strength."""
+        from quantlab.execution import compute_explosion_score
+        score, n = compute_explosion_score(
+            earnings_acceleration=1.0,
+            rs_percentile=1.0,
+            rel_volume_zscore=None,
+            stage2_regime=None,
+            call_flow_imbalance=None,
+            adr_expansion_rate=None,
+            peg_score=1.0,
+        )
+        assert n == 3
+        assert score is None
+
+    def test_gate_requires_top_weighted_components(self):
+        """Even with 6 components, a missing earnings_acceleration (top weight)
+        gates the composite to None."""
+        from quantlab.execution import compute_explosion_score
+        score, n = compute_explosion_score(
+            earnings_acceleration=None,
+            rs_percentile=0.9,
+            rel_volume_zscore=2.0,
+            stage2_regime=1.0,
+            call_flow_imbalance=0.8,
+            adr_expansion_rate=0.2,
+            peg_score=0.7,
+        )
+        assert n == 6
+        assert score is None
+
+    def test_real_zero_drags_score_missing_does_not(self):
+        """stage2=0.0 (measured: not Stage 2) must lower the score relative to
+        stage2=None (unknown) — the 98f5491 regression conflated these."""
+        from quantlab.execution import compute_explosion_score
+        common = dict(
+            earnings_acceleration=0.8,
+            rs_percentile=0.8,
+            rel_volume_zscore=2.0,
+            call_flow_imbalance=0.5,
+            adr_expansion_rate=0.1,
+            peg_score=0.7,
+        )
+        with_real_zero, n_zero = compute_explosion_score(stage2_regime=0.0, **common)
+        with_missing, n_missing = compute_explosion_score(stage2_regime=None, **common)
+        assert n_zero == 7 and n_missing == 6
+        assert with_real_zero < with_missing
 
     def test_weights_sum_to_1(self):
         """The component weights defined in the function sum exactly to 1.0."""
@@ -8134,7 +8217,7 @@ class TestComputeExplosionScore:
     def test_clamps_above_1(self):
         """Score is clamped to 1.0 even with super-max inputs."""
         from quantlab.execution import compute_explosion_score
-        score = compute_explosion_score(
+        score, _ = compute_explosion_score(
             earnings_acceleration=2.0,
             rs_percentile=2.0,
             rel_volume_zscore=100.0,
@@ -8148,7 +8231,7 @@ class TestComputeExplosionScore:
     def test_clamps_below_0(self):
         """Score is clamped to 0.0 with negative inputs."""
         from quantlab.execution import compute_explosion_score
-        score = compute_explosion_score(
+        score, _ = compute_explosion_score(
             earnings_acceleration=-5.0,
             rs_percentile=-5.0,
             rel_volume_zscore=0.0,
@@ -8158,3 +8241,84 @@ class TestComputeExplosionScore:
             peg_score=-5.0,
         )
         assert score >= 0.0
+
+
+class TestMissingVsZeroSemantics:
+    """MISSING data must never render or score as literal zero."""
+
+    def test_foreign_filer_revenue_renders_dash(self):
+        """Revenue absent from EDGAR (20-F/40-F filers) renders '—', not '+0.0%'."""
+        import sys
+        from pathlib import Path
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from generate_report import _rev_pct
+        assert _rev_pct(None) == "—"
+
+    def test_downside_outlier_capped(self):
+        """Rev YoY beyond the artifact zone is suppressed on BOTH tails."""
+        import sys
+        from pathlib import Path
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from generate_report import _rev_pct
+        assert _rev_pct(-1.0) == "N/A"     # TNGX-style -100.0%
+        assert _rev_pct(-0.972) == "N/A"   # KALV-style -97.2%
+        assert _rev_pct(-0.941) == "N/A"   # NPKI-style -94.1%
+        assert _rev_pct(2.5) == "N/A"      # upside unchanged
+        assert _rev_pct(-0.50) == "-50.0%" # real collapse inside bounds still shown
+        assert _rev_pct(0.194) == "+19.4%"
+
+    def test_save_edgar_cache_stores_null_not_zero(self, tmp_path, monkeypatch):
+        """Missing growth rates are stored as NULL, never coerced to 0.0."""
+        import duckdb
+        from datetime import date as _date
+        import quantlab.storage as _storage
+        db = tmp_path / "test.duckdb"
+        monkeypatch.setattr(_storage, "DB_PATH", db)
+        from quantlab.providers.edgar import FundamentalSnapshot, _save_edgar_cache
+        snap = FundamentalSnapshot(ticker="TD", cik="0000947263", as_of=_date.today())
+        # Foreign filer: no revenue/EPS facts under 10-K/10-Q at all
+        _save_edgar_cache("TD", snap, acceleration_score=None, consecutive_beats=0)
+        con = duckdb.connect(str(db))
+        row = con.execute(
+            "SELECT acceleration_score, revenue_growth, eps_growth "
+            "FROM edgar_fundamentals WHERE symbol='TD'"
+        ).fetchone()
+        con.close()
+        assert row == (None, None, None)
+
+    def test_compute_earnings_acceleration_none_when_no_history(self):
+        """No usable earnings history → None (unavailable), not 0.5 (neutral)."""
+        from datetime import date as _date
+        from quantlab.providers.edgar import FundamentalSnapshot, compute_earnings_acceleration
+        snap = FundamentalSnapshot(ticker="TD", cik="0000947263", as_of=_date.today())
+        assert compute_earnings_acceleration(snap) is None
+
+    def test_watchlist_upsert_stores_null_explosion(self, tmp_path):
+        """A ScanResult without a computable composite stores NULL + component count."""
+        import duckdb
+        from quantlab.execution import ScanResult
+        from quantlab.watchlist import InstitutionalWatchlist
+        db = str(tmp_path / "wl.duckdb")
+        r = ScanResult(
+            symbol="TD", scan_date="2026-06-12", signal_type="breakout",
+            signal=True, entry_close=70.0, indicator_value=69.0,
+            lookback=5, regime_bullish=True, stage=2,
+        )
+        assert r.explosion_score is None and r.explosion_components == 0
+        iwl = InstitutionalWatchlist(db_path=db)
+        iwl.upsert("TD", r)
+        con = duckdb.connect(db)
+        row = con.execute(
+            "SELECT explosion_score, explosion_components, peg_score "
+            "FROM institutional_watchlist WHERE symbol='TD'"
+        ).fetchone()
+        con.close()
+        assert row[0] is None      # NULL, never 0.0
+        assert row[1] == 0
+        assert row[2] is None      # peg also NULL when not computable
+
+
