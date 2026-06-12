@@ -4767,6 +4767,43 @@ class TestCheckDailyRuns:
         code = m.check_and_report(log, date(2026, 6, 5), quiet=True, db_path=db)
         assert code == 0   # [LATE] is advisory, not a failure
 
+    def test_utc_crontab_incident_is_tagged_late(self, tmp_path, capsys):
+        """2026-06-12 incident pin: a crontab written in UTC fields on an
+        Eastern-clock host fired the morning check at 12:45 PM ET instead of
+        8:45 AM.  Log stamps are host-local ET, so the checker must tag that
+        run [LATE] — the tag was truthful, not a clock-parsing artifact."""
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            "[2026-06-12 12:45:07] QuantLab Morning Check",   # 45 12 cron on ET clock
+        ])
+        m.check_and_report(log, date(2026, 6, 12), quiet=False,
+                           db_path=self._heartbeat_db(tmp_path, date(2026, 6, 12)))
+        out = capsys.readouterr().out
+        assert "Morning check" in out
+        assert "LATE" in out
+        assert "12:45 PM ET" in out
+
+    def test_design_time_morning_check_is_ok(self, tmp_path, capsys):
+        """Post-fix contract: with the ET-local crontab the morning check
+        fires 8:45 AM ET and the same stamp now lands inside the window."""
+        from datetime import date
+        m = self._import()
+        log = self._write_log(tmp_path, [
+            "[2026-06-12 08:45:05] QuantLab Morning Check",
+        ])
+        m.check_and_report(log, date(2026, 6, 12), quiet=False,
+                           db_path=self._heartbeat_db(tmp_path, date(2026, 6, 12)))
+        out = capsys.readouterr().out
+        assert "Morning check" in out
+        assert "ran at 8:45 AM ET" in out
+
+    def test_host_clock_is_eastern_here(self):
+        """The checker's window math is only valid on an Eastern host —
+        this environment is one, and the guard must agree."""
+        m = self._import()
+        assert m.host_clock_is_eastern() is True
+
     def test_output_contains_ok_and_missing(self, tmp_path, capsys):
         from datetime import date
         m = self._import()

@@ -50,7 +50,14 @@ LOG_DEFAULT  = Path.home() / "quantlab-scan.log"
 NY           = pytz.timezone("America/New_York")
 
 # Regex patterns for extracting a datetime from a log line.
-# The system clock is America/New_York so timestamps are already in ET.
+#
+# CLOCK CONVENTION (made explicit after the 2026-06-12 incident): log
+# timestamps are the host's LOCAL wall clock, the job windows below are
+# defined in Eastern time, and the comparison is only valid when the host
+# clock IS Eastern.  host_clock_is_eastern() enforces that instead of
+# assuming it — the incident was the inverse mismatch (an ET host running a
+# crontab written in UTC fields, so every job truly fired 4 hours late and
+# the [LATE] tags were correct).
 _TS_PATTERNS = [
     # [2026-06-05 09:00:01] — from daily_scan.sh log() function
     re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]'),
@@ -61,6 +68,19 @@ _TS_PATTERNS = [
 ]
 
 _STRPTIME_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def host_clock_is_eastern(now: datetime | None = None) -> bool:
+    """
+    True when the host's local wall clock matches America/New_York.
+
+    The job windows are ET and log stamps are host-local; if the host TZ is
+    not Eastern, every window comparison is shifted and the report would lie.
+    """
+    if now is None:
+        now = datetime.now()
+    ny_now = datetime.now(NY).replace(tzinfo=None)
+    return abs((now - ny_now).total_seconds()) < 120
 
 
 # ── Job definitions ────────────────────────────────────────────────────────────
@@ -310,6 +330,13 @@ def check_and_report(
 
     exit_code = 0
     results: list[tuple[str, str]] = []   # (tag, message)
+
+    # Window comparisons assume host-local stamps == Eastern time.  Surface
+    # loudly when that doesn't hold instead of producing shifted verdicts.
+    if not host_clock_is_eastern():
+        results.append((_tag("[WARN]", _YELLOW),
+                        f"{'Host clock':<18} not Eastern time — [OK]/[LATE] "
+                        f"verdicts below are unreliable"))
 
     for spec in JOBS:
         if spec.name == "Options monitor" and not market_open:
