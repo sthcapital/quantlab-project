@@ -182,13 +182,18 @@ def add_to_watchlist(
     try:
         con = get_db()
         # INSERT OR IGNORE keeps the first entry if run twice today
+        # current_price is seeded with the entry close so a position is NEVER
+        # monitored with a null price — same-session entries used to sit at
+        # NULL until the next EOD tracker run (SNEX/KO incidents: stop checks
+        # silently skipped on day 0)
         con.execute("""
             INSERT OR IGNORE INTO watchlist (
                 watch_id, symbol, date_added, entry_price, atr_stop,
                 conviction_score, signal_layers, lookback, signal_type,
                 target_price, status, date_updated, breadth_override_note,
-                size_factor, conviction_components
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?, ?, ?)
+                size_factor, conviction_components,
+                current_price, days_on_watch
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?, ?, ?, ?, 0)
         """, [
             watch_id,
             scan_result.symbol,
@@ -204,6 +209,7 @@ def add_to_watchlist(
             note,
             size_factor,
             components_json,
+            scan_result.entry_close,
         ])
         con.close()
         return True
@@ -272,6 +278,61 @@ def get_active_watchlist(db_path: str | None = None) -> list[dict[str, Any]]:
         return []
 
 
+def _fetch_ib_price(ib_connection, symbol: str, Stock, retries: int = 2,
+                    warmup_wait: float = 1.5) -> float | None:
+    """
+    Current price from IBKR, preferring last trade over close/midpoint.
+
+    Retries once after a short wait: a symbol entered the same session has a
+    cold delayed-data subscription whose first snapshot is often all-NaN
+    (the SNEX/KO null-price bug).  Returns None when IBKR yields nothing.
+    """
+    import time
+    try:
+        ib_connection.reqMarketDataType(3)
+        stock = Stock(symbol, "SMART", "USD")
+        qualified = ib_connection.qualifyContracts(stock)
+        if not qualified:
+            return None
+        for attempt in range(retries):
+            ticker = ib_connection.reqTickers(qualified[0])[0]
+            for candidate in [ticker.last, ticker.close, ticker.marketPrice()]:
+                if candidate is not None and candidate == candidate and candidate > 0:
+                    return float(candidate)
+            if attempt < retries - 1:
+                time.sleep(warmup_wait)   # subscription warm-up
+    except Exception as exc:
+        logger.debug("%s: IBKR price fetch failed: %s", symbol, exc)
+    return None
+
+
+def _latest_flatfile_close(symbol: str, max_back_days: int = 5) -> float | None:
+    """
+    Snapshot fallback: the symbol's close from the most recent cached stocks
+    flat file (final EOD data, never an empty subscription).  At worst one
+    session stale — still infinitely better than monitoring blind.
+    """
+    try:
+        from datetime import timedelta
+
+        import pyarrow.parquet as pq
+
+        from quantlab.providers.flat_files import FlatFileProvider
+        flat = FlatFileProvider()
+        d = date.today()
+        for _ in range(max_back_days):
+            path = flat.stocks_cache_path(d)
+            if path.exists():
+                tbl = pq.read_table(path, columns=["ticker", "close"],
+                                    filters=[("ticker", "=", symbol)]).to_pydict()
+                if tbl["close"]:
+                    return float(tbl["close"][0])
+            d -= timedelta(days=1)
+    except Exception as exc:
+        logger.debug("%s: flat-file close fallback failed: %s", symbol, exc)
+    return None
+
+
 def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
     """
     Refresh current prices for all active watchlist entries via IBKR.
@@ -328,22 +389,26 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
         if isinstance(date_added, str):
             date_added = date.fromisoformat(date_added)
 
-        # Fetch current price — prefer last trade over bid/ask midpoint
-        try:
-            ib_connection.reqMarketDataType(3)
-            stock = Stock(symbol, "SMART", "USD")
-            qualified = ib_connection.qualifyContracts(stock)
-            if not qualified:
-                continue
-            ticker = ib_connection.reqTickers(qualified[0])[0]
-            current = None
-            for candidate in [ticker.last, ticker.close, ticker.marketPrice()]:
-                if candidate is not None and candidate == candidate and candidate > 0:
-                    current = float(candidate)
-                    break
-            if current is None:
-                continue
-        except Exception:
+        # Fetch current price — IBKR with one warm-up retry (a same-session
+        # entry's delayed-data subscription often returns NaN on the first
+        # snapshot: the SNEX/KO bug), then flat-file close as snapshot
+        # fallback.  A position must NEVER be monitored with a null price.
+        current = _fetch_ib_price(ib_connection, symbol, Stock)
+        price_source = "ibkr"
+        if current is None:
+            current = _latest_flatfile_close(symbol)
+            price_source = "flatfile-close"
+            if current is not None:
+                logger.warning(
+                    "%s: IBKR price unavailable — monitoring on flat-file "
+                    "close %.2f (last completed session)", symbol, current,
+                )
+        if current is None:
+            logger.error(
+                "%s: NO price from any source — position is being monitored "
+                "blind; stop at %s cannot trigger this cycle",
+                symbol, f"{atr_stop:.2f}" if atr_stop else "?",
+            )
             continue
 
         # Sanity check: price must be within ±20%/+50% of entry to be trusted.

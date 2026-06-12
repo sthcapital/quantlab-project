@@ -198,6 +198,32 @@ def check_options_heartbeat(check_date: date, db_path: Path | None = None) -> in
     return int(n)
 
 
+def check_position_prices(db_path: Path | None = None) -> list[str] | None:
+    """
+    Symbols of open ('watching') positions with a NULL current price.
+
+    A position monitored with a null price has a stop that can never trigger
+    (SNEX 2026-06-12, KO before it).  Empty list = invariant holds; None =
+    DB unreadable.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+    except Exception:
+        return None
+    try:
+        rows = con.execute(
+            "SELECT symbol FROM watchlist "
+            "WHERE status = 'watching' AND current_price IS NULL"
+        ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []   # table missing — no positions exist
+    finally:
+        con.close()
+
+
 def check_universe_gate(check_date: date, db_path: Path | None = None) -> bool | None:
     """
     Whether the universe sanity gate refused the build for ``check_date``.
@@ -405,6 +431,21 @@ def check_and_report(
         else:
             results.append((_tag("[OK]", _GREEN),
                             f"{'Universe gate':<18} build accepted for {check_date}"))
+
+    # Position-price invariant — a null current price means the stop cannot
+    # trigger (SNEX 2026-06-12).  Critical: monitoring blind is a failure.
+    null_priced = check_position_prices(db_path)
+    if null_priced is None:
+        results.append((_tag("[WARN]", _YELLOW),
+                        f"{'Position prices':<18} DuckDB unreadable — cannot verify"))
+    elif null_priced:
+        results.append((_tag("[MISSING]", _RED),
+                        f"{'Position prices':<18} NULL current price on open "
+                        f"position(s): {', '.join(null_priced)}"))
+        exit_code = 1
+    else:
+        results.append((_tag("[OK]", _GREEN),
+                        f"{'Position prices':<18} all open positions priced"))
 
     if not quiet:
         print()
