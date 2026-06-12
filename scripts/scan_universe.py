@@ -27,7 +27,7 @@ def select_top_candidates(
     is_cs_fn,
     max_per_day: int = 5,
     max_per_sector: int = 3,
-    options_counts_as_confirmation: bool | None = None,
+    options_signal_gating_enabled: bool | None = None,
 ) -> list:
     """
     Apply the strict paper-trading watchlist filter and return up to max_per_day
@@ -39,19 +39,26 @@ def select_top_candidates(
       - conviction_score >= 0.70
       - earnings_score > 0.0 (real earnings data available)
       - at least one confirming signal: volume_dry_up OR consecutive_days >= 2
-        (already on institutional_watchlist).  options_signal counts only when
-        options_counts_as_confirmation is enabled (None → scanner config) —
-        the unusual-options detector is uncalibrated (347/357 symbols flagged
-        on 2026-06-11) and is display-only until the recalibration lands.
+        (already on institutional_watchlist).  options_signal — now the
+        recalibrated flag (per-symbol baseline z-score + cross-sectional
+        top-decile gate, signals/options_relative.py) — counts only when
+        options_signal_gating_enabled is True (None → scanner config).
+        Default False: display-only until the rescored 2026-06-11 output
+        is reviewed.
 
-    Ranking: consecutive_days DESC → conviction_score DESC → earnings_score DESC.
+    Ranking: conviction_score DESC, then a deterministic tie-break chain —
+    consecutive_days DESC → explosion_score DESC (None ranks last) →
+    breakout_volume_ratio DESC (None ranks last) → rs_score (vs SPY) DESC →
+    symbol ASC.
+    With dozens of names saturating conviction at 1.00, the tie-break chain is
+    what actually orders the top-5; symbol ASC guarantees full determinism.
 
     Returns:
         List of (ScanResult, earn_score, consecutive_days) tuples.
     """
-    if options_counts_as_confirmation is None:
-        options_counts_as_confirmation = bool(
-            get_config("scanner").get("options_counts_as_confirmation", False)
+    if options_signal_gating_enabled is None:
+        options_signal_gating_enabled = bool(
+            get_config("scanner").get("options_signal_gating_enabled", False)
         )
 
     qualifying = []
@@ -77,12 +84,28 @@ def select_top_candidates(
         vdu   = bool(iwl_e.get("volume_dry_up", False))
         cdays = int(iwl_e.get("consecutive_days", 1))
 
-        if not ((opts and options_counts_as_confirmation) or vdu or cdays >= 2):
+        if not ((opts and options_signal_gating_enabled) or vdu or cdays >= 2):
             continue
 
         qualifying.append((r, earn, cdays))
 
-    qualifying.sort(key=lambda x: (-x[2], -x[0].conviction_score, -x[1]))
+    def _rank_key(item):
+        r, _earn, cdays = item
+        explosion = r.explosion_score if r.explosion_score is not None else -1.0
+        bv_ratio = (
+            r.breakout_volume_ratio if getattr(r, "breakout_volume_ratio", None) is not None
+            else -1.0  # not measurable ranks below any real ratio
+        )
+        return (
+            -r.conviction_score,
+            -cdays,
+            -explosion,
+            -bv_ratio,
+            -(r.rs_score or 0.0),
+            r.symbol,
+        )
+
+    qualifying.sort(key=_rank_key)
 
     # Sector cap: no more than max_per_sector from the same GICS sector
     sector_count: dict[str, int] = defaultdict(int)

@@ -368,6 +368,202 @@ class MassiveOptionsProvider:
         )
         return result_score
 
+    def compute_relative_options_score(
+        self,
+        symbol: str,
+        spot_price: float,
+        baseline_call_volumes: list[float],
+    ) -> Optional[dict]:
+        """
+        Relative (per-symbol baseline) options score — the recalibrated path.
+
+        Today's total call volume is z-scored against the symbol's OWN
+        trailing baseline (build it with
+        FlatFileProvider.get_call_volume_history) and blended with continuous
+        PCR / IV-skew tilts — see quantlab.signals.options_relative.
+
+        The cross-sectional gate (top decile of the day's scores) runs AFTER
+        every symbol is scored: unusual_flag is left NULL here and set by
+        mark_unusual_flags() in the monitor's second pass.
+
+        DuckDB day-cache: when today's row already carries a rel_score the
+        stored values are returned without a REST fetch — same once-per-day
+        economy as the legacy path.  Intraday chain volumes are partial,
+        which depresses z-scores roughly uniformly across symbols; the gate
+        is rank-based, so relative ordering survives.
+
+        Legacy fields (pcr, iv_skew, unusual_calls, options_score) are
+        computed from the same chain and stored alongside so the old and new
+        distributions stay comparable in options_snapshots.
+
+        Returns:
+            dict with keys call_volume, put_volume, vol_zscore, rel_score,
+            pcr, iv_skew — vol_zscore/rel_score are None when the baseline is
+            too short (MISSING ≠ ZERO).  None on chain fetch failure.
+        """
+        from quantlab.signals.options_relative import (
+            relative_options_score,
+            volume_zscore,
+        )
+
+        cached = self._load_relative_cache(symbol)
+        if cached is not None:
+            logger.debug("%s: relative options score from cache", symbol)
+            return cached
+
+        try:
+            chain = self._get_chain_cached(symbol)
+        except Exception as exc:
+            logger.warning("%s: options chain fetch failed: %s", symbol, exc)
+            return None
+
+        call_volume = sum(c.volume or 0.0 for c in chain if c.option_type == "C")
+        put_volume  = sum(c.volume or 0.0 for c in chain if c.option_type == "P")
+
+        pcr  = self.get_put_call_ratio(symbol, spot_price)
+        skew = self.get_iv_skew(symbol, spot_price)
+        unusual_legacy = bool(self.get_unusual_call_activity(symbol))
+
+        legacy_score = 0.0
+        if pcr < 0.50:
+            legacy_score += 0.60
+        elif pcr < 0.70:
+            legacy_score += 0.40
+        if unusual_legacy:
+            legacy_score += 0.25
+        if skew > 0.60:
+            legacy_score += 0.15
+        legacy_score = round(min(1.0, legacy_score), 4)
+
+        vol_z = volume_zscore(call_volume, baseline_call_volumes)
+        rel   = relative_options_score(vol_z, pcr=pcr, iv_skew=skew)
+
+        self._save_relative_cache(
+            symbol=symbol,
+            spot_price=spot_price,
+            pcr=pcr,
+            iv_skew=skew,
+            unusual_calls=unusual_legacy,
+            options_score=legacy_score,
+            call_count=sum(1 for c in chain if c.option_type == "C"),
+            put_count=sum(1 for c in chain if c.option_type == "P"),
+            call_volume=call_volume,
+            put_volume=put_volume,
+            vol_zscore=vol_z,
+            rel_score=rel,
+        )
+
+        logger.info(
+            "%s: rel_score=%s  vol_z=%s  call_vol=%.0f  pcr=%.2f  iv_skew=%.2f",
+            symbol,
+            f"{rel:.4f}" if rel is not None else "None",
+            f"{vol_z:.2f}" if vol_z is not None else "None",
+            call_volume, pcr, skew,
+        )
+        return {
+            "call_volume": call_volume,
+            "put_volume":  put_volume,
+            "vol_zscore":  vol_z,
+            "rel_score":   rel,
+            "pcr":         pcr,
+            "iv_skew":     skew,
+        }
+
+    def mark_unusual_flags(
+        self, flagged: set[str], snap_date: Optional[date] = None
+    ) -> None:
+        """
+        Persist the day's cross-sectional gate result to options_snapshots.
+
+        Sets unusual_flag TRUE for ``flagged`` symbols and FALSE for every
+        other row scored that day (rel_score NOT NULL).  Rows that were never
+        scored keep unusual_flag NULL — MISSING ≠ ZERO.
+        """
+        try:
+            import duckdb
+            from quantlab.storage import DB_PATH
+
+            con = duckdb.connect(str(DB_PATH))
+            self._ensure_table(con)
+            day = snap_date or date.today()
+            con.execute(
+                """
+                UPDATE options_snapshots SET unusual_flag = FALSE
+                WHERE snap_date = ? AND rel_score IS NOT NULL
+                """,
+                [day],
+            )
+            if flagged:
+                placeholders = ", ".join("?" for _ in flagged)
+                con.execute(
+                    f"""
+                    UPDATE options_snapshots SET unusual_flag = TRUE
+                    WHERE snap_date = ? AND symbol IN ({placeholders})
+                    """,
+                    [day, *flagged],
+                )
+            con.close()
+        except Exception as exc:
+            logger.warning("mark_unusual_flags failed: %s", exc)
+
+    def _load_relative_cache(self, symbol: str) -> Optional[dict]:
+        """Return today's stored relative-score row, or None when not yet scored."""
+        try:
+            import duckdb
+            from quantlab.storage import DB_PATH
+
+            con = duckdb.connect(str(DB_PATH))
+            self._ensure_table(con)
+            row = con.execute(
+                """
+                SELECT call_volume, put_volume, vol_zscore, rel_score, pcr, iv_skew
+                FROM options_snapshots
+                WHERE symbol = ? AND snap_date = CURRENT_DATE
+                  AND rel_score IS NOT NULL
+                """,
+                [symbol],
+            ).fetchone()
+            con.close()
+            if row is None:
+                return None
+            keys = ("call_volume", "put_volume", "vol_zscore",
+                    "rel_score", "pcr", "iv_skew")
+            return dict(zip(keys, row))
+        except Exception as exc:
+            logger.debug("relative cache read failed for %s: %s", symbol, exc)
+            return None
+
+    def _save_relative_cache(self, symbol: str, spot_price: float, pcr: float,
+                             iv_skew: float, unusual_calls: bool,
+                             options_score: float, call_count: int,
+                             put_count: int, call_volume: float,
+                             put_volume: float, vol_zscore: Optional[float],
+                             rel_score: Optional[float]) -> None:
+        """Persist today's full snapshot row (unusual_flag stays NULL). Non-fatal."""
+        try:
+            import duckdb
+            from quantlab.storage import DB_PATH
+
+            con = duckdb.connect(str(DB_PATH))
+            self._ensure_table(con)
+            con.execute(
+                """
+                INSERT OR REPLACE INTO options_snapshots
+                    (symbol, snap_date, spot_price, pcr, iv_skew,
+                     unusual_calls, options_score, call_count, put_count,
+                     call_volume, put_volume, vol_zscore, rel_score, unusual_flag)
+                VALUES (?, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                [
+                    symbol, spot_price, pcr, iv_skew,
+                    unusual_calls, options_score, call_count, put_count,
+                    call_volume, put_volume, vol_zscore, rel_score,
+                ],
+            )
+            con.close()
+        except Exception as exc:
+            logger.warning("options_snapshots relative write failed for %s: %s", symbol, exc)
+
     # ── S3 / Historical OHLCV ──────────────────────────────────────────────────
 
     def get_historical_ohlcv(
@@ -488,7 +684,8 @@ class MassiveOptionsProvider:
 
     # ── DuckDB cache ───────────────────────────────────────────────────────────
 
-    def _ensure_table(self, con) -> None:
+    @staticmethod
+    def _ensure_table(con) -> None:
         con.execute("""
             CREATE TABLE IF NOT EXISTS options_snapshots (
                 symbol        VARCHAR,
@@ -503,6 +700,19 @@ class MassiveOptionsProvider:
                 PRIMARY KEY (symbol, snap_date)
             )
         """)
+        # Relative-scoring columns (2026-06 recalibration).  Nullable with no
+        # defaults — MISSING ≠ ZERO: a NULL rel_score means "not scored", a
+        # NULL unusual_flag means "not gated", never 0/false.
+        for col, col_type in (
+            ("call_volume", "DOUBLE"),
+            ("put_volume",  "DOUBLE"),
+            ("vol_zscore",  "DOUBLE"),
+            ("rel_score",   "DOUBLE"),
+            ("unusual_flag", "BOOLEAN"),
+        ):
+            con.execute(
+                f"ALTER TABLE options_snapshots ADD COLUMN IF NOT EXISTS {col} {col_type}"
+            )
 
     def _load_cache(self, symbol: str) -> Optional[float]:
         """Return today's cached options_score or None."""

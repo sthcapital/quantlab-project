@@ -82,12 +82,16 @@ DEFAULT_CONFIG = {
         "min_rel_volume": 1.5,
         "news_lookback_days": 7,
         "SHORT_SIGNAL_ENABLED": False,   # activate after long side validated in paper trading (Phase 8+)
-        # Unusual-options detector is uncalibrated (flagged 347/357 monitored
-        # symbols on 2026-06-11) — until the recalibration work lands,
-        # options_signal is display-only: it still renders in the report's
-        # Opts column and persists to DuckDB, but it does not satisfy the
-        # confirming-signal gate in select_top_candidates().
-        "options_counts_as_confirmation": False,
+        # Recalibrated unusual-options signal (per-symbol baseline z-score +
+        # cross-sectional top-decile gate; see signals/options_relative.py).
+        # Display-only until the rescored 2026-06-11 output is reviewed:
+        # options_signal renders in the report and persists to DuckDB, but it
+        # satisfies the confirming-signal gate in select_top_candidates() and
+        # adds the monitor's conviction bonus only when this is True.
+        "options_signal_gating_enabled": False,
+        # Cross-sectional gate percentile: "unusual" = the day's scores
+        # strictly above this percentile (90 → ~top decile, ≤ ~10%/day).
+        "options_unusual_percentile": 90.0,
     },
     "news": {
         "provider_codes": "BRFG+BRFUPDN+DJNL",

@@ -7516,22 +7516,23 @@ class TestSelectTopCandidates:
         assert fn([r], iwl, lambda s: True) == []
 
     def test_options_signal_display_only_by_default(self):
-        """options_counts_as_confirmation defaults to False (detector
-        uncalibrated — flagged 347/357 symbols on 2026-06-11): a candidate
-        whose only confirming signal is options must NOT qualify."""
+        """options_signal_gating_enabled defaults to False (recalibrated
+        signal stays display-only until the rescored 2026-06-11 output is
+        reviewed): a candidate whose only confirming signal is options must
+        NOT qualify."""
         fn = self._load()
         r = self._make_result("LLY")
         iwl = {"LLY": self._iwl_entry(options=True, vdu=False, days=1)}
         assert fn([r], iwl, lambda s: True) == []
 
-    def test_options_signal_qualifies_when_confirmation_enabled(self):
-        """With options_counts_as_confirmation=True the pre-calibration
-        behavior is restored: options alone satisfies the gate."""
+    def test_options_signal_qualifies_when_gating_enabled(self):
+        """With options_signal_gating_enabled=True (recalibrated detector
+        approved) options alone satisfies the gate."""
         fn = self._load()
         r = self._make_result("LLY")
         iwl = {"LLY": self._iwl_entry(options=True, vdu=False, days=1)}
         assert len(fn([r], iwl, lambda s: True,
-                      options_counts_as_confirmation=True)) == 1
+                      options_signal_gating_enabled=True)) == 1
 
     def test_volume_dry_up_qualifies(self):
         fn = self._load()

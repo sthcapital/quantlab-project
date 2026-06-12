@@ -288,6 +288,59 @@ class FlatFileProvider:
         """
         return self.download_stocks_day(d)
 
+    def get_underlying_call_volumes(self, d: date) -> dict[str, float]:
+        """
+        Total call volume per underlying for date ``d``.
+
+        Cached parquet only — returns {} when the file for ``d`` hasn't been
+        synced (never triggers an S3 download).  An underlying absent from an
+        existing file genuinely traded zero contracts that day (the flat file
+        covers all of OPRA), so callers may treat absence as 0.0.
+        """
+        import pyarrow.parquet as pq
+
+        path = self.options_cache_path(d)
+        if not path.exists():
+            return {}
+
+        df = pq.read_table(
+            path, columns=["underlying", "option_type", "volume"]
+        ).to_pydict()
+
+        totals: dict[str, float] = {}
+        for underlying, opt_type, volume in zip(
+            df["underlying"], df["option_type"], df["volume"]
+        ):
+            if opt_type == "C":
+                totals[underlying] = totals.get(underlying, 0.0) + float(volume)
+        return totals
+
+    def get_call_volume_history(
+        self, as_of: date, n_sessions: int = 20
+    ) -> list[dict[str, float]]:
+        """
+        Per-underlying total call volume for the ``n_sessions`` most recent
+        cached sessions strictly before ``as_of``, oldest first.
+
+        Sessions are dates with a cached options parquet; non-cached dates
+        (weekends, holidays, unsynced days) are skipped.  Cached reads only —
+        one parquet read per session, covering every underlying at once.
+
+        Used to build per-symbol baselines for the relative options scorer:
+        ``baseline = [day.get(symbol, 0.0) for day in history]``.
+        """
+        history: list[dict[str, float]] = []
+        current = as_of - timedelta(days=1)
+        limit = as_of - timedelta(days=n_sessions * 3)  # buffer for holidays
+
+        while len(history) < n_sessions and current >= limit:
+            if self.options_cache_path(current).exists():
+                history.append(self.get_underlying_call_volumes(current))
+            current -= timedelta(days=1)
+
+        history.reverse()
+        return history
+
     def get_options_chain_from_flatfile(
         self, symbol: str, d: date
     ) -> list[dict]:

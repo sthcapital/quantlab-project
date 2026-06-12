@@ -5,10 +5,24 @@ Runs every 30 minutes during market hours (9:30 AM – 4:00 PM ET, Mon–Fri).
 Scans only the institutional_watchlist symbols — not the full 2,325-symbol
 universe — keeping each run under 2 minutes.
 
-On unusual options detection:
+Recalibrated two-pass detection (2026-06; replaces the absolute-threshold
+scorer that flagged 347/357 symbols on 2026-06-11):
+
+  Pass 1 — per-symbol: today's total call volume z-scored against the
+  symbol's OWN trailing 20-session flat-file baseline, blended with
+  continuous PCR / IV-skew tilts (signals/options_relative.py).
+
+  Pass 2 — cross-sectional: "unusual" = the day's scores strictly above the
+  configured percentile (scanner.options_unusual_percentile, default p90),
+  capping the daily flag rate at ~10% by construction.
+
+On a flagged symbol:
   - Sets options_signal=True on the institutional watchlist entry
-  - Adds +0.08 conviction bonus (capped at 1.0)
-  - Logs the update with timestamp for the daily report
+  - Adds the +0.08 conviction bonus ONLY when
+    scanner.options_signal_gating_enabled is True (default False:
+    display-only until the recalibration output is reviewed)
+  - Persists unusual_flag to options_snapshots for the report's
+    signal-rate header line
 
 Requires POLYGON_API_KEY in the environment (loaded from .env by daily_scan.sh
 or set directly in the shell).
@@ -87,35 +101,56 @@ def main() -> None:
         print(f"[{_ts()}] monitor_options: MassiveOptionsProvider unavailable: {exc}")
         return
 
-    alerts: list[str] = []
+    from quantlab.utils import get_config
+    from quantlab.providers.flat_files import FlatFileProvider
+    from quantlab.signals.options_relative import cross_sectional_flags
 
+    scanner_cfg = get_config("scanner")
+    pctl   = float(scanner_cfg.get("options_unusual_percentile", 90.0))
+    gating = bool(scanner_cfg.get("options_signal_gating_enabled", False))
+
+    # Per-symbol baselines: trailing 20 cached flat-file sessions (one parquet
+    # read per session, all underlyings at once; never hits S3).
+    history = FlatFileProvider().get_call_volume_history(today, n_sessions=20)
+    if not history:
+        print(f"[{_ts()}] monitor_options: WARNING — no cached options flat files "
+              f"before {today}; per-symbol baselines unavailable, nothing can flag")
+
+    # Pass 1 — per-symbol relative scores
+    scores:  dict[str, float | None] = {}
+    zscores: dict[str, float | None] = {}
     for entry in candidates:
         sym         = entry["symbol"]
         entry_price = entry.get("entry_price") or 0.0
         if entry_price <= 0:
             continue
+        baseline = [day.get(sym, 0.0) for day in history]
         try:
-            opt_score = mp.compute_options_score(sym, entry_price)
-            if opt_score >= 0.6:
-                flag = "▲" if opt_score >= 0.8 else "~"
-                msg  = (
-                    f"  {flag} {sym:<8}  opt_score={opt_score:.2f}  "
-                    f"conv_was={entry.get('conviction_score',0):.2f}  "
-                    f"days={entry.get('consecutive_days',1)}"
-                )
-                print(msg)
-                alerts.append(sym)
-                if not args.dry_run:
-                    iwl.set_options_signal(sym, bonus=0.08)
-        except Exception as exc:
+            res = mp.compute_relative_options_score(sym, entry_price, baseline)
+            if res is not None:
+                scores[sym]  = res["rel_score"]
+                zscores[sym] = res["vol_zscore"]
+        except Exception:
             # Options data unavailable for this symbol — skip silently
             pass
 
-    if alerts:
-        print(f"[{_ts()}] monitor_options: flagged {len(alerts)} symbol(s): "
-              f"{', '.join(alerts)}")
-    else:
-        print(f"[{_ts()}] monitor_options: no unusual options activity detected")
+    # Pass 2 — cross-sectional gate: unusual = top-percentile of the day's
+    # scores AND ≥2σ above the symbol's own baseline (cap, not quota)
+    flagged = cross_sectional_flags(scores, percentile_cut=pctl, zscores=zscores)
+
+    if not args.dry_run:
+        mp.mark_unusual_flags(flagged)
+
+    for sym in sorted(flagged, key=lambda s: -(scores[s] or 0.0)):
+        print(f"  ▲ {sym:<8}  rel_score={scores[sym]:.4f}")
+        if not args.dry_run:
+            iwl.set_options_signal(sym, bonus=0.08 if gating else 0.0)
+
+    n_scored = sum(1 for v in scores.values() if v is not None)
+    rate = (len(flagged) / n_scored) if n_scored else 0.0
+    print(f"[{_ts()}] monitor_options: Options: {len(flagged)}/{n_scored} unusual, "
+          f"{rate:.1%}  (gate p{pctl:g}, gating "
+          f"{'ENABLED' if gating else 'display-only'})")
 
 
 if __name__ == "__main__":

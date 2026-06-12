@@ -206,13 +206,33 @@ def _stage_lbl(n: int) -> str:
     return {1: "1·Base", 2: "2", 3: "3·Top", 4: "4·Dec"}.get(n, "?")
 
 
-def _rev_pct(v) -> str:
-    """Format revenue_growth for display; cap outliers >±200% as 'N/A'."""
+def _bv_ratio(v) -> str:
+    """Format the raw Weinstein breakout-volume ratio (e.g. 2.1x).
+
+    None/NULL means the ratio was not measurable (no bar history) and must
+    render as "—" — never as a number.
+    """
     if v is None:
         return "—"
     try:
+        return f"{float(v):.1f}x"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _rev_pct(v) -> str:
+    """Format revenue_growth for display; suppress outliers in BOTH tails as 'N/A'.
+
+    Bounds come from quantlab.providers.edgar (YOY_OUTLIER_HI/LO): growth above
+    +200% or decline beyond −90% is treated as a data artifact (period mismatch
+    or one-off prior-year item), not a real reading.  Missing renders as "—".
+    """
+    if v is None:
+        return "—"
+    try:
+        from quantlab.providers.edgar import YOY_OUTLIER_HI, YOY_OUTLIER_LO
         f = float(v)
-        if f > 2.0 or f < -1.0:
+        if f > YOY_OUTLIER_HI or f < YOY_OUTLIER_LO:
             return "N/A"
         return f"{f * 100:+.1f}%"
     except (TypeError, ValueError):
@@ -247,6 +267,9 @@ def _page1(
     n_multi: int,
     open_positions: list[dict],
     vix_close: float | None = None,
+    warning: str | None = None,
+    options_rate: str | None = None,
+    regime_gate=None,
 ) -> list:
     tape  = (breadth_snap.tape if breadth_snap else "N/A")
     mcl   = (f"{breadth_snap.mcclellan_oscillator:+.0f}"
@@ -293,6 +316,16 @@ def _page1(
     e.append(Spacer(1, 0.25 * inch))
     e.append(HRFlowable(width="100%", thickness=1, color=C_ACCENT, spaceAfter=12))
 
+    if warning:
+        e.append(Paragraph(
+            f"<font color='#d63031'><b>{warning}</b></font>", S["body"],
+        ))
+        e.append(Spacer(1, 0.1 * inch))
+
+    if options_rate:
+        e.append(Paragraph(f"<b>{options_rate}</b>", S["body"]))
+        e.append(Spacer(1, 0.1 * inch))
+
     # ── Tape badge (colored box via single-cell Table) ────────────────────────
     tape_inner = Paragraph(
         f"<font color='white'><b>{tape}</b></font>",
@@ -310,6 +343,15 @@ def _page1(
     e.append(Table([[tape_tbl, Spacer(0.1 * inch, 0.1 * inch)]],
                    colWidths=[2.2 * inch, CONTENT_W - 2.2 * inch]))
     e.append(Spacer(1, 0.15 * inch))
+
+    # ── Regime exposure gate — suppressed entries are visible, never silent ──
+    if regime_gate is not None:
+        _gate_c = "#d63031" if regime_gate.entered == 0 and regime_gate.qualified > 0 else "#2d3436"
+        e.append(Paragraph(
+            f"<font color='{_gate_c}'><b>Entry gate:</b> {regime_gate.summary()}</font>",
+            S["body"],
+        ))
+        e.append(Spacer(1, 0.12 * inch))
 
     # ── Market Internals — grouped sections ───────────────────────────────────
     e.append(Paragraph("Market Internals", S["section"]))
@@ -651,7 +693,7 @@ def _alert_section(
         detail_line = (
             f"{'✓ Options signal' if en.get('options_signal') else '– No options signal'}"
             f"   |   {'✓ Volume dry-up' if en.get('volume_dry_up') else '– Vol normal'}"
-            f"   |   Brkout Vol: {_fmt(en.get('breakout_volume_score'))}"
+            f"   |   Brkout Vol: {_bv_ratio(en.get('breakout_volume_ratio'))}"
             f"   |   First seen: {en.get('first_seen', '—')}"
         )
         header_c = C_GREEN if en.get("options_signal") else C_NAVY
@@ -875,6 +917,94 @@ def _save_report_row(
 _DEFAULT_DIR = Path("/mnt/c/Users/hadda/Desktop/Daily Report")
 
 
+def _options_signal_rate(
+    report_date: date,
+    db_path: str | None = None,
+) -> str | None:
+    """
+    Render the day's options signal rate, e.g. "Options: 31/357 unusual, 8.7%".
+
+    Counterpart to the zero-signal warning, for the opposite failure: a drift
+    back toward saturation (the detector flagged 97% of monitored symbols on
+    2026-06-11 before recalibration) must be visible in the header at a glance.
+
+    Uses the recalibrated columns (rel_score / unusual_flag) when the session
+    has them; falls back to the legacy unusual_calls count (marked "legacy")
+    for pre-recalibration sessions.  Returns None when the session has no
+    options_snapshots rows at all.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+        total, n_scored, n_flagged, n_legacy = con.execute(
+            "SELECT COUNT(*), "
+            "       COUNT(rel_score), "
+            "       COALESCE(SUM(CASE WHEN unusual_flag THEN 1 ELSE 0 END), 0), "
+            "       COALESCE(SUM(CASE WHEN unusual_calls THEN 1 ELSE 0 END), 0) "
+            "FROM options_snapshots WHERE snap_date = ?",
+            [report_date],
+        ).fetchone()
+        con.close()
+    except Exception:
+        return None
+
+    if not total:
+        return None
+    if n_scored > 0:
+        return (f"Options: {n_flagged}/{n_scored} unusual, "
+                f"{n_flagged / n_scored:.1%}")
+    return (f"Options: {n_legacy}/{total} unusual, "
+            f"{n_legacy / total:.1%} (legacy scorer)")
+
+
+def _options_pipeline_warning(
+    candidates: list[dict],
+    basing_cands: list[dict],
+    report_date: date,
+    db_path: str | None = None,
+) -> str | None:
+    """
+    Return a WARNING string when zero watchlist entries carry an options signal.
+
+    Universe-wide zero is treated as a pipeline fault until proven otherwise:
+    when the intraday monitor recorded options_snapshots rows for the session
+    but no entry is flagged, the signal was detected and then lost downstream.
+    Returns None when at least one entry has options_signal=True.
+    """
+    n_flagged = sum(
+        1 for c in [*candidates, *basing_cands] if c.get("options_signal")
+    )
+    if n_flagged > 0:
+        return None
+
+    snap_total, snap_unusual = 0, 0
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        con = duckdb.connect(str(db_path or DB_PATH), read_only=True)
+        snap_total, snap_unusual = con.execute(
+            "SELECT COUNT(*), "
+            "       COALESCE(SUM(CASE WHEN unusual_calls THEN 1 ELSE 0 END), 0) "
+            "FROM options_snapshots WHERE snap_date = ?",
+            [report_date],
+        ).fetchone()
+        con.close()
+    except Exception:
+        pass
+
+    if snap_total > 0:
+        return (
+            f"WARNING: 0 options signals in this report, but the intraday monitor "
+            f"recorded {snap_total} snapshots ({snap_unusual} unusual) for "
+            f"{report_date} — options signal pipeline fault likely."
+        )
+    return (
+        f"WARNING: 0 options signals and no intraday monitor data for "
+        f"{report_date} — options monitor may not have run."
+    )
+
+
 def generate(
     report_date: date | None = None,
     reports_dir: Path | None = None,
@@ -951,9 +1081,31 @@ def generate(
         subject="Institutional Pre-Breakout Watchlist",
     )
 
+    # Universe-wide zero options signals must never pass silently as normal
+    opts_warning = _options_pipeline_warning(candidates, basing_cands,
+                                             report_date, db_path)
+    if opts_warning:
+        print(f"  {opts_warning}")
+
+    # Day's options signal rate — saturation drift must be visible immediately
+    opts_rate = _options_signal_rate(report_date, db_path)
+    if opts_rate:
+        print(f"  {opts_rate}")
+
+    # Regime gate decision from today's scan (None when no scan ran today)
+    regime_gate = None
+    try:
+        from quantlab.risk.regime_policy import load_regime_gate
+        regime_gate = load_regime_gate(report_date, db_path)
+    except Exception:
+        pass
+    if regime_gate:
+        print(f"  regime gate: {regime_gate.summary()}")
+
     story: list = []
     story += _page1(S, report_date, breadth, len(candidates), n_multi, open_positions,
-                    vix_close=vix_close)
+                    vix_close=vix_close, warning=opts_warning,
+                    options_rate=opts_rate, regime_gate=regime_gate)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map, revenue_map)
         story += _alert_section(S, candidates, backtest_map, revenue_map)
