@@ -359,6 +359,29 @@ def main() -> None:
             mp   = MassiveOptionsProvider(api_key=polygon_key)
             flat = FlatFileProvider()
 
+            # Polygon publishes the daily options flat file hours after the
+            # close, so at evening-scan time end_date's file usually doesn't
+            # exist yet.  Detecting against a missing file silently zeroes
+            # every unusual-activity score — fall back to the most recent
+            # cached session instead.
+            from datetime import timedelta as _opt_td
+            opt_asof = end_date
+            if not flat.options_cache_path(opt_asof).exists():
+                try:
+                    # One probe in case today's file was just published
+                    flat.get_options_chain_from_flatfile("SPY", opt_asof)
+                except Exception:
+                    pass
+            if not flat.options_cache_path(opt_asof).exists():
+                for _back in range(1, 8):
+                    _prev = end_date - _opt_td(days=_back)
+                    if flat.options_cache_path(_prev).exists():
+                        opt_asof = _prev
+                        break
+            if opt_asof != end_date:
+                print(f"\n  NOTE: options flat file for {end_date} not yet "
+                      f"published — unusual-activity detection uses {opt_asof}")
+
             print(f"\nOptions enrichment — tier-aware ({len(results)} symbols) ...")
             for r in results:
                 tier = r.market_cap_tier or _mct(r.symbol)
@@ -366,7 +389,7 @@ def main() -> None:
                 try:
                     if tier == "mid_cap":
                         sigs = detect_unusual_activity(
-                            r.symbol, end_date, flat, r.entry_close,
+                            r.symbol, opt_asof, flat, r.entry_close,
                             volume_ratio_threshold=5.0,
                         )
                         u_score = score_unusual_activity(sigs)
@@ -377,7 +400,7 @@ def main() -> None:
                               f"  conv={r.conviction_score:.2f}{flag}")
                     elif tier == "large_cap":
                         sigs = detect_unusual_activity(
-                            r.symbol, end_date, flat, r.entry_close,
+                            r.symbol, opt_asof, flat, r.entry_close,
                             volume_ratio_threshold=3.0,
                         )
                         u_score = score_unusual_activity(sigs)

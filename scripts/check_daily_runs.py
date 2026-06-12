@@ -6,9 +6,11 @@ within its expected time window.  Exits with code 1 if any critical job
 is missing so the script can be used in monitoring / alerting pipelines.
 
 Critical jobs (exit code 1 when absent):
-    Morning check  — 08:30–09:15 ET   (cron: 12:45 UTC)
-    Evening scan   — 17:00–17:45 ET   (cron: 21:00 UTC Mon-Fri / 22:00 UTC Sun)
-    EOD tracker    — 16:00–17:00 ET   (cron: 20:30 UTC)
+    Morning check     — 08:30–09:15 ET   (cron: 12:45 UTC)
+    Evening scan      — 17:00–17:45 ET   (cron: 21:00 UTC Mon-Fri / 22:00 UTC Sun)
+    EOD tracker       — 16:00–17:00 ET   (cron: 20:30 UTC)
+    Options monitor   — 09:30–16:00 ET   (cron: every 30 min; skipped on holidays)
+    Options heartbeat — options_snapshots rows in DuckDB for the session
 
 Advisory jobs (reported but do not affect exit code):
     Breadth update — 17:00–18:30 ET   (runs inside evening scan)
@@ -39,6 +41,8 @@ from datetime import date, datetime, time
 from pathlib import Path
 
 import pytz
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -131,7 +135,47 @@ JOBS: list[JobSpec] = [
         window   = (17, 0, 18, 30),
         critical = False,
     ),
+    JobSpec(
+        name     = "Options monitor",
+        patterns = [
+            "monitor_options: checking",        # start of an intraday run
+            "monitor_options: flagged",         # detections written
+            "monitor_options: no unusual",      # ran, nothing detected
+        ],
+        window   = (9, 30, 16, 0),
+        critical = True,
+    ),
 ]
+
+
+# ── Options monitor heartbeat (DuckDB) ─────────────────────────────────────────
+
+def check_options_heartbeat(check_date: date, db_path: Path | None = None) -> int | None:
+    """
+    Count of options_snapshots rows written for ``check_date``.
+
+    The log check above only proves the cron job fired; this proves the monitor
+    actually produced per-symbol output for the session.  Returns None when the
+    database itself cannot be opened (treated as a warning, not a failure), and
+    0 when the table is missing or empty for the date.
+    """
+    try:
+        import duckdb
+        from quantlab.storage import DB_PATH
+        path = db_path or DB_PATH
+        con = duckdb.connect(str(path), read_only=True)
+    except Exception:
+        return None
+    try:
+        n = con.execute(
+            "SELECT COUNT(*) FROM options_snapshots WHERE snap_date = ?",
+            [check_date],
+        ).fetchone()[0]
+    except Exception:
+        n = 0   # table missing — monitor has never written
+    finally:
+        con.close()
+    return int(n)
 
 
 # ── Log parsing ────────────────────────────────────────────────────────────────
@@ -213,6 +257,7 @@ def check_and_report(
     log_path: Path,
     check_date: date,
     quiet: bool = False,
+    db_path: Path | None = None,
 ) -> int:
     """
     Run all job checks and print the status report.
@@ -229,10 +274,22 @@ def check_and_report(
         print(_tag(msg, _YELLOW))
         return 1
 
+    # Market-hour jobs (options monitor) legitimately skip NYSE holidays
+    try:
+        from quantlab.market_calendar import is_market_open
+        market_open = is_market_open(check_date)
+    except Exception:
+        market_open = check_date.weekday() < 5
+
     exit_code = 0
     results: list[tuple[str, str]] = []   # (tag, message)
 
     for spec in JOBS:
+        if spec.name == "Options monitor" and not market_open:
+            results.append((_tag("[SKIP]", _YELLOW),
+                            f"{spec.name:<18} market closed on {check_date}"))
+            continue
+
         found, run_time = find_job(today, spec)
 
         if not found:
@@ -264,6 +321,21 @@ def check_and_report(
             # Advisory only — a job that ran late is better than not running at all
 
         results.append((tag, msg))
+
+    # Options monitor heartbeat — the log proves the cron fired; this proves
+    # it actually wrote per-symbol rows for the session.
+    if market_open:
+        n_snap = check_options_heartbeat(check_date, db_path)
+        if n_snap is None:
+            results.append((_tag("[WARN]", _YELLOW),
+                            f"{'Options heartbeat':<18} DuckDB unreadable — cannot verify"))
+        elif n_snap == 0:
+            results.append((_tag("[MISSING]", _RED),
+                            f"{'Options heartbeat':<18} 0 options_snapshots rows for {check_date}"))
+            exit_code = 1
+        else:
+            results.append((_tag("[OK]", _GREEN),
+                            f"{'Options heartbeat':<18} {n_snap} options_snapshots rows for {check_date}"))
 
     if not quiet:
         print()

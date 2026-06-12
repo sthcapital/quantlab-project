@@ -4585,6 +4585,26 @@ class TestCheckDailyRuns:
         p.write_text("\n".join(lines))
         return p
 
+    def _heartbeat_db(self, tmp_path, snap_date):
+        """tmp DuckDB with one options_snapshots row so the heartbeat check passes."""
+        import duckdb
+        db = tmp_path / "health.duckdb"
+        con = duckdb.connect(str(db))
+        con.execute("""
+            CREATE TABLE options_snapshots (
+                symbol VARCHAR, snap_date DATE, spot_price DOUBLE, pcr DOUBLE,
+                iv_skew DOUBLE, unusual_calls BOOLEAN, options_score DOUBLE,
+                call_count INTEGER, put_count INTEGER
+            )
+        """)
+        con.execute(
+            "INSERT INTO options_snapshots VALUES "
+            "('CELH', ?, 100.0, 0.5, 0.0, TRUE, 0.85, 10, 5)",
+            [snap_date],
+        )
+        con.close()
+        return db
+
     # ── extract_time ──────────────────────────────────────────────────────────
 
     def test_extract_time_bracket_format(self):
@@ -4683,11 +4703,13 @@ class TestCheckDailyRuns:
         m = self._import()
         log = self._write_log(tmp_path, [
             "[2026-06-05 08:46:00] QuantLab Morning Check",
+            "[2026-06-05 13:00:08] monitor_options: checking 312 watchlist symbols ...",
             "[2026-06-05 17:02:00] Starting universe scan ...",
             "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
             "── [17:10] Breadth update complete — 2026-06-05 17:10:00",
         ])
-        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        db = self._heartbeat_db(tmp_path, date(2026, 6, 5))
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True, db_path=db)
         assert code == 0
 
     def test_missing_critical_job_returns_1(self, tmp_path):
@@ -4706,11 +4728,13 @@ class TestCheckDailyRuns:
         m = self._import()
         log = self._write_log(tmp_path, [
             "[2026-06-05 08:46:00] QuantLab Morning Check",
+            "[2026-06-05 13:00:08] monitor_options: checking 312 watchlist symbols ...",
             "[2026-06-05 17:02:00] Starting universe scan ...",
             "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
             # Breadth update MISSING — advisory only
         ])
-        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        db = self._heartbeat_db(tmp_path, date(2026, 6, 5))
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True, db_path=db)
         assert code == 0
 
     def test_empty_log_returns_1(self, tmp_path):
@@ -4734,11 +4758,13 @@ class TestCheckDailyRuns:
         log = self._write_log(tmp_path, [
             # Morning check at 10:30 AM (outside 8:30-9:15 window — late but present)
             "[2026-06-05 10:30:00] QuantLab Morning Check",
+            "[2026-06-05 13:00:08] monitor_options: checking 312 watchlist symbols ...",
             "[2026-06-05 17:05:00] Starting universe scan ...",
             "── [16:30] EOD tracker complete — 2026-06-05 16:45:00",
             "── [17:10] Breadth update complete — 2026-06-05 17:10:00",
         ])
-        code = m.check_and_report(log, date(2026, 6, 5), quiet=True)
+        db = self._heartbeat_db(tmp_path, date(2026, 6, 5))
+        code = m.check_and_report(log, date(2026, 6, 5), quiet=True, db_path=db)
         assert code == 0   # [LATE] is advisory, not a failure
 
     def test_output_contains_ok_and_missing(self, tmp_path, capsys):

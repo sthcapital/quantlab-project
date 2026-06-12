@@ -473,7 +473,8 @@ class InstitutionalWatchlist:
         try:
             con = self._con()
             row = con.execute(
-                f"SELECT consecutive_days, last_seen FROM {_table} WHERE symbol = ?",
+                f"SELECT consecutive_days, last_seen, options_signal, updated_at "
+                f"FROM {_table} WHERE symbol = ?",
                 [symbol],
             ).fetchone()
 
@@ -505,6 +506,23 @@ class InstitutionalWatchlist:
                 consecutive_days = prev_days + 1 if last_seen < today else prev_days
                 bonus = min(0.20, 0.05 * consecutive_days)
                 stored_conviction = min(1.0, base_conviction + bonus)
+
+                # Preserve an options_signal set earlier today by the intraday
+                # monitor (set_options_signal).  The evening scan recomputes the
+                # flag from flat files that often aren't published yet at scan
+                # time, so overwriting here would erase every intraday detection
+                # before the report is generated.  Flags older than today are
+                # stale scan-time values and are recomputed normally.
+                if isinstance(prev_updated, str):
+                    prev_updated_date = date.fromisoformat(prev_updated[:10])
+                elif hasattr(prev_updated, "date"):
+                    prev_updated_date = prev_updated.date()
+                else:
+                    prev_updated_date = prev_updated
+                if bool(prev_opts) and prev_updated_date == today and not options_signal:
+                    options_signal = True
+                    # Re-apply the monitor's conviction bonus the recompute dropped
+                    stored_conviction = min(1.0, stored_conviction + 0.08)
                 con.execute(
                     f"""
                     UPDATE {_table} SET
@@ -609,7 +627,7 @@ class InstitutionalWatchlist:
                 """
                 UPDATE institutional_watchlist SET
                     options_signal=TRUE,
-                    conviction_score=MIN(1.0, conviction_score + ?),
+                    conviction_score=LEAST(1.0, conviction_score + ?),
                     updated_at=CURRENT_TIMESTAMP
                 WHERE symbol=?
                 """,
