@@ -138,20 +138,67 @@ def export_trades_csv(
 
 # ── DuckDB storage ─────────────────────────────────────────────────────────────
 
+def connect_with_retry(
+    db_path=None,
+    read_only: bool = False,
+    attempts: int = 5,
+    base_delay: float = 2.0,
+):
+    """
+    duckdb.connect with exponential-backoff retry on lock contention.
+
+    Manual CLI scripts (rescore_options_session.py, rescore_universe_analysis.py,
+    anything opening quantlab.duckdb) collide with the intraday monitor's short
+    write cycles.  The monitor holds the file lock for well under a second per
+    cycle, so a brief backoff wins the race instead of failing outright.
+
+    Retries ONLY on lock-contention IOExceptions ("Could not set lock");
+    every other error (missing file, corrupt DB, bad path) raises immediately.
+    Delays are base_delay * 2**attempt: 2s, 4s, 8s, 16s ≈ 30s worst case at
+    the defaults.
+    """
+    import time
+
+    import duckdb
+
+    path = str(db_path or DB_PATH)
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            return duckdb.connect(path, read_only=read_only)
+        except duckdb.IOException as exc:
+            # DuckDB's contention message: 'Could not set lock on file "...":
+            # Conflicting lock is held ...' — match the phrase, not just
+            # "lock", which can appear in the file path itself.
+            msg = str(exc).lower()
+            if "could not set lock" not in msg and "conflicting lock" not in msg:
+                raise
+            last_exc = exc
+            if attempt < attempts - 1:
+                delay = base_delay * (2 ** attempt)
+                print(
+                    f"[storage] {path} is locked by another process — "
+                    f"retrying in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{attempts})"
+                )
+                time.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def get_db():
     """
     Return a DuckDB connection to the local research database.
 
-    Creates the database and schema on first call.
+    Creates the database and schema on first call.  Lock contention with the
+    intraday monitor is retried with backoff (see connect_with_retry).
     Usage::
 
         with get_db() as con:
             con.execute("SELECT * FROM trades LIMIT 10").fetchdf()
     """
     try:
-        import duckdb
-
-        con = duckdb.connect(str(DB_PATH))
+        con = connect_with_retry(DB_PATH)
         _ensure_schema(con)
         return con
 

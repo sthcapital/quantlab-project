@@ -45,8 +45,7 @@ def main() -> None:
 
     session = date.fromisoformat(args.date)
 
-    import duckdb
-    from quantlab.storage import DB_PATH
+    from quantlab.storage import DB_PATH, connect_with_retry
     from quantlab.utils import get_config
     from quantlab.providers.flat_files import FlatFileProvider
     from quantlab.signals.options_relative import (
@@ -59,7 +58,7 @@ def main() -> None:
         get_config("scanner").get("options_unusual_percentile", 90.0)
     )
 
-    con = duckdb.connect(str(DB_PATH), read_only=True)
+    con = connect_with_retry(DB_PATH, read_only=True)
     rows = con.execute(
         "SELECT symbol, pcr, iv_skew, options_score FROM options_snapshots "
         "WHERE snap_date = ? ORDER BY symbol",
@@ -160,7 +159,7 @@ def main() -> None:
 
     if args.write:
         from quantlab.providers.massive_options import MassiveOptionsProvider
-        con = duckdb.connect(str(DB_PATH))
+        con = connect_with_retry(DB_PATH)
         # Run the schema migration (adds the relative-scoring columns)
         MassiveOptionsProvider._ensure_table(con)
         for sym, r in results.items():

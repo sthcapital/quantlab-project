@@ -487,10 +487,9 @@ class MassiveOptionsProvider:
         unscored NULL) as future short-side signal data.
         """
         try:
-            import duckdb
-            from quantlab.storage import DB_PATH
+            from quantlab.storage import DB_PATH, connect_with_retry
 
-            con = duckdb.connect(str(DB_PATH))
+            con = connect_with_retry(DB_PATH)
             self._ensure_table(con)
             day = snap_date or date.today()
             con.execute(
