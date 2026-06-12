@@ -7598,10 +7598,10 @@ class TestSelectTopCandidates:
         selected = fn(results, iwl, lambda s: True)
         assert len(selected) <= 5
 
-    def test_sorted_by_conviction_then_days(self):
-        """Ranking is conviction-first; consecutive_days is the first
-        tie-break (with conviction saturating at 1.00 for many names, the
-        tie-break chain does the real ordering)."""
+    def test_sorted_by_days_then_conviction(self):
+        """Ranking is days-primary: conviction saturates at 1.00 above the
+        0.70 gate (quantization noise) while days-on-list is a real
+        measurement.  Conviction is the first tie-break."""
         fn = self._load()
         r_high_conv = self._make_result("HIGH", conviction=0.90)
         r_multi_day = self._make_result("MULTI", conviction=0.75)
@@ -7610,15 +7610,15 @@ class TestSelectTopCandidates:
             "MULTI": self._iwl_entry(vdu=True, days=3),
         }
         selected = fn([r_high_conv, r_multi_day], iwl, lambda s: True)
-        # Higher conviction ranks first under the conviction-first contract
-        assert selected[0][0].symbol == "HIGH"
+        # More days ranks first despite lower conviction
+        assert selected[0][0].symbol == "MULTI"
 
-        # Equal conviction → more consecutive days ranks first
+        # Equal days → higher conviction ranks first
         r_a = self._make_result("AAA", conviction=0.80)
-        r_b = self._make_result("BBB", conviction=0.80)
+        r_b = self._make_result("BBB", conviction=0.95)
         iwl2 = {
-            "AAA": self._iwl_entry(vdu=True, days=1),
-            "BBB": self._iwl_entry(vdu=True, days=3),
+            "AAA": self._iwl_entry(vdu=True, days=2),
+            "BBB": self._iwl_entry(vdu=True, days=2),
         }
         selected2 = fn([r_a, r_b], iwl2, lambda s: True)
         assert selected2[0][0].symbol == "BBB"
@@ -8599,7 +8599,7 @@ class TestSelectionTieBreak:
         )
 
     def test_tiebreak_order_matches_spec(self):
-        """conviction desc -> cdays desc -> explosion desc -> bv ratio desc -> rs desc."""
+        """cdays desc (primary) -> conviction desc -> explosion desc -> bv ratio desc -> rs desc."""
         iwl = {s: {"volume_dry_up": True, "consecutive_days": d}
                for s, d in [("CD3", 3), ("EXPL", 2), ("BVR", 2), ("RS", 2), ("LOW", 2)]}
         results = [
@@ -8634,8 +8634,21 @@ class TestSelectionTieBreak:
             selected = self._select(list(results), iwl)
             assert [it[0].symbol for it in selected] == ["AAA", "MMM", "ZZZ"]
 
-    def test_conviction_still_primary(self):
-        """A 0.99 name never outranks a 1.00 name regardless of tie-break fields."""
+    def test_days_primary_beats_higher_conviction(self):
+        """Days-on-list is primary: a 3-day 0.99 name outranks a 2-day 1.00
+        name — conviction above the 0.70 gate is quantization noise while
+        consecutive_days is a real measurement."""
+        iwl = {"MULTI": {"volume_dry_up": True, "consecutive_days": 3},
+               "FRESH": {"volume_dry_up": True, "consecutive_days": 2}}
+        results = [
+            _mk_result("FRESH", conviction=1.00, explosion=1.0, bv_ratio=9.0, rs=1.0),
+            _mk_result("MULTI", conviction=0.99, explosion=0.0, bv_ratio=0.0, rs=0.0),
+        ]
+        selected = self._select(results, iwl)
+        assert [it[0].symbol for it in selected] == ["MULTI", "FRESH"]
+
+    def test_conviction_first_tiebreak_within_equal_days(self):
+        """With equal days, conviction is the first tie-break."""
         iwl = {s: {"volume_dry_up": True, "consecutive_days": 2} for s in ("HI", "LO")}
         results = [
             _mk_result("LO", conviction=0.99, explosion=1.0, bv_ratio=9.0, rs=1.0),

@@ -46,12 +46,13 @@ def select_top_candidates(
         Default False: display-only until the rescored 2026-06-11 output
         is reviewed.
 
-    Ranking: conviction_score DESC, then a deterministic tie-break chain —
-    consecutive_days DESC → explosion_score DESC (None ranks last) →
-    breakout_volume_ratio DESC (None ranks last) → rs_score (vs SPY) DESC →
-    symbol ASC.
-    With dozens of names saturating conviction at 1.00, the tie-break chain is
-    what actually orders the top-5; symbol ASC guarantees full determinism.
+    Ranking: consecutive_days DESC (primary — a real measurement), then a
+    deterministic tie-break chain — conviction_score DESC →
+    explosion_score DESC (None ranks last) → breakout_volume_ratio DESC
+    (None ranks last) → rs_score (vs SPY) DESC → symbol ASC.
+    With dozens of names saturating conviction at 1.00, conviction above the
+    0.70 gate is quantization noise; days-on-list orders the top-5 and
+    symbol ASC guarantees full determinism.
 
     Returns:
         List of (ScanResult, earn_score, consecutive_days) tuples.
@@ -96,9 +97,12 @@ def select_top_candidates(
             r.breakout_volume_ratio if getattr(r, "breakout_volume_ratio", None) is not None
             else -1.0  # not measurable ranks below any real ratio
         )
+        # Days-on-list is primary: 40+ names saturate conviction at 1.00, so
+        # above the 0.70 gate conviction is quantization noise while
+        # consecutive_days is a real measurement.
         return (
-            -r.conviction_score,
             -cdays,
+            -r.conviction_score,
             -explosion,
             -bv_ratio,
             -(r.rs_score or 0.0),
