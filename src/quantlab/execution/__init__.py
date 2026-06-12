@@ -379,15 +379,15 @@ def _compute_adr_expansion_rate(bars) -> float | None:
 def compute_explosion_score(
     earnings_acceleration: float,
     rs_percentile: float,
-    rel_volume: float | None,
-    is_stage2: bool,
-    options_flow: float,
+    rel_volume_zscore: float | None,
+    stage2_regime: float,
+    call_flow_imbalance: float,
     adr_expansion_rate: float | None,
     peg_score: float,
 ) -> float:
     """Unified weighted composite signal for explosive breakout probability.
 
-    Weights (sum to 1.0):
+    Base weights (sum to 1.0):
         0.25  earnings_acceleration   (0–1)
         0.20  RS percentile rank      (0–1)
         0.18  relative volume norm    (0–1)
@@ -395,22 +395,41 @@ def compute_explosion_score(
         0.10  options call flow       (0–1)
         0.07  ADR expansion norm      (0–1)
         0.05  PEG quality             (0–1)
-    """
-    # Relative volume: normalize 0.5× → 3.5× to 0.0 → 1.0
-    rv_norm = min(1.0, max(0.0, ((rel_volume or 1.0) - 0.5) / 3.0))
-    # ADR expansion: normalize [-1, +1] range to [0, 1]
-    adr_exp  = adr_expansion_rate if adr_expansion_rate is not None else 0.0
-    adr_norm = min(1.0, max(0.0, (adr_exp + 1.0) / 2.0))
 
-    raw = (
-        0.25 * min(1.0, max(0.0, earnings_acceleration))
-        + 0.20 * min(1.0, max(0.0, rs_percentile))
-        + 0.18 * rv_norm
-        + 0.15 * (1.0 if is_stage2 else 0.0)
-        + 0.10 * min(1.0, max(0.0, options_flow))
-        + 0.07 * adr_norm
-        + 0.05 * min(1.0, max(0.0, peg_score))
-    )
+    Components with 0.0 values are treated as unavailable and excluded;
+    remaining weights are re-normalized to sum to 1.0.  Returns 0.0 only
+    when ALL components are unavailable.
+    """
+    # Relative volume: normalize raw vol (0.5x–3.5x) → 0.0–1.0
+    # None or 0.0 means the metric was not available
+    if rel_volume_zscore is None or rel_volume_zscore == 0.0:
+        rv_norm = 0.0
+    else:
+        rv_norm = min(1.0, max(0.0, (rel_volume_zscore - 0.5) / 3.0))
+
+    # ADR expansion: normalize [-1, +1] → [0, 1]
+    # None or 0.0 means the metric was not computed
+    if adr_expansion_rate is None or adr_expansion_rate == 0.0:
+        adr_norm = 0.0
+    else:
+        adr_norm = min(1.0, max(0.0, (adr_expansion_rate + 1.0) / 2.0))
+
+    components = [
+        (min(1.0, max(0.0, earnings_acceleration)), 0.25),
+        (min(1.0, max(0.0, rs_percentile)),         0.20),
+        (rv_norm,                                    0.18),
+        (min(1.0, max(0.0, stage2_regime)),          0.15),
+        (min(1.0, max(0.0, call_flow_imbalance)),    0.10),
+        (adr_norm,                                   0.07),
+        (min(1.0, max(0.0, peg_score)),              0.05),
+    ]
+
+    available = [(v, w) for v, w in components if v > 0.0]
+    if not available:
+        return 0.0
+
+    total_weight = sum(w for _, w in available)
+    raw = sum(v * w / total_weight for v, w in available)
     return round(min(1.0, max(0.0, raw)), 4)
 
 
@@ -875,9 +894,9 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
         result.explosion_score     = compute_explosion_score(
             earnings_acceleration = edgar_accel or result.earnings_acceleration,
             rs_percentile         = rs_percentile,
-            rel_volume            = result.rel_volume,
-            is_stage2             = result.stage == 2,
-            options_flow          = _opt,
+            rel_volume_zscore     = result.rel_volume,
+            stage2_regime         = 1.0 if result.stage == 2 else 0.0,
+            call_flow_imbalance   = _opt,
             adr_expansion_rate    = _adr_expansion,
             peg_score             = peg_score,
         )

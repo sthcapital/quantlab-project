@@ -8066,23 +8066,23 @@ class TestComputeExplosionScore:
         score = compute_explosion_score(
             earnings_acceleration=1.0,
             rs_percentile=1.0,
-            rel_volume=4.0,     # > 3.5 → normalises to 1.0
-            is_stage2=True,
-            options_flow=1.0,
+            rel_volume_zscore=4.0,     # > 3.5 → normalises to 1.0
+            stage2_regime=1.0,
+            call_flow_imbalance=1.0,
             adr_expansion_rate=1.0,  # → normalises to 1.0
             peg_score=1.0,
         )
         assert score == 1.0
 
     def test_all_zero_inputs_returns_0(self):
-        """All-zero inputs yields 0.0 except the ADR expansion neutral midpoint."""
+        """All-zero/missing inputs yields 0.0 (no available components)."""
         from quantlab.execution import compute_explosion_score
         score = compute_explosion_score(
             earnings_acceleration=0.0,
             rs_percentile=0.0,
-            rel_volume=0.5,     # normalises to 0.0
-            is_stage2=False,
-            options_flow=0.0,
+            rel_volume_zscore=0.5,     # normalises to 0.0
+            stage2_regime=0.0,
+            call_flow_imbalance=0.0,
             adr_expansion_rate=-1.0,  # normalises to 0.0
             peg_score=0.0,
         )
@@ -8099,9 +8099,9 @@ class TestComputeExplosionScore:
         score = compute_explosion_score(
             earnings_acceleration=2.0,
             rs_percentile=2.0,
-            rel_volume=100.0,
-            is_stage2=True,
-            options_flow=5.0,
+            rel_volume_zscore=100.0,
+            stage2_regime=1.0,
+            call_flow_imbalance=5.0,
             adr_expansion_rate=10.0,
             peg_score=10.0,
         )
@@ -8113,9 +8113,9 @@ class TestComputeExplosionScore:
         score = compute_explosion_score(
             earnings_acceleration=-5.0,
             rs_percentile=-5.0,
-            rel_volume=0.0,
-            is_stage2=False,
-            options_flow=-5.0,
+            rel_volume_zscore=0.0,
+            stage2_regime=0.0,
+            call_flow_imbalance=-5.0,
             adr_expansion_rate=-10.0,
             peg_score=-5.0,
         )
