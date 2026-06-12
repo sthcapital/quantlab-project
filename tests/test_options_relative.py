@@ -251,6 +251,42 @@ class TestCrossSectionalFlags:
         scores, zscores = _universe(100)
         assert len(cross_sectional_flags(scores, zscores=zscores)) == 10
 
+    # ── Direction ceiling (PCR — gate eligibility only) ───────────────────────
+
+    def test_pcr_above_ceiling_blocks_flag(self):
+        """The HST case (2026-06-11): z=10 with PCR 6.25 — put-dominated flow
+        is not LONG-accumulation evidence.  Scored, but no flag."""
+        scores, zscores = _universe(100)
+        pcrs = {sym: 0.5 for sym in scores}
+        pcrs["S099"] = 6.25   # top score, put-dominated session
+        flagged = cross_sectional_flags(scores, zscores=zscores, pcrs=pcrs)
+        assert "S099" not in flagged
+        assert "S098" in flagged   # call-dominated neighbours unaffected
+
+    def test_pcr_below_ceiling_passes(self):
+        scores, zscores = _universe(100)
+        pcrs = {sym: 1.5 for sym in scores}   # exactly at the default ceiling
+        flagged = cross_sectional_flags(scores, zscores=zscores, pcrs=pcrs)
+        assert len(flagged) == 10
+
+    def test_pcr_ceiling_configurable(self):
+        scores, zscores = _universe(100)
+        pcrs = {sym: 2.0 for sym in scores}
+        assert cross_sectional_flags(
+            scores, zscores=zscores, pcrs=pcrs, max_pcr=2.5,
+        )
+        assert cross_sectional_flags(
+            scores, zscores=zscores, pcrs=pcrs, max_pcr=1.5,
+        ) == set()
+
+    def test_unknown_pcr_passes(self):
+        """No PCR measured → no evidence of put domination → eligible."""
+        scores, zscores = _universe(100)
+        pcrs = {sym: 0.5 for sym in scores}
+        pcrs["S099"] = None
+        flagged = cross_sectional_flags(scores, zscores=zscores, pcrs=pcrs)
+        assert "S099" in flagged
+
     def test_percentile_helper(self):
         vals = list(range(1, 101))
         assert percentile(vals, 50.0) == pytest.approx(50.5)
@@ -299,7 +335,7 @@ class TestReportSignalRate:
             flagged = i < n_flagged
             con.execute(
                 "INSERT OR REPLACE INTO options_snapshots VALUES "
-                "(?, ?, 100.0, 0.5, 0.2, ?, 0.85, 10, 5, ?, ?, ?, ?, ?)",
+                "(?, ?, 100.0, 0.5, 0.2, ?, 0.85, 10, 5, ?, ?, ?, ?, ?, NULL)",
                 [f"SYM{i:03d}", snap_date, flagged,
                  5000.0 if relative else None,
                  3000.0 if relative else None,
@@ -334,3 +370,53 @@ class TestReportSignalRate:
         db = tmp_path / "empty.duckdb"
         duckdb.connect(str(db)).close()
         assert gr._options_signal_rate(date(2026, 6, 12), str(db)) is None
+
+
+class TestPutDominatedTag:
+    """The put_dominated snapshot tag — short-side signal data persistence."""
+
+    def _seed_snapshots(self, db_path, snap_date, symbols):
+        from quantlab.providers.massive_options import MassiveOptionsProvider
+        con = duckdb.connect(str(db_path))
+        MassiveOptionsProvider._ensure_table(con)
+        for sym in symbols:
+            con.execute(
+                "INSERT INTO options_snapshots "
+                "(symbol, snap_date, spot_price, pcr, iv_skew, rel_score) "
+                "VALUES (?, ?, 100.0, 0.5, 0.1, 0.8)",
+                [sym, snap_date],
+            )
+        # One unscored row — must keep NULL tags (MISSING ≠ ZERO)
+        con.execute(
+            "INSERT INTO options_snapshots (symbol, snap_date, spot_price) "
+            "VALUES ('NOSCORE', ?, 100.0)",
+            [snap_date],
+        )
+        con.close()
+
+    def test_put_dominated_tag_persists(self, tmp_path, monkeypatch):
+        import quantlab.storage as storage
+        from quantlab.providers.massive_options import MassiveOptionsProvider
+        db = tmp_path / "test.duckdb"
+        monkeypatch.setattr(storage, "DB_PATH", db)
+        day = date(2026, 6, 11)
+        self._seed_snapshots(db, day, ["HST", "ASH", "CB"])
+
+        mp = MassiveOptionsProvider(api_key="test")
+        mp.mark_unusual_flags({"ASH", "CB"}, snap_date=day, put_dominated={"HST"})
+
+        con = duckdb.connect(str(db))
+        rows = dict(con.execute(
+            "SELECT symbol, put_dominated FROM options_snapshots WHERE snap_date = ?",
+            [day],
+        ).fetchall())
+        flags = dict(con.execute(
+            "SELECT symbol, unusual_flag FROM options_snapshots WHERE snap_date = ?",
+            [day],
+        ).fetchall())
+        con.close()
+
+        assert rows["HST"] is True          # tagged — short-side record exists
+        assert flags["HST"] is False        # but no LONG flag / gate credit
+        assert rows["ASH"] is False and flags["ASH"] is True
+        assert rows["NOSCORE"] is None      # unscored stays NULL

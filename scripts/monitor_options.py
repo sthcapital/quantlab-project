@@ -109,6 +109,7 @@ def main() -> None:
     pctl     = float(scanner_cfg.get("options_unusual_percentile", 90.0))
     gating   = bool(scanner_cfg.get("options_signal_gating_enabled", False))
     min_base = float(scanner_cfg.get("options_min_baseline_contracts", 75))
+    max_pcr  = float(scanner_cfg.get("options_gate_max_pcr", 1.5))
 
     # Per-symbol baselines: trailing 20 cached flat-file sessions (one parquet
     # read per session, all underlyings at once; never hits S3).
@@ -121,6 +122,7 @@ def main() -> None:
     scores:     dict[str, float | None] = {}
     zscores:    dict[str, float | None] = {}
     base_means: dict[str, float | None] = {}
+    pcrs:       dict[str, float | None] = {}
     for entry in candidates:
         sym         = entry["symbol"]
         entry_price = entry.get("entry_price") or 0.0
@@ -133,20 +135,29 @@ def main() -> None:
                 scores[sym]     = res["rel_score"]
                 zscores[sym]    = res["vol_zscore"]
                 base_means[sym] = (sum(baseline) / len(baseline)) if baseline else None
+                pcrs[sym]       = res.get("pcr")
         except Exception:
             # Options data unavailable for this symbol — skip silently
             pass
 
     # Pass 2 — cross-sectional gate: unusual = top-percentile of the day's
     # scores AND ≥2σ above the symbol's own baseline (cap, not quota) AND a
-    # baseline liquid enough that the spike can mean accumulation
+    # baseline liquid enough that the spike can mean accumulation AND not
+    # put-dominated flow (PCR ceiling — direction-aware LONG confirmation)
     flagged = cross_sectional_flags(
         scores, percentile_cut=pctl, zscores=zscores,
         baseline_means=base_means, min_baseline=min_base,
+        pcrs=pcrs, max_pcr=max_pcr,
     )
+    # Cleared volume/liquidity but blocked by the PCR ceiling — tagged as
+    # future short-side signal data (SHORT_SIGNAL_ENABLED is off)
+    put_dominated = cross_sectional_flags(
+        scores, percentile_cut=pctl, zscores=zscores,
+        baseline_means=base_means, min_baseline=min_base,
+    ) - flagged
 
     if not args.dry_run:
-        mp.mark_unusual_flags(flagged)
+        mp.mark_unusual_flags(flagged, put_dominated=put_dominated)
 
     for sym in sorted(flagged, key=lambda s: -(scores[s] or 0.0)):
         print(f"  ▲ {sym:<8}  rel_score={scores[sym]:.4f}")

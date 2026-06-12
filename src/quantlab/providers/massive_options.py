@@ -470,7 +470,10 @@ class MassiveOptionsProvider:
         }
 
     def mark_unusual_flags(
-        self, flagged: set[str], snap_date: Optional[date] = None
+        self,
+        flagged: set[str],
+        snap_date: Optional[date] = None,
+        put_dominated: Optional[set[str]] = None,
     ) -> None:
         """
         Persist the day's cross-sectional gate result to options_snapshots.
@@ -478,6 +481,10 @@ class MassiveOptionsProvider:
         Sets unusual_flag TRUE for ``flagged`` symbols and FALSE for every
         other row scored that day (rel_score NOT NULL).  Rows that were never
         scored keep unusual_flag NULL — MISSING ≠ ZERO.
+
+        ``put_dominated`` symbols cleared the volume/liquidity gates but were
+        blocked by the PCR ceiling — tagged TRUE (other scored rows FALSE,
+        unscored NULL) as future short-side signal data.
         """
         try:
             import duckdb
@@ -502,6 +509,23 @@ class MassiveOptionsProvider:
                     """,
                     [day, *flagged],
                 )
+            if put_dominated is not None:
+                con.execute(
+                    """
+                    UPDATE options_snapshots SET put_dominated = FALSE
+                    WHERE snap_date = ? AND rel_score IS NOT NULL
+                    """,
+                    [day],
+                )
+                if put_dominated:
+                    placeholders = ", ".join("?" for _ in put_dominated)
+                    con.execute(
+                        f"""
+                        UPDATE options_snapshots SET put_dominated = TRUE
+                        WHERE snap_date = ? AND symbol IN ({placeholders})
+                        """,
+                        [day, *put_dominated],
+                    )
             con.close()
         except Exception as exc:
             logger.warning("mark_unusual_flags failed: %s", exc)
@@ -709,6 +733,9 @@ class MassiveOptionsProvider:
             ("vol_zscore",  "DOUBLE"),
             ("rel_score",   "DOUBLE"),
             ("unusual_flag", "BOOLEAN"),
+            # Cleared the volume/liquidity gates but PCR > ceiling — a
+            # put-dominated anomaly kept as future short-side signal data
+            ("put_dominated", "BOOLEAN"),
         ):
             con.execute(
                 f"ALTER TABLE options_snapshots ADD COLUMN IF NOT EXISTS {col} {col_type}"

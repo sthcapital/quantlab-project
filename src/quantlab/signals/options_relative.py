@@ -59,6 +59,13 @@ MIN_FLAG_ZSCORE = 2.0
 # cannot receive the unusual flag / gate credit.
 MIN_BASELINE_CONTRACTS = 75.0
 
+# Direction ceiling for FLAG eligibility: a session PCR above this is
+# put-dominated flow — not accumulation evidence, whatever the call-volume z
+# (HST on 2026-06-11: z = 10 with PCR 6.25).  Still scored/persisted, and
+# callers tag such rows put_dominated in options_snapshots: they are future
+# short-side signal data (SHORT_SIGNAL_ENABLED is False, the record exists).
+MAX_GATE_PCR = 1.5
+
 # Z-score at which the volume component saturates at 1.0.
 _Z_SATURATION = 4.0
 
@@ -170,6 +177,8 @@ def cross_sectional_flags(
     min_zscore: float = MIN_FLAG_ZSCORE,
     baseline_means: Mapping[str, float | None] | None = None,
     min_baseline: float = MIN_BASELINE_CONTRACTS,
+    pcrs: Mapping[str, float | None] | None = None,
+    max_pcr: float = MAX_GATE_PCR,
 ) -> set[str]:
     """
     Flag the top tail of the day's scores: symbols whose score is strictly
@@ -190,6 +199,12 @@ def cross_sectional_flags(
     flag — at a 24-contract baseline a z = 10 spike is one hedger rolling a
     position, not accumulation.  Such symbols are still scored and persisted;
     they only lose gate credit.
+
+    Direction ceiling: when ``pcrs`` is provided, a symbol whose measured
+    session PCR exceeds ``max_pcr`` cannot flag — put-dominated flow is not
+    LONG-accumulation evidence regardless of call-volume z (HST 2026-06-11:
+    z = 10, PCR 6.25).  A None PCR passes: unknown direction is not evidence
+    of put domination.
 
     Symbols with score None (no baseline) are excluded from both the
     percentile computation and the flags.  Returns the empty set when fewer
@@ -213,5 +228,10 @@ def cross_sectional_flags(
             sym for sym in flagged
             if baseline_means.get(sym) is not None
             and baseline_means[sym] >= min_baseline
+        }
+    if pcrs is not None:
+        flagged = {
+            sym for sym in flagged
+            if pcrs.get(sym) is None or pcrs[sym] <= max_pcr
         }
     return flagged

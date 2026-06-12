@@ -96,6 +96,11 @@ DEFAULT_CONFIG = {
         # many contracts cannot flag (still scored/displayed/persisted).
         # EG 2026-06-11: z=10 on a 24-contract baseline = one hedger rolling.
         "options_min_baseline_contracts": 75,
+        # Direction ceiling for gate eligibility: session PCR above this is
+        # put-dominated flow — no LONG flag regardless of call-volume z
+        # (HST 2026-06-11: z=10, PCR 6.25).  Rows are tagged put_dominated
+        # in options_snapshots as future short-side signal data.
+        "options_gate_max_pcr": 1.5,
         # Universe build stability (2026-06-12 incident: builds against
         # partial-day Polygon grouped data produced 457–2,325 symbol swings).
         # Floor on raw grouped-ticker count — below this the response is

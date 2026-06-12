@@ -102,20 +102,28 @@ def main() -> None:
             "legacy_score": legacy_score,
         }
 
-    min_base = float(
-        get_config("scanner").get("options_min_baseline_contracts", 75)
-    )
+    _cfg = get_config("scanner")
+    min_base = float(_cfg.get("options_min_baseline_contracts", 75))
+    max_pcr  = float(_cfg.get("options_gate_max_pcr", 1.5))
     scores     = {sym: r["rel_score"] for sym, r in results.items()}
     zscores    = {sym: r["vol_zscore"] for sym, r in results.items()}
     base_means = {sym: r["baseline_mean"] for sym, r in results.items()}
+    pcrs       = {sym: r["pcr"] for sym, r in results.items()}
     flagged = cross_sectional_flags(
         scores, percentile_cut=pctl, zscores=zscores,
         baseline_means=base_means, min_baseline=min_base,
+        pcrs=pcrs, max_pcr=max_pcr,
     )
+    # Put-dominated: cleared volume/liquidity gates, blocked by PCR ceiling —
+    # tagged in options_snapshots as future short-side signal data
+    put_dominated = cross_sectional_flags(
+        scores, percentile_cut=pctl, zscores=zscores,
+        baseline_means=base_means, min_baseline=min_base,
+    ) - flagged
     # Floor-blocked: would have flagged on score+z alone — listed for review
     floor_blocked = cross_sectional_flags(
         scores, percentile_cut=pctl, zscores=zscores,
-    ) - flagged
+    ) - flagged - put_dominated
 
     n_scored = sum(1 for v in scores.values() if v is not None)
     print(f"{'SYM':<8} {'CALL_VOL':>10} {'BASE_AVG':>10} {'VOL_Z':>7} "
@@ -133,6 +141,14 @@ def main() -> None:
             r = results[sym]
             print(f"  {sym:<8} base_avg={r['baseline_mean']:>8,.0f}  "
                   f"vol_z={r['vol_zscore']:>6.2f}  rel={r['rel_score']:.4f}")
+
+    if put_dominated:
+        print(f"\nPut-dominated (PCR > {max_pcr:g} — no LONG flag; tagged as "
+              f"short-side signal data):")
+        for sym in sorted(put_dominated, key=lambda s: -(scores[s] or 0.0)):
+            r = results[sym]
+            print(f"  {sym:<8} pcr={r['pcr']:>6.2f}  vol_z={r['vol_zscore']:>6.2f}  "
+                  f"rel={r['rel_score']:.4f}")
 
     rate = (len(flagged) / n_scored) if n_scored else 0.0
     print(f"\nOptions: {len(flagged)}/{n_scored} unusual, {rate:.1%}"
@@ -152,11 +168,13 @@ def main() -> None:
                 """
                 UPDATE options_snapshots
                 SET call_volume = ?, vol_zscore = ?, rel_score = ?,
-                    unusual_flag = CASE WHEN ? IS NULL THEN NULL ELSE ? END
+                    unusual_flag  = CASE WHEN ? IS NULL THEN NULL ELSE ? END,
+                    put_dominated = CASE WHEN ? IS NULL THEN NULL ELSE ? END
                 WHERE symbol = ? AND snap_date = ?
                 """,
                 [r["call_volume"], r["vol_zscore"], r["rel_score"],
-                 r["rel_score"], sym in flagged, sym, session],
+                 r["rel_score"], sym in flagged,
+                 r["rel_score"], sym in put_dominated, sym, session],
             )
         con.close()
         print(f"Persisted rescored values for {len(results)} rows.")
