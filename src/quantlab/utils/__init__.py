@@ -82,6 +82,12 @@ DEFAULT_CONFIG = {
         "min_rel_volume": 1.5,
         "news_lookback_days": 7,
         "SHORT_SIGNAL_ENABLED": False,   # activate after long side validated in paper trading (Phase 8+)
+        # Unusual-options detector is uncalibrated (flagged 347/357 monitored
+        # symbols on 2026-06-11) — until the recalibration work lands,
+        # options_signal is display-only: it still renders in the report's
+        # Opts column and persists to DuckDB, but it does not satisfy the
+        # confirming-signal gate in select_top_candidates().
+        "options_counts_as_confirmation": False,
     },
     "news": {
         "provider_codes": "BRFG+BRFUPDN+DJNL",

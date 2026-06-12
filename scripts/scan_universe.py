@@ -27,6 +27,7 @@ def select_top_candidates(
     is_cs_fn,
     max_per_day: int = 5,
     max_per_sector: int = 3,
+    options_counts_as_confirmation: bool | None = None,
 ) -> list:
     """
     Apply the strict paper-trading watchlist filter and return up to max_per_day
@@ -37,14 +38,22 @@ def select_top_candidates(
       - is_cs_fn(symbol) → common stock
       - conviction_score >= 0.70
       - earnings_score > 0.0 (real earnings data available)
-      - at least one confirming signal: options_signal OR volume_dry_up OR
-        consecutive_days >= 2 (already on institutional_watchlist)
+      - at least one confirming signal: volume_dry_up OR consecutive_days >= 2
+        (already on institutional_watchlist).  options_signal counts only when
+        options_counts_as_confirmation is enabled (None → scanner config) —
+        the unusual-options detector is uncalibrated (347/357 symbols flagged
+        on 2026-06-11) and is display-only until the recalibration lands.
 
     Ranking: consecutive_days DESC → conviction_score DESC → earnings_score DESC.
 
     Returns:
         List of (ScanResult, earn_score, consecutive_days) tuples.
     """
+    if options_counts_as_confirmation is None:
+        options_counts_as_confirmation = bool(
+            get_config("scanner").get("options_counts_as_confirmation", False)
+        )
+
     qualifying = []
     for r in results:
         if r.stage != 2:
@@ -68,7 +77,7 @@ def select_top_candidates(
         vdu   = bool(iwl_e.get("volume_dry_up", False))
         cdays = int(iwl_e.get("consecutive_days", 1))
 
-        if not (opts or vdu or cdays >= 2):
+        if not ((opts and options_counts_as_confirmation) or vdu or cdays >= 2):
             continue
 
         qualifying.append((r, earn, cdays))

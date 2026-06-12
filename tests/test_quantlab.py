@@ -7451,7 +7451,7 @@ class TestSelectTopCandidates:
     def test_basic_stage2_conviction_passes(self):
         fn = self._load()
         r = self._make_result("AAPL", conviction=0.75, stage=2)
-        iwl = {"AAPL": self._iwl_entry(options=True)}
+        iwl = {"AAPL": self._iwl_entry(vdu=True)}
         result = fn([r], iwl, lambda s: True)
         assert len(result) == 1
         assert result[0][0].symbol == "AAPL"
@@ -7488,11 +7488,23 @@ class TestSelectTopCandidates:
         iwl = {"LLY": self._iwl_entry(options=False, vdu=False, days=1)}
         assert fn([r], iwl, lambda s: True) == []
 
-    def test_options_signal_qualifies(self):
+    def test_options_signal_display_only_by_default(self):
+        """options_counts_as_confirmation defaults to False (detector
+        uncalibrated — flagged 347/357 symbols on 2026-06-11): a candidate
+        whose only confirming signal is options must NOT qualify."""
         fn = self._load()
         r = self._make_result("LLY")
         iwl = {"LLY": self._iwl_entry(options=True, vdu=False, days=1)}
-        assert len(fn([r], iwl, lambda s: True)) == 1
+        assert fn([r], iwl, lambda s: True) == []
+
+    def test_options_signal_qualifies_when_confirmation_enabled(self):
+        """With options_counts_as_confirmation=True the pre-calibration
+        behavior is restored: options alone satisfies the gate."""
+        fn = self._load()
+        r = self._make_result("LLY")
+        iwl = {"LLY": self._iwl_entry(options=True, vdu=False, days=1)}
+        assert len(fn([r], iwl, lambda s: True,
+                      options_counts_as_confirmation=True)) == 1
 
     def test_volume_dry_up_qualifies(self):
         fn = self._load()
@@ -7510,7 +7522,7 @@ class TestSelectTopCandidates:
         fn = self._load()
         results = [self._make_result(f"SYM{i}", conviction=0.80 - i * 0.01)
                    for i in range(8)]
-        iwl = {f"SYM{i}": self._iwl_entry(options=True) for i in range(8)}
+        iwl = {f"SYM{i}": self._iwl_entry(vdu=True) for i in range(8)}
         selected = fn(results, iwl, lambda s: True)
         assert len(selected) <= 5
 
@@ -7519,8 +7531,8 @@ class TestSelectTopCandidates:
         r_high_conv = self._make_result("HIGH", conviction=0.90)
         r_multi_day = self._make_result("MULTI", conviction=0.75)
         iwl = {
-            "HIGH":  self._iwl_entry(options=True, days=1),
-            "MULTI": self._iwl_entry(options=True, days=3),
+            "HIGH":  self._iwl_entry(vdu=True, days=1),
+            "MULTI": self._iwl_entry(vdu=True, days=3),
         }
         selected = fn([r_high_conv, r_multi_day], iwl, lambda s: True)
         # MULTI has more days → should rank first despite lower conviction
@@ -7531,7 +7543,7 @@ class TestSelectTopCandidates:
         # 5 Tech symbols all qualifying — only 3 should be selected
         results = [self._make_result(f"T{i}", conviction=0.80 - i * 0.01, sector="Technology")
                    for i in range(5)]
-        iwl = {f"T{i}": self._iwl_entry(options=True) for i in range(5)}
+        iwl = {f"T{i}": self._iwl_entry(vdu=True) for i in range(5)}
         selected = fn(results, iwl, lambda s: True)
         assert len(selected) == 3
 
@@ -7542,7 +7554,7 @@ class TestSelectTopCandidates:
                 for i in range(4)]
         health = [self._make_result(f"H{i}", conviction=0.80, sector="Health Care")
                   for i in range(2)]
-        iwl = {r.symbol: self._iwl_entry(options=True) for r in tech + health}
+        iwl = {r.symbol: self._iwl_entry(vdu=True) for r in tech + health}
         selected = fn(tech + health, iwl, lambda s: True)
         sectors = [getattr(item[0], "sector", "") for item in selected]
         assert sectors.count("Technology") == 3
@@ -7570,7 +7582,7 @@ class TestSelectTopCandidates:
         fn = self._load()
         r = self._make_result("OK", conviction=0.80)
         r.eps_growth = -0.09
-        iwl = {"OK": self._iwl_entry(options=True)}
+        iwl = {"OK": self._iwl_entry(vdu=True)}
         assert len(fn([r], iwl, lambda s: True)) == 1
 
     def test_eps_growth_none_does_not_block(self):
@@ -7578,7 +7590,7 @@ class TestSelectTopCandidates:
         fn = self._load()
         r = self._make_result("NOEDR", conviction=0.80)
         r.eps_growth = None
-        iwl = {"NOEDR": self._iwl_entry(options=True)}
+        iwl = {"NOEDR": self._iwl_entry(vdu=True)}
         assert len(fn([r], iwl, lambda s: True)) == 1
 
 
