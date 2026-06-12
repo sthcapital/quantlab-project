@@ -104,10 +104,12 @@ class ScanResult:
     climactic_volume: float = 0.0      # climactic_volume_score()   ≥ 0.7 → +0.07
 
     # Options flow conviction (IBKR chain; enriched post-scan)
-    options_conviction: float = 0.0  # IBKR source: ≥ 0.6 → +0.10; ≥ 0.8 → +0.15
+    # MISSING ≠ ZERO: None = never enriched; a measured 0.0 ("no unusual
+    # flow") is information and flows into the composite as 0.0.
+    options_conviction: float | None = None  # IBKR source: ≥ 0.6 → +0.10; ≥ 0.8 → +0.15
 
-    # Polygon/Massive options score (preferred over IBKR options_conviction when > 0)
-    options_score: float = 0.0       # MassiveOptionsProvider.compute_options_score()
+    # Polygon/Massive options score (preferred over IBKR options_conviction when set)
+    options_score: float | None = None  # MassiveOptionsProvider.compute_options_score()
 
     # Multi-lookback confirmation (set post-scan when signal fires at ≥2 lookbacks)
     multi_lookback_confirmed: bool = False  # True → +0.05 structural confirmation bonus
@@ -291,10 +293,11 @@ def score_conviction(result: ScanResult) -> float:
             score += 0.08
     elif _tier != "small_cap":
         # mega_cap / large_cap (or mid_cap without unusual data): PCR + IV skew
-        _opt = result.options_score if result.options_score > 0 else result.options_conviction
-        if _opt >= 0.8:
+        _opt = (result.options_score if result.options_score is not None
+                else result.options_conviction)
+        if _opt is not None and _opt >= 0.8:
             score += 0.15
-        elif _opt >= 0.6:
+        elif _opt is not None and _opt >= 0.6:
             score += 0.10
     # small_cap: 0 options contribution (options market too thin)
 
@@ -965,9 +968,10 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
         result.adr_expansion_rate  = _adr_expansion
         # MISSING ≠ ZERO: each component is None when not measurable, so the
         # composite re-normalizes instead of treating absent data as 0.
-        # Options scores use 0.0 as their "not computed" sentinel (enrichment
-        # runs post-scan), so 0.0 maps to None here.
-        _opt = result.options_score if result.options_score > 0 else result.options_conviction
+        # Options fields default to None (never enriched); a measured 0.0
+        # ("scored, no unusual flow") is real information and passes through.
+        _opt = (result.options_score if result.options_score is not None
+                else result.options_conviction)
         if edgar_accel is not None:
             _earn = edgar_accel
         elif result.earnings_acceleration > 0:
@@ -979,7 +983,7 @@ def _scan_symbol_worker(args: tuple) -> "ScanResult | None":
             rs_percentile         = rs_percentile if rs_percentile else None,
             rel_volume_zscore     = result.rel_volume,
             stage2_regime         = None if result.stage == 0 else (1.0 if result.stage == 2 else 0.0),
-            call_flow_imbalance   = _opt if _opt > 0 else None,
+            call_flow_imbalance   = _opt,
             adr_expansion_rate    = _adr_expansion,
             peg_score             = peg_score,
         )

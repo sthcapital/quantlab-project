@@ -116,8 +116,8 @@ def _layers_fired(scan_result) -> str:
     if getattr(scan_result, "sector_cluster", False):
         layers.append("SECTOR_CLUSTER")
 
-    opt = getattr(scan_result, "options_conviction", 0.0)
-    if opt >= 0.6:
+    opt = getattr(scan_result, "options_conviction", None)
+    if opt is not None and opt >= 0.6:
         layers.append("OPTIONS")
 
     news_cat = getattr(scan_result, "news_category", "none")
@@ -540,9 +540,10 @@ class InstitutionalWatchlist:
         vol_trend       = getattr(scan_result, "volume_trend", 1.0)
         absorption      = getattr(scan_result, "absorption", 0.0)
         volume_dry_up   = vol_trend < 0.4 and absorption >= 0.3
+        _opt_score      = getattr(scan_result, "options_score", None)
         options_signal  = (
             getattr(scan_result, "unusual_options_score", 0.0) >= 0.5
-            or getattr(scan_result, "options_score", 0.0) >= 0.6
+            or (_opt_score is not None and _opt_score >= 0.6)
         )
         explosion_score      = getattr(scan_result, "explosion_score", None)
         explosion_components = getattr(scan_result, "explosion_components", 0)

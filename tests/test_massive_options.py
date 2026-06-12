@@ -554,17 +554,19 @@ class TestScanResultOptionsScore:
         defaults.update(kwargs)
         return ScanResult(**defaults)
 
-    def test_options_score_field_exists_and_defaults_zero(self):
+    def test_options_score_field_defaults_none(self):
+        """Never-enriched = None; a measured 0.0 is real data (MISSING ≠ ZERO)."""
         r = self._base_result()
         assert hasattr(r, "options_score")
-        assert r.options_score == 0.0
+        assert r.options_score is None
+        assert r.options_conviction is None
 
     def test_score_conviction_prefers_options_score_over_conviction(self):
         from quantlab.execution import score_conviction
         # Polygon score 0.7 (should trigger +0.10)
-        r_poly = self._base_result(options_score=0.70, options_conviction=0.0)
-        # No options data
-        r_none = self._base_result(options_score=0.0, options_conviction=0.0)
+        r_poly = self._base_result(options_score=0.70, options_conviction=None)
+        # No options data at all
+        r_none = self._base_result(options_score=None, options_conviction=None)
         assert score_conviction(r_poly) > score_conviction(r_none)
         assert score_conviction(r_poly) - score_conviction(r_none) == pytest.approx(0.10)
 
@@ -577,9 +579,9 @@ class TestScanResultOptionsScore:
 
     def test_score_conviction_falls_back_to_ibkr_conviction(self):
         from quantlab.execution import score_conviction
-        # No Polygon score; IBKR provides 0.7
-        r_ibkr = self._base_result(options_score=0.0, options_conviction=0.70)
-        r_none  = self._base_result(options_score=0.0, options_conviction=0.0)
+        # Polygon never enriched (None) → IBKR's 0.7 carries the bonus
+        r_ibkr = self._base_result(options_score=None, options_conviction=0.70)
+        r_none = self._base_result(options_score=None, options_conviction=None)
         assert score_conviction(r_ibkr) > score_conviction(r_none)
         assert score_conviction(r_ibkr) - score_conviction(r_none) == pytest.approx(0.10)
 
@@ -587,7 +589,15 @@ class TestScanResultOptionsScore:
         from quantlab.execution import score_conviction
         # Polygon=0.85 (strong), IBKR=0.65 (moderate) → use Polygon (+0.15)
         r = self._base_result(options_score=0.85, options_conviction=0.65)
-        r_ibkr_only = self._base_result(options_score=0.0, options_conviction=0.65)
+        r_ibkr_only = self._base_result(options_score=None, options_conviction=0.65)
         # r gets +0.15, r_ibkr_only gets +0.10
         assert score_conviction(r) > score_conviction(r_ibkr_only)
         assert score_conviction(r) - score_conviction(r_ibkr_only) == pytest.approx(0.05)
+
+    def test_measured_zero_polygon_score_blocks_ibkr_fallback(self):
+        from quantlab.execution import score_conviction
+        # Polygon measured 0.0 ("scored, no unusual flow") is information —
+        # it must NOT fall through to IBKR's stale 0.7
+        r_zero = self._base_result(options_score=0.0, options_conviction=0.70)
+        r_none = self._base_result(options_score=None, options_conviction=None)
+        assert score_conviction(r_zero) == score_conviction(r_none)   # no bonus

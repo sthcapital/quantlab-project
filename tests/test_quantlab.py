@@ -2317,9 +2317,11 @@ class TestOptionsConvictionLayer:
         strong = score_conviction(self._r(options_conviction=0.85))
         assert strong - mid == pytest.approx(0.05, abs=1e-9)  # 0.15 - 0.10 = 0.05
 
-    def test_options_field_defaults_zero(self):
+    def test_options_field_defaults_none(self):
+        """Never-enriched = None (MISSING ≠ ZERO); measured 0.0 is real data."""
         r = ScanResult("UNH","2026-06-04","breakout",True,399.0,None,5)
-        assert r.options_conviction == 0.0
+        assert r.options_conviction is None
+        assert r.options_score is None
 
     def test_full_conviction_with_options_clamped(self):
         r = self._r(
@@ -4842,13 +4844,15 @@ class TestCheckDailyRuns:
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
         assert "check_daily_runs.py" in result.stdout
 
-    def test_health_check_cron_time_is_21_15(self):
+    def test_health_check_cron_time_is_18_15_et(self):
+        """Crontab fields are LOCAL Eastern time since the 2026-06-12 fix
+        (UTC-intended fields on an ET-clock cron ran every job 4h late)."""
         import subprocess, re
         result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
-        # Should be "15 21 * * 1-5 ... check_daily_runs.py"
+        # Should be "15 18 * * 1-5 ... check_daily_runs.py" — 6:15 PM ET local
         lines = [ln for ln in result.stdout.splitlines() if "check_daily_runs" in ln]
         assert len(lines) == 1
-        assert re.match(r'15 2[12] \* \* 1-5', lines[0].strip()), (
+        assert re.match(r'15 18 \* \* 1-5', lines[0].strip()), (
             f"Unexpected cron time: {lines[0]}"
         )
 
@@ -8214,6 +8218,41 @@ class TestComputeExplosionScore:
         assert n == 5
         assert score is not None
         assert score > 0.5
+
+    def test_enriched_zero_options_reaches_composite_as_zero(self):
+        """Post-calibration contract: a genuinely scored 0.0 ("no unusual
+        flow") is a measured component — it must be counted and pull the
+        composite down, NOT be conflated with never-computed (None)."""
+        from quantlab.execution import compute_explosion_score
+        common = dict(
+            earnings_acceleration=1.0,
+            rs_percentile=0.7,
+            rel_volume_zscore=1.2,
+            stage2_regime=1.0,
+            adr_expansion_rate=None,
+            peg_score=1.0,
+        )
+        score_zero, n_zero = compute_explosion_score(call_flow_imbalance=0.0, **common)
+        score_none, n_none = compute_explosion_score(call_flow_imbalance=None, **common)
+        assert n_zero == n_none + 1          # measured 0.0 counts as a component
+        assert score_zero < score_none        # and dilutes the composite
+
+    def test_scanresult_options_defaults_are_none(self):
+        """Never-enriched options fields default to None (MISSING ≠ ZERO),
+        so the >0 'EBC workaround' sentinel is no longer needed anywhere."""
+        from quantlab.execution import ScanResult
+        r = ScanResult(
+            symbol="X", scan_date="2026-06-12", signal_type="breakout",
+            signal=True, entry_close=100.0, indicator_value=None, lookback=5,
+        )
+        assert r.options_score is None
+        assert r.options_conviction is None
+        # And score_conviction must handle None and measured-0.0 alike
+        from quantlab.execution import score_conviction
+        r.stage = 2
+        score_conviction(r)                   # None options — must not raise
+        r.options_score = 0.0                 # measured zero — no bonus, no crash
+        score_conviction(r)
 
     def test_thin_coverage_below_gate_returns_none(self):
         """Below EXPLOSION_MIN_COMPONENTS → None, regardless of input strength."""

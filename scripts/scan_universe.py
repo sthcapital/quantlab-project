@@ -330,10 +330,11 @@ def main() -> None:
         )
         multi_str   = " ✓" if r.multi_lookback_confirmed else "  "
         _tier       = r.market_cap_tier or "?"
-        _opt_val    = r.options_score if r.options_score > 0 else r.options_conviction
+        _opt_val    = (r.options_score if r.options_score is not None
+                       else r.options_conviction)
         if r.unusual_options_score > 0:
             opt_str = f"  unusual_opts={r.unusual_options_score:.2f} [{_tier}]"
-        elif _opt_val > 0:
+        elif _opt_val is not None:
             opt_str = f"  opt={_opt_val:.2f} [{_tier}]"
         else:
             opt_str = f"  [{_tier}]" if _tier and _tier != "?" else ""

@@ -82,9 +82,10 @@ def has_confirming_signal(
     average (breakout_volume_score ≥ 0.7 — Weinstein's 2× rule) OR volume
     dry-up then expansion (IWL volume_dry_up flag)."""
     iwl_entry = iwl_entry or {}
+    _opt_score = getattr(scan_result, "options_score", None)
     options = (
         getattr(scan_result, "unusual_options_score", 0.0) >= 0.5
-        or getattr(scan_result, "options_score", 0.0) >= 0.6
+        or (_opt_score is not None and _opt_score >= 0.6)
         or bool(iwl_entry.get("options_signal", False))
     )
     breakout_vol = getattr(scan_result, "breakout_volume_score", 0.0) >= 0.7
