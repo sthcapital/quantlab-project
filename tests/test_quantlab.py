@@ -7553,7 +7553,10 @@ class TestSelectTopCandidates:
         selected = fn(results, iwl, lambda s: True)
         assert len(selected) <= 5
 
-    def test_sorted_by_days_then_conviction(self):
+    def test_sorted_by_conviction_then_days(self):
+        """Ranking is conviction-first; consecutive_days is the first
+        tie-break (with conviction saturating at 1.00 for many names, the
+        tie-break chain does the real ordering)."""
         fn = self._load()
         r_high_conv = self._make_result("HIGH", conviction=0.90)
         r_multi_day = self._make_result("MULTI", conviction=0.75)
@@ -7562,8 +7565,18 @@ class TestSelectTopCandidates:
             "MULTI": self._iwl_entry(vdu=True, days=3),
         }
         selected = fn([r_high_conv, r_multi_day], iwl, lambda s: True)
-        # MULTI has more days → should rank first despite lower conviction
-        assert selected[0][0].symbol == "MULTI"
+        # Higher conviction ranks first under the conviction-first contract
+        assert selected[0][0].symbol == "HIGH"
+
+        # Equal conviction → more consecutive days ranks first
+        r_a = self._make_result("AAA", conviction=0.80)
+        r_b = self._make_result("BBB", conviction=0.80)
+        iwl2 = {
+            "AAA": self._iwl_entry(vdu=True, days=1),
+            "BBB": self._iwl_entry(vdu=True, days=3),
+        }
+        selected2 = fn([r_a, r_b], iwl2, lambda s: True)
+        assert selected2[0][0].symbol == "BBB"
 
     def test_sector_cap_at_3(self):
         fn = self._load()
@@ -8322,3 +8335,270 @@ class TestMissingVsZeroSemantics:
         assert row[2] is None      # peg also NULL when not computable
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Regime exposure policy (quantlab.risk.regime_policy)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mk_result(symbol, conviction=0.9, cdays=2, explosion=None, bv_ratio=None,
+               rs=0.0, stage=2, bvs=0.0, opts=0.0):
+    """Minimal ScanResult for regime/tie-break tests."""
+    from quantlab.execution import ScanResult
+    r = ScanResult(
+        symbol=symbol, scan_date="2026-06-12", signal_type="breakout",
+        signal=True, entry_close=100.0, indicator_value=99.0, lookback=5,
+        regime_bullish=True, stage=stage,
+    )
+    r.conviction_score = conviction
+    r.explosion_score = explosion
+    r.breakout_volume_ratio = bv_ratio
+    r.breakout_volume_score = bvs
+    r.rs_score = rs
+    r.options_score = opts
+    r.edgar_acceleration = 0.8
+    return r
+
+
+class TestRegimePolicy:
+
+    def test_policy_states(self):
+        """Each tape state maps to the documented exposure rule."""
+        from quantlab.risk.regime_policy import get_regime_rule
+        bull = get_regime_rule("BULL")
+        assert bull.allow_entries and bull.size_factor == 1.0
+        assert bull.max_new_positions == 5 and not bull.require_confirming
+
+        rec = get_regime_rule("RECOVERY")
+        assert rec.allow_entries and rec.size_factor == 0.5
+        assert rec.require_confirming
+
+        neu = get_regime_rule("NEUTRAL")
+        assert neu.allow_entries and neu.size_factor == 0.5
+        assert neu.max_new_positions == 3
+
+        corr = get_regime_rule("CORRECTION")
+        assert not corr.allow_entries
+        assert corr.stop_tighten_factor == 1.0   # stops unchanged
+
+        bear = get_regime_rule("BEAR")
+        assert not bear.allow_entries
+        assert bear.stop_tighten_factor < 1.0    # stops tightened
+
+    def test_unknown_tape_falls_back_to_neutral(self):
+        from quantlab.risk.regime_policy import get_regime_rule
+        assert get_regime_rule(None) == get_regime_rule("NEUTRAL")
+        assert get_regime_rule("") == get_regime_rule("NEUTRAL")
+        assert get_regime_rule("garbage") == get_regime_rule("NEUTRAL")
+
+    def test_correction_blocks_all_entries(self):
+        """CORRECTION: qualified candidates accumulate but none enter."""
+        from quantlab.risk.regime_policy import apply_regime_gate, get_regime_rule
+        items = [(_mk_result(s), 0.8, 2) for s in ("AAA", "BBB", "CCC")]
+        entries, suppressed = apply_regime_gate(items, get_regime_rule("CORRECTION"))
+        assert entries == []
+        assert suppressed == ["AAA", "BBB", "CCC"]
+
+    def test_bear_blocks_all_entries(self):
+        from quantlab.risk.regime_policy import apply_regime_gate, get_regime_rule
+        items = [(_mk_result("AAA"), 0.8, 2)]
+        entries, suppressed = apply_regime_gate(items, get_regime_rule("BEAR"))
+        assert entries == [] and suppressed == ["AAA"]
+
+    def test_recovery_requires_confirming_signal(self):
+        """RECOVERY admits only candidates with options / 2x vol / VDU."""
+        from quantlab.risk.regime_policy import apply_regime_gate, get_regime_rule
+        confirmed   = _mk_result("YES", bvs=0.8)          # breakout vol >= 2x
+        unconfirmed = _mk_result("NO",  bvs=0.0)
+        items = [(confirmed, 0.8, 2), (unconfirmed, 0.8, 2)]
+        entries, suppressed = apply_regime_gate(items, get_regime_rule("RECOVERY"))
+        assert [it[0].symbol for it in entries] == ["YES"]
+        assert suppressed == ["NO"]
+
+    def test_neutral_caps_at_three(self):
+        from quantlab.risk.regime_policy import apply_regime_gate, get_regime_rule
+        items = [(_mk_result(f"S{i}"), 0.8, 2) for i in range(5)]
+        entries, suppressed = apply_regime_gate(items, get_regime_rule("NEUTRAL"))
+        assert len(entries) == 3
+        assert suppressed == ["S3", "S4"]
+
+    def test_bull_admits_all_full_size(self):
+        from quantlab.risk.regime_policy import apply_regime_gate, get_regime_rule
+        rule = get_regime_rule("BULL")
+        items = [(_mk_result(f"S{i}"), 0.8, 2) for i in range(5)]
+        entries, suppressed = apply_regime_gate(items, rule)
+        assert len(entries) == 5 and suppressed == []
+        assert rule.size_factor == 1.0
+
+    def test_half_size_factors(self):
+        """RECOVERY and NEUTRAL entries carry size_factor 0.5."""
+        from quantlab.risk.regime_policy import get_regime_rule
+        assert get_regime_rule("RECOVERY").size_factor == 0.5
+        assert get_regime_rule("NEUTRAL").size_factor == 0.5
+
+    def test_confirming_signal_variants(self):
+        from quantlab.risk.regime_policy import has_confirming_signal
+        assert has_confirming_signal(_mk_result("A", opts=0.7))               # options
+        assert has_confirming_signal(_mk_result("B", bvs=0.75))               # 2x breakout vol
+        assert has_confirming_signal(_mk_result("C"), {"volume_dry_up": True})  # VDU
+        assert not has_confirming_signal(_mk_result("D"))
+
+    def test_effective_stop_tightening(self):
+        from quantlab.risk.regime_policy import effective_stop_price
+        # BEAR factor 0.5: stop moves halfway up (entry 100, stop 90 -> 95)
+        assert effective_stop_price(100.0, 90.0, 0.5) == 95.0
+        # Factor 1.0: unchanged
+        assert effective_stop_price(100.0, 90.0, 1.0) == 90.0
+        # Unusable inputs: original stop returned
+        assert effective_stop_price(None, 90.0, 0.5) == 90.0
+        assert effective_stop_price(100.0, None, 0.5) is None
+        assert effective_stop_price(80.0, 90.0, 0.5) == 90.0  # stop above entry
+
+    def test_gate_decision_summary_format(self):
+        from quantlab.risk.regime_policy import RegimeGateDecision
+        d = RegimeGateDecision(
+            gate_date="2026-06-12", tape="CORRECTION",
+            qualified=3, entered=0, size_factor=0.0,
+            suppressed=["UNH", "ABC"],
+        )
+        s = d.summary()
+        assert "3 candidate(s) qualified, 0 entered — regime CORRECTION" in s
+        assert "UNH" in s and "ABC" in s
+
+    def test_gate_log_roundtrip(self, tmp_path):
+        from quantlab.risk.regime_policy import (
+            RegimeGateDecision, load_regime_gate, log_regime_gate,
+        )
+        db = str(tmp_path / "gate.duckdb")
+        d = RegimeGateDecision(
+            gate_date="2026-06-12", tape="NEUTRAL",
+            qualified=4, entered=3, size_factor=0.5, suppressed=["ZZZ"],
+        )
+        log_regime_gate(d, db_path=db)
+        loaded = load_regime_gate("2026-06-12", db_path=db)
+        assert loaded is not None
+        assert loaded.tape == "NEUTRAL"
+        assert loaded.qualified == 4 and loaded.entered == 3
+        assert loaded.size_factor == 0.5
+        assert loaded.suppressed == ["ZZZ"]
+
+    def test_watchlist_entry_stores_size_factor(self, tmp_path, monkeypatch):
+        """add_to_watchlist persists the regime size factor on the position row."""
+        import duckdb
+        import quantlab.storage as _storage
+        import quantlab.watchlist as _wl
+        db = tmp_path / "wl.duckdb"
+        monkeypatch.setattr(_storage, "DB_PATH", db)
+        r = _mk_result("HALF", conviction=0.9)
+        r.atr_stop = 95.0
+        assert _wl.add_to_watchlist(r, size_factor=0.5)
+        con = duckdb.connect(str(db))
+        row = con.execute(
+            "SELECT size_factor, conviction_components FROM watchlist WHERE symbol='HALF'"
+        ).fetchone()
+        con.close()
+        assert row[0] == 0.5
+        import json
+        comps = json.loads(row[1])
+        assert "rs_score" in comps and "breakout_volume_ratio" in comps
+
+
+class TestSelectionTieBreak:
+    """Deterministic candidate ordering when conviction saturates at 1.00."""
+
+    @staticmethod
+    def _select(results, iwl_state):
+        import sys
+        from pathlib import Path
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from scan_universe import select_top_candidates
+        return select_top_candidates(
+            results, iwl_state, lambda s: True,
+            max_per_sector=5,   # sector cap exercised elsewhere; isolate ordering here
+            options_signal_gating_enabled=False,
+        )
+
+    def test_tiebreak_order_matches_spec(self):
+        """conviction desc -> cdays desc -> explosion desc -> bv ratio desc -> rs desc."""
+        iwl = {s: {"volume_dry_up": True, "consecutive_days": d}
+               for s, d in [("CD3", 3), ("EXPL", 2), ("BVR", 2), ("RS", 2), ("LOW", 2)]}
+        results = [
+            _mk_result("RS",   conviction=1.0, explosion=0.5, bv_ratio=1.0, rs=0.9),
+            _mk_result("LOW",  conviction=1.0, explosion=0.5, bv_ratio=1.0, rs=0.1),
+            _mk_result("CD3",  conviction=1.0, explosion=0.1, bv_ratio=0.5, rs=0.0),
+            _mk_result("BVR",  conviction=1.0, explosion=0.5, bv_ratio=3.0, rs=0.0),
+            _mk_result("EXPL", conviction=1.0, explosion=0.9, bv_ratio=0.5, rs=0.0),
+        ]
+        # All conviction 1.00: CD3 wins on days, then EXPL on explosion,
+        # then BVR on ratio, then RS on rs, LOW last.
+        selected = self._select(results, iwl)
+        assert [it[0].symbol for it in selected] == ["CD3", "EXPL", "BVR", "RS", "LOW"]
+
+    def test_explosion_none_ranks_below_any_real_score(self):
+        iwl = {s: {"volume_dry_up": True, "consecutive_days": 2} for s in ("REAL", "MISS")}
+        results = [
+            _mk_result("MISS", conviction=1.0, explosion=None, bv_ratio=5.0, rs=0.9),
+            _mk_result("REAL", conviction=1.0, explosion=0.05, bv_ratio=0.1, rs=0.0),
+        ]
+        selected = self._select(results, iwl)
+        assert [it[0].symbol for it in selected] == ["REAL", "MISS"]
+
+    def test_symbol_asc_makes_order_fully_deterministic(self):
+        """Identical metrics everywhere -> alphabetical, stable across runs."""
+        iwl = {s: {"volume_dry_up": True, "consecutive_days": 2} for s in ("ZZZ", "AAA", "MMM")}
+        results = [
+            _mk_result(s, conviction=1.0, explosion=0.5, bv_ratio=2.0, rs=0.5)
+            for s in ("ZZZ", "AAA", "MMM")
+        ]
+        for _ in range(3):
+            selected = self._select(list(results), iwl)
+            assert [it[0].symbol for it in selected] == ["AAA", "MMM", "ZZZ"]
+
+    def test_conviction_still_primary(self):
+        """A 0.99 name never outranks a 1.00 name regardless of tie-break fields."""
+        iwl = {s: {"volume_dry_up": True, "consecutive_days": 2} for s in ("HI", "LO")}
+        results = [
+            _mk_result("LO", conviction=0.99, explosion=1.0, bv_ratio=9.0, rs=1.0),
+            _mk_result("HI", conviction=1.00, explosion=0.0, bv_ratio=0.0, rs=0.0),
+        ]
+        selected = self._select(results, iwl)
+        assert [it[0].symbol for it in selected] == ["HI", "LO"]
+
+
+class TestRegimeGateReportLine:
+
+    def test_page1_renders_gate_decision(self):
+        """The report's first page includes the entry-gate line."""
+        import sys
+        from datetime import date as _date
+        from pathlib import Path
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from generate_report import _page1, _styles
+        from quantlab.risk.regime_policy import RegimeGateDecision
+
+        d = RegimeGateDecision(
+            gate_date="2026-06-12", tape="CORRECTION",
+            qualified=3, entered=0, size_factor=0.0, suppressed=["UNH"],
+        )
+        elements = _page1(
+            _styles(), _date(2026, 6, 12), None, 3, 1, [],
+            regime_gate=d,
+        )
+        texts = [getattr(el, "text", "") for el in elements]
+        gate_lines = [t for t in texts if "Entry gate:" in t]
+        assert len(gate_lines) == 1
+        assert "3 candidate(s) qualified, 0 entered — regime CORRECTION" in gate_lines[0]
+
+    def test_page1_no_gate_line_when_absent(self):
+        import sys
+        from datetime import date as _date
+        from pathlib import Path
+        scripts_dir = str(Path(__file__).parent.parent / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from generate_report import _page1, _styles
+        elements = _page1(_styles(), _date(2026, 6, 12), None, 0, 0, [])
+        texts = [getattr(el, "text", "") for el in elements]
+        assert not any("Entry gate:" in t for t in texts)

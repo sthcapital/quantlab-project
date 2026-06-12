@@ -334,7 +334,34 @@ def _ensure_schema(con) -> None:
             date_updated        DATE,
             -- Audit / override notes
             breadth_override_note VARCHAR DEFAULT '',
-            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- Regime exposure policy: 1.0 full size, 0.5 half (RECOVERY/NEUTRAL)
+            size_factor         DOUBLE DEFAULT 1.0,
+            -- Raw conviction component values at entry (JSON) — for future re-weighting
+            conviction_components VARCHAR
+        )
+    """)
+
+    # Migration: regime-policy columns for pre-existing DBs
+    try:
+        _wl_cols = {r[1] for r in con.execute("PRAGMA table_info(watchlist)").fetchall()}
+        if "size_factor" not in _wl_cols:
+            con.execute("ALTER TABLE watchlist ADD COLUMN size_factor DOUBLE DEFAULT 1.0")
+        if "conviction_components" not in _wl_cols:
+            con.execute("ALTER TABLE watchlist ADD COLUMN conviction_components VARCHAR")
+    except Exception:
+        pass
+
+    # Regime gate decisions — one row per scan day, rendered in the daily report
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS regime_gate_log (
+            date               DATE PRIMARY KEY,
+            tape               TEXT,
+            qualified          INTEGER,
+            entered            INTEGER,
+            size_factor        DOUBLE,
+            suppressed_symbols TEXT DEFAULT '',
+            created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
 
@@ -478,15 +505,32 @@ def _ensure_schema(con) -> None:
             tape                  TEXT DEFAULT '',
             notes                 TEXT DEFAULT '',
             updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            explosion_score       FLOAT DEFAULT 0.0
+            explosion_score       FLOAT,
+            explosion_components  INTEGER DEFAULT 0,
+            conviction_components VARCHAR,
+            breakout_volume_ratio FLOAT
         )
     """)
 
-    # Migration: add explosion_score to institutional_watchlist for pre-existing DBs
+    # Migration: add explosion columns to institutional_watchlist for pre-existing DBs.
+    # explosion_score is nullable — NULL means "not computed", which must never be
+    # rendered or ranked as a real 0.0 score (MISSING ≠ ZERO).
     try:
         _iwl_cols = {r[1] for r in con.execute("PRAGMA table_info(institutional_watchlist)").fetchall()}
         if "explosion_score" not in _iwl_cols:
-            con.execute("ALTER TABLE institutional_watchlist ADD COLUMN explosion_score FLOAT DEFAULT 0.0")
+            con.execute("ALTER TABLE institutional_watchlist ADD COLUMN explosion_score FLOAT")
+        if "explosion_components" not in _iwl_cols:
+            con.execute("ALTER TABLE institutional_watchlist ADD COLUMN explosion_components INTEGER DEFAULT 0")
+            # One-time data fix: rows written before component tracking carry a
+            # 0.0 column default from scans that never computed the composite
+            # (or pre-dated it).  Genuine 0.0 scores did not exist before this
+            # schema version, so all of them are stale → NULL.
+            con.execute("UPDATE institutional_watchlist SET explosion_score = NULL WHERE explosion_score = 0.0")
+        if "conviction_components" not in _iwl_cols:
+            con.execute("ALTER TABLE institutional_watchlist ADD COLUMN conviction_components VARCHAR")
+        # Raw Weinstein breakout-volume ratio — nullable (MISSING ≠ ZERO)
+        if "breakout_volume_ratio" not in _iwl_cols:
+            con.execute("ALTER TABLE institutional_watchlist ADD COLUMN breakout_volume_ratio FLOAT")
     except Exception:
         pass
 
@@ -507,15 +551,26 @@ def _ensure_schema(con) -> None:
             tape                  TEXT DEFAULT '',
             notes                 TEXT DEFAULT '',
             updated_at            TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            explosion_score       FLOAT DEFAULT 0.0
+            explosion_score       FLOAT,
+            explosion_components  INTEGER DEFAULT 0,
+            conviction_components VARCHAR,
+            breakout_volume_ratio FLOAT
         )
     """)
 
-    # Migration: add explosion_score to basing_watchlist for pre-existing DBs
+    # Migration: add explosion columns to basing_watchlist (same semantics as IWL)
     try:
         _bw_cols = {r[1] for r in con.execute("PRAGMA table_info(basing_watchlist)").fetchall()}
         if "explosion_score" not in _bw_cols:
-            con.execute("ALTER TABLE basing_watchlist ADD COLUMN explosion_score FLOAT DEFAULT 0.0")
+            con.execute("ALTER TABLE basing_watchlist ADD COLUMN explosion_score FLOAT")
+        if "explosion_components" not in _bw_cols:
+            con.execute("ALTER TABLE basing_watchlist ADD COLUMN explosion_components INTEGER DEFAULT 0")
+            con.execute("UPDATE basing_watchlist SET explosion_score = NULL WHERE explosion_score = 0.0")
+        if "conviction_components" not in _bw_cols:
+            con.execute("ALTER TABLE basing_watchlist ADD COLUMN conviction_components VARCHAR")
+        # Raw Weinstein breakout-volume ratio — nullable (MISSING ≠ ZERO)
+        if "breakout_volume_ratio" not in _bw_cols:
+            con.execute("ALTER TABLE basing_watchlist ADD COLUMN breakout_volume_ratio FLOAT")
     except Exception:
         pass
 

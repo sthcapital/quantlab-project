@@ -100,6 +100,7 @@ def add_to_watchlist(
     scan_result,
     min_conviction: float = MIN_CONVICTION_FOR_WATCHLIST,
     note: str = "",
+    size_factor: float = 1.0,
 ) -> bool:
     """
     Add a scan result to the watchlist if conviction meets the threshold.
@@ -112,6 +113,8 @@ def add_to_watchlist(
         min_conviction: Minimum conviction score to accept (default 0.70).
         note:           Optional audit note stored in breadth_override_note
                         (e.g. "Added pre-breadth-load — tape=BEAR at time of scan").
+        size_factor:    Position-size multiplier from the regime exposure policy
+                        (1.0 full size; 0.5 half size in RECOVERY/NEUTRAL).
 
     Returns:
         True if the entry was inserted; False if skipped (below threshold or
@@ -123,6 +126,15 @@ def add_to_watchlist(
     today      = date.today()
     watch_id   = f"{scan_result.symbol}_{today.isoformat()}"
     layers     = _layers_fired(scan_result)
+
+    # Raw conviction inputs (JSON) — preserved for future score re-weighting
+    components_json = ""
+    try:
+        import json
+        from quantlab.execution import conviction_components
+        components_json = json.dumps(conviction_components(scan_result))
+    except Exception:
+        pass
 
     # 2R price target: entry + 2 * (entry - stop)
     _ep   = scan_result.entry_close
@@ -140,8 +152,9 @@ def add_to_watchlist(
             INSERT OR IGNORE INTO watchlist (
                 watch_id, symbol, date_added, entry_price, atr_stop,
                 conviction_score, signal_layers, lookback, signal_type,
-                target_price, status, date_updated, breadth_override_note
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?)
+                target_price, status, date_updated, breadth_override_note,
+                size_factor, conviction_components
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'watching', ?, ?, ?, ?)
         """, [
             watch_id,
             scan_result.symbol,
@@ -155,6 +168,8 @@ def add_to_watchlist(
             target_price,
             today.isoformat(),
             note,
+            size_factor,
+            components_json,
         ])
         con.close()
         return True
@@ -230,7 +245,10 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
     For each entry:
     - Fetches the current spot price using get_spot_price().
     - Computes unrealized_ret = (current − entry) / entry.
-    - Sets status = 'stopped_out' if current_price ≤ atr_stop.
+    - Sets status = 'stopped_out' if current_price ≤ effective stop.
+      The effective stop is the ATR stop tightened by the regime policy's
+      stop_tighten_factor (BEAR halves the entry→stop distance; all other
+      regimes leave stops unchanged).
     - Sets status = 'expired'     if trading_days_on_watch ≥ 10.
     - Updates days_on_watch and date_updated.
 
@@ -245,6 +263,24 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
     active = get_active_watchlist()
     if not active:
         return []
+
+    # Regime policy: BEAR tape tightens stops on open positions
+    _stop_factor = 1.0
+    _tape = ""
+    try:
+        from quantlab.risk.regime_policy import get_regime_rule
+        from quantlab.signals.breadth import get_latest_snapshot
+        _snap = get_latest_snapshot()
+        if _snap:
+            _tape = _snap.tape
+            _stop_factor = get_regime_rule(_tape).stop_tighten_factor
+            if _stop_factor != 1.0:
+                logger.info(
+                    "Regime %s: stops tightened ×%.2f of entry→stop distance",
+                    _tape, _stop_factor,
+                )
+    except Exception:
+        pass
 
     today   = date.today()
     updates: list[dict] = []
@@ -294,7 +330,16 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
         if target_price is None and entry_price and atr_stop and entry_price > atr_stop:
             target_price = entry_price + 2 * (entry_price - atr_stop)
 
-        if atr_stop and current <= atr_stop:
+        # Effective stop: tighten the entry→stop distance by the regime factor
+        # (factor 1.0 → unchanged; 0.5 in BEAR → stop halfway between entry and
+        # original stop, exiting weak positions sooner)
+        try:
+            from quantlab.risk.regime_policy import effective_stop_price
+            effective_stop = effective_stop_price(entry_price, atr_stop, _stop_factor)
+        except Exception:
+            effective_stop = atr_stop
+
+        if effective_stop and current <= effective_stop:
             new_status = "stopped_out"
         elif target_price and current >= target_price:
             new_status = "target_hit"
@@ -329,6 +374,7 @@ def update_watchlist_prices(ib_connection) -> list[dict[str, Any]]:
             "status":        new_status,
             "entry_price":   entry_price,
             "atr_stop":      atr_stop,
+            "effective_stop": effective_stop,
         })
 
     return updates
@@ -380,7 +426,8 @@ _IWL_COLS = [
     "symbol", "first_seen", "last_seen", "consecutive_days", "stage",
     "conviction_score", "entry_price", "options_signal", "volume_dry_up",
     "earnings_score", "peg_score", "breakout_volume_score", "tape", "notes",
-    "updated_at", "explosion_score",
+    "updated_at", "explosion_score", "explosion_components",
+    "conviction_components", "breakout_volume_ratio",
 ]
 
 
@@ -445,12 +492,16 @@ class InstitutionalWatchlist:
         _table = "basing_watchlist" if stage == 1 else "institutional_watchlist"
 
         entry_price     = getattr(scan_result, "entry_close", None)
+        _edgar_accel    = getattr(scan_result, "edgar_acceleration", None)
         earnings_score  = (
-            getattr(scan_result, "edgar_acceleration", None)
-            or getattr(scan_result, "earnings_acceleration", 0.0)
+            _edgar_accel if _edgar_accel is not None
+            else getattr(scan_result, "earnings_acceleration", None)
         )
-        peg_score       = getattr(scan_result, "peg_score", 0.0)
+        # None = not computable — stored as NULL, never coerced to 0.0
+        peg_score       = getattr(scan_result, "peg_score", None)
         bvs             = getattr(scan_result, "breakout_volume_score", 0.0)
+        # Raw Weinstein ratio — None = not measurable, stored as NULL
+        bv_ratio        = getattr(scan_result, "breakout_volume_ratio", None)
         # Volume dry-up proxy: low volume_trend + decent absorption signals drying
         vol_trend       = getattr(scan_result, "volume_trend", 1.0)
         absorption      = getattr(scan_result, "absorption", 0.0)
@@ -459,7 +510,18 @@ class InstitutionalWatchlist:
             getattr(scan_result, "unusual_options_score", 0.0) >= 0.5
             or getattr(scan_result, "options_score", 0.0) >= 0.6
         )
-        explosion_score = getattr(scan_result, "explosion_score", 0.0)
+        explosion_score      = getattr(scan_result, "explosion_score", None)
+        explosion_components = getattr(scan_result, "explosion_components", 0)
+
+        # Raw conviction inputs (JSON) — candidate record keeps the data a
+        # future conviction re-weighting needs
+        components_json = ""
+        try:
+            import json as _json
+            from quantlab.execution import conviction_components as _cc
+            components_json = _json.dumps(_cc(scan_result))
+        except Exception:
+            pass
 
         tape = ""
         try:
@@ -487,17 +549,19 @@ class InstitutionalWatchlist:
                         (symbol, first_seen, last_seen, consecutive_days, stage,
                          conviction_score, entry_price, options_signal, volume_dry_up,
                          earnings_score, peg_score, breakout_volume_score, tape, notes,
-                         updated_at, explosion_score)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', CURRENT_TIMESTAMP, ?)
+                         updated_at, explosion_score, explosion_components,
+                         conviction_components, breakout_volume_ratio)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', CURRENT_TIMESTAMP, ?, ?, ?, ?)
                     """,
                     [
                         symbol, today_str, today_str, consecutive_days, stage,
                         stored_conviction, entry_price, options_signal, volume_dry_up,
                         earnings_score, peg_score, bvs, tape, explosion_score,
+                        explosion_components, components_json, bv_ratio,
                     ],
                 )
             else:
-                prev_days, last_seen = row
+                prev_days, last_seen, prev_opts, prev_updated = row
                 if isinstance(last_seen, str):
                     last_seen = date.fromisoformat(last_seen)
                 elif hasattr(last_seen, "date"):
@@ -530,14 +594,16 @@ class InstitutionalWatchlist:
                         conviction_score=?, entry_price=?, options_signal=?,
                         volume_dry_up=?, earnings_score=?, peg_score=?,
                         breakout_volume_score=?, tape=?, updated_at=CURRENT_TIMESTAMP,
-                        explosion_score=?
+                        explosion_score=?, explosion_components=?,
+                        conviction_components=?, breakout_volume_ratio=?
                     WHERE symbol=?
                     """,
                     [
                         today_str, consecutive_days, stage,
                         stored_conviction, entry_price, options_signal,
                         volume_dry_up, earnings_score, peg_score, bvs, tape,
-                        explosion_score, symbol,
+                        explosion_score, explosion_components, components_json,
+                        bv_ratio, symbol,
                     ],
                 )
             con.close()

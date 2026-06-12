@@ -346,6 +346,48 @@ def score_conviction(result: ScanResult) -> float:
     return max(0.0, min(score, 1.0))
 
 
+def conviction_components(result: "ScanResult") -> dict:
+    """Raw (un-thresholded) values of every conviction input for one symbol.
+
+    score_conviction() collapses these into coarse step contributions, which is
+    why dozens of names saturate at 1.00.  Persisting the raw values with each
+    candidate gives a future re-weighting real data to work from.
+    """
+    return {
+        "regime_bullish":        result.regime_bullish,
+        "news_category":         result.news_category,
+        "news_count":            result.news_count,
+        "news_c_score":          result.news_c_score,
+        "rel_volume":            result.rel_volume,
+        "absorption":            result.absorption,
+        "volume_character":      result.volume_character,
+        "wyckoff_spring":        result.wyckoff_spring,
+        "edgar_acceleration":    result.edgar_acceleration,
+        "earnings_acceleration": result.earnings_acceleration,
+        "accumulation_ratio":    result.accumulation_ratio,
+        "climactic_volume":      result.climactic_volume,
+        "multi_lookback":        result.multi_lookback_confirmed,
+        "unusual_options_score": result.unusual_options_score,
+        "options_score":         result.options_score,
+        "options_conviction":    result.options_conviction,
+        "market_cap_tier":       result.market_cap_tier,
+        "rs_score":              result.rs_score,
+        "rs_percentile":         result.rs_percentile,
+        "breadth_regime_adj":    result.breadth_regime_adj,
+        "macro_regime":          result.macro_regime,
+        "earnings_proximity":    result.earnings_proximity,
+        "stage":                 result.stage,
+        "breakout_volume_score": result.breakout_volume_score,
+        "breakout_volume_ratio": getattr(result, "breakout_volume_ratio", None),
+        "peg_score":             result.peg_score,
+        "eps_growth":            result.eps_growth,
+        "adr_pct":               result.adr_pct,
+        "adr_expansion_rate":    result.adr_expansion_rate,
+        "explosion_score":       result.explosion_score,
+        "explosion_components":  result.explosion_components,
+    }
+
+
 def compute_adr_pct(bars) -> float | None:
     """Average Daily Range % over the last 20 bars.
 

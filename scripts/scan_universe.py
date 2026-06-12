@@ -157,10 +157,12 @@ def main() -> None:
 
         if breadth_snap.tape == "BEAR":
             bear_tape_active = True
-            if args.min_conviction < 0.80:
-                print(f"  WARNING: Bear tape active — "
-                      f"conviction threshold raised to 0.80 (was {args.min_conviction:.2f})")
-                args.min_conviction = 0.80
+            # Scanning continues at the normal threshold in ALL regimes — the
+            # regime exposure gate (quantlab.risk.regime_policy) blocks new
+            # entries in BEAR/CORRECTION at initiation time instead of starving
+            # the watchlist of candidates here.
+            print("  WARNING: Bear tape active — new entries blocked by regime gate; "
+                  "scan/watchlist accumulation continues")
     elif not breadth_snap:
         print("\n  Breadth: no data — run update_breadth.py after market close")
 
@@ -490,9 +492,13 @@ def main() -> None:
     except Exception as _iwl_err:
         print(f"  WARNING: institutional watchlist update failed: {_iwl_err}")
 
-    # ── Paper trading watchlist — strict top-5 filter ─────────────────────────
+    # ── Paper trading watchlist — strict top-5 filter + regime exposure gate ──
     if args.add_to_watchlist:
         from quantlab.watchlist import add_to_watchlist
+        from quantlab.risk.regime_policy import (
+            RegimeGateDecision, apply_regime_gate, get_regime_rule,
+            log_regime_gate,
+        )
 
         # Build IWL state for confirming-signal fields (options, vdu, consecutive_days)
         iwl_state: dict[str, dict] = {}
@@ -504,21 +510,29 @@ def main() -> None:
 
         # Select top-5 using strict qualification + sector concentration cap
         top5 = select_top_candidates(results, iwl_state, _is_common_stock)
-        top5_symbols = {item[0].symbol for item in top5}
 
-        # ── Clean today's watchlist: keep only top-5, drop known non-CS ────────
+        # ── Regime exposure gate ───────────────────────────────────────────────
+        # Scanning and IWL accumulation already happened above in ALL regimes;
+        # this gate governs only position INITIATION (O'Neil/Minervini:
+        # corrections build watchlists, not positions).
+        _tape = breadth_snap.tape if breadth_snap else ""
+        rule = get_regime_rule(_tape)
+        entry_items, suppressed = apply_regime_gate(top5, rule, iwl_state)
+        entry_symbols = {item[0].symbol for item in entry_items}
+
+        # ── Clean today's watchlist: keep only gated entries, drop non-CS ─────
         today_str = date.today().isoformat()
         try:
             import duckdb as _ddb
             from quantlab.storage import DB_PATH as _DB
             _con = _ddb.connect(str(_DB))
 
-            if top5_symbols:
-                _ph = ",".join(["?"] * len(top5_symbols))
+            if entry_symbols:
+                _ph = ",".join(["?"] * len(entry_symbols))
                 _con.execute(
                     f"DELETE FROM watchlist "
                     f"WHERE date_added=? AND status='watching' AND symbol NOT IN ({_ph})",
-                    [today_str, *top5_symbols],
+                    [today_str, *entry_symbols],
                 )
             else:
                 _con.execute(
@@ -548,25 +562,42 @@ def main() -> None:
         except Exception:
             pass
 
-        # ── Add top-5 to paper watchlist (skip if already tracking) ──────────
+        # ── Add gated entries to paper watchlist (skip if already tracking) ──
         added = sum(
-            1 for item in top5
+            1 for item in entry_items
             if item[0].symbol not in already_watching
-            and add_to_watchlist(item[0])
+            and add_to_watchlist(
+                item[0],
+                note=f"regime={_tape or 'UNKNOWN'} size×{rule.size_factor:g}",
+                size_factor=rule.size_factor,
+            )
         )
+
+        decision = RegimeGateDecision(
+            gate_date=today_str,
+            tape=_tape or "UNKNOWN",
+            qualified=len(top5),
+            entered=added,
+            size_factor=rule.size_factor,
+            suppressed=suppressed,
+        )
+        log_regime_gate(decision)
+
         n_qual = len([
             r for r in results
             if r.stage == 2 and _is_common_stock(r.symbol) and r.conviction_score >= 0.70
         ])
         print(f"\nwatchlist → {n_qual} qualifying | top {len(top5)} selected | {added} added")
+        print(f"  regime gate: {decision.summary()}")
         for item in top5:
             r, earn, cdays = item
             iwl_e = iwl_state.get(r.symbol, {})
+            _held = "" if r.symbol in entry_symbols else "  [held back — regime]"
             print(
                 f"  ★ {r.symbol:<8}  conv={r.conviction_score:.2f}  "
                 f"day={cdays}  earn={earn:.2f}  "
                 f"opts={'✓' if iwl_e.get('options_signal') else '–'}  "
-                f"vdu={'✓' if iwl_e.get('volume_dry_up') else '–'}"
+                f"vdu={'✓' if iwl_e.get('volume_dry_up') else '–'}{_held}"
             )
 
 
