@@ -117,6 +117,17 @@ DEFAULT_CONFIG = {
         # deviates more than this fraction from the trailing 10-accepted-build
         # median.  A stale-but-sane universe beats a fresh-but-degenerate one.
         "universe_gate_max_deviation": 0.15,
+        # Growth-stock pre-filter (quantlab.growth_filter): a $1B–$10B / high-ADR
+        # / liquid / growth gate runs BEFORE stage analysis so every downstream
+        # signal sees only the population it was designed for.  Defaults live in
+        # GrowthFilterConfig; this dict supplies OVERRIDES only (any subset of
+        # the dataclass fields).  bypass=True (default) builds the funnel and
+        # persists per-gate values but scans the full universe — flip to False
+        # (or pass --growth-filter on) to scan only growth-qualified names.
+        "growth_filter": {
+            "bypass": True,                 # DEFAULT BYPASS ON — built, inactive
+            "show_excluded_panel": False,   # optional report "tape character" panel
+        },
     },
     "news": {
         "provider_codes": "BRFG+BRFUPDN+DJNL",

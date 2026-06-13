@@ -660,6 +660,39 @@ def _ensure_schema(con) -> None:
         )
     """)
 
+    # Growth-universe pre-filter (2026-06-13): a growth-stock pre-filter runs
+    # BEFORE stage analysis so every downstream signal is computed only on the
+    # $1B–$10B / high-ADR / liquid / growth population the system was designed
+    # for.  Per-gate booleans AND raw computed values are persisted (not just a
+    # symbol list) so the IC monitor and future re-weighting can study them.
+    # bucket ∈ {qualified, unqualified_data, failed_growth, failed_adr,
+    # failed_cap, failed_liquidity}.  market_cap/adr_pct/eps_yoy/rev_yoy are
+    # nullable — NULL = unavailable, never zero (MISSING ≠ ZERO).
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS growth_universe (
+            as_of_date       DATE,
+            symbol           TEXT,
+            market_cap       DOUBLE,
+            adr_pct          DOUBLE,
+            dollar_vol       DOUBLE,
+            price            DOUBLE,
+            eps_yoy          DOUBLE,
+            rev_yoy          DOUBLE,
+            turned_positive  BOOLEAN,
+            rev_accel        BOOLEAN,
+            eps_accel        BOOLEAN,
+            n_quarters       INTEGER,
+            cap_source       TEXT,
+            pass_liquidity   BOOLEAN,
+            pass_cap         BOOLEAN,
+            pass_adr         BOOLEAN,
+            growth_qualified BOOLEAN,
+            bucket           TEXT,
+            created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (as_of_date, symbol)
+        )
+    """)
+
 
 def save_equity_curve_chart(
     equity_curve: list[float],

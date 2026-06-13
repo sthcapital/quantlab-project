@@ -175,6 +175,18 @@ def _ensure_edgar_table(con) -> None:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN gross_margin DOUBLE")
         if "eps_turned_positive" not in cols:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_turned_positive BOOLEAN")
+        # Growth-filter inputs (2026-06-13): the acceleration qualifier needs
+        # the YoY *trend* (latest rate > prior quarter's rate), and the IPO
+        # path needs the raw quarter count.  Persisted so the growth universe
+        # build stays a pure DuckDB read.  NULL = not computed (MISSING ≠ ZERO).
+        if "rev_yoy_accel" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN rev_yoy_accel BOOLEAN")
+        if "eps_yoy_accel" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_yoy_accel BOOLEAN")
+        if "shares_out" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN shares_out DOUBLE")
+        if "n_quarters" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN n_quarters INTEGER")
     except Exception:
         pass
 
@@ -229,6 +241,10 @@ def _save_edgar_cache(
 
         con = duckdb.connect(str(DB_PATH))
         _ensure_edgar_table(con)
+        # Growth-filter inputs derived from the snapshot's YoY history.
+        rev_accel = _is_yoy_accelerating(snap.revenue_yoy_history)
+        eps_accel = _is_yoy_accelerating(snap.eps_yoy_history)
+        n_quarters = len(snap.eps_history or snap.net_income_history) or None
         # RAW period-matched YoY only, uncapped — NULL means not computable
         # (quarantined / turned_positive / no base).  The old QoQ fallback is
         # gone: a Q4→Q1 sequential rate in a column consumers read as YoY was
@@ -239,8 +255,9 @@ def _save_edgar_cache(
                 (symbol, fetch_date, acceleration_score, revenue_growth,
                  eps_growth, consecutive_beats, eps_diluted,
                  adj_eps, adj_eps_yoy_pct, eps_surprise_pct, gross_margin,
-                 eps_turned_positive)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 eps_turned_positive, rev_yoy_accel, eps_yoy_accel,
+                 shares_out, n_quarters)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 symbol,
@@ -255,6 +272,10 @@ def _save_edgar_cache(
                 snap.eps_surprise_pct,
                 snap.gross_margin_trend,
                 snap.eps_turned_positive,
+                rev_accel,
+                eps_accel,
+                snap.shares_out,
+                n_quarters,
             ],
         )
         con.close()

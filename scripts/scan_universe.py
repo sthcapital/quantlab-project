@@ -162,6 +162,11 @@ def main() -> None:
                         help="Secondary lookback for multi-lookback confirmation (default 20)")
     parser.add_argument("--ignore-breadth", action="store_true",
                         help="Skip breadth regime check — don't auto-raise min_conviction")
+    parser.add_argument("--growth-filter", choices=["auto", "on", "off"],
+                        default="auto",
+                        help="Growth pre-filter: 'auto' uses config (default "
+                             "BYPASS ON — built but inactive); 'on' activates "
+                             "(scan only growth-qualified names); 'off' bypasses.")
     args = parser.parse_args()
 
     ensure_dirs()
@@ -226,6 +231,37 @@ def main() -> None:
             symbols = load_universe("sp500_sample")
     else:
         symbols = load_universe(args.universe)
+
+    # ── Growth pre-filter (runs BEFORE stage analysis) ─────────────────────────
+    # Inverts the funnel: a $1B–$10B / high-ADR / liquid / growth pre-filter so
+    # every downstream signal is computed only on the population it was designed
+    # for.  DEFAULT = BYPASS ON (built but inactive) until the qualified list is
+    # reviewed; --growth-filter on/off overrides config for A/B paper trading.
+    if not args.symbols:
+        try:
+            from quantlab.growth_filter import build_growth_universe, GrowthFilterConfig
+            from datetime import date as _gdate
+            _gcfg = GrowthFilterConfig.from_config()
+            if args.growth_filter == "on":
+                from dataclasses import replace as _replace
+                _gcfg = _replace(_gcfg, bypass=False)
+            elif args.growth_filter == "off":
+                from dataclasses import replace as _replace
+                _gcfg = _replace(_gcfg, bypass=True)
+            _gf_syms, _gf_results, _gf_funnel = build_growth_universe(
+                symbols, as_of=_gdate.today(), cfg=_gcfg,
+            )
+            print(f"\n  Growth filter [{'ACTIVE' if not _gcfg.bypass else 'BYPASS'}]: "
+                  f"{_gf_funnel.render()}")
+            if not _gcfg.bypass:
+                if _gf_syms:
+                    symbols = _gf_syms
+                    print(f"  → scanning {len(symbols)} growth-qualified names")
+                else:
+                    print("  → 0 growth-qualified (deep correction?) — "
+                          "scanning continues on full universe for basing/watchlist")
+        except Exception as _gf_exc:
+            print(f"  Growth filter skipped ({_gf_exc})")
 
     start_date = parse_date(args.start)
     end_date = parse_date(args.end)

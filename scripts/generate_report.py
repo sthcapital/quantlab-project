@@ -310,6 +310,8 @@ def _page1(
     warning: str | None = None,
     options_rate: str | None = None,
     regime_gate=None,
+    growth_funnel: str | None = None,
+    excluded_defensives: str | None = None,
 ) -> list:
     tape  = (breadth_snap.tape if breadth_snap else "N/A")
     mcl   = (f"{breadth_snap.mcclellan_oscillator:+.0f}"
@@ -364,6 +366,15 @@ def _page1(
 
     if options_rate:
         e.append(Paragraph(f"<b>{options_rate}</b>", S["body"]))
+        e.append(Spacer(1, 0.1 * inch))
+
+    if growth_funnel:
+        e.append(Paragraph(f"<b>Growth funnel:</b> {growth_funnel}", S["body"]))
+        e.append(Spacer(1, 0.1 * inch))
+
+    if excluded_defensives:
+        e.append(Paragraph(
+            f"<font color='#636e72'><i>{excluded_defensives}</i></font>", S["body"]))
         e.append(Spacer(1, 0.1 * inch))
 
     # ── Tape badge (colored box via single-cell Table) ────────────────────────
@@ -1128,6 +1139,49 @@ def _universe_gate_warning(report_date: date, db_path: str | None = None) -> str
     )
 
 
+def _growth_funnel_line(report_date: date, db_path: str | None = None) -> str | None:
+    """One-line growth pre-filter funnel for the report header, or None.
+
+    Reads the persisted growth_universe rows for ``report_date`` and renders the
+    sequential per-gate counts (binding constraint always visible).  When zero
+    names are growth-qualified — possible in a deep correction — that is stated
+    explicitly rather than hidden; basing/watchlist panels still render below.
+    """
+    try:
+        from quantlab.growth_filter import load_growth_funnel
+        f = load_growth_funnel(report_date, db_path)
+    except Exception:
+        return None
+    if f is None:
+        return None
+    line = f.render()
+    if f.growth_qualified == 0:
+        line += "  —  ZERO growth-qualified (correction tape); see basing/watchlist below"
+    return line
+
+
+def _excluded_defensive_line(report_date: date, db_path: str | None = None) -> str | None:
+    """Optional 'tape character' context: top defensive names the growth filter
+    excluded at a hard gate.  OFF by default — enabled via scanner config
+    growth_filter.show_excluded_panel.  Market context only, never candidates.
+    """
+    try:
+        from quantlab.utils import get_config
+        if not get_config("scanner").get("growth_filter", {}).get("show_excluded_panel", False):
+            return None
+        from quantlab.growth_filter import load_excluded_defensive
+        rows = load_excluded_defensive(report_date, limit=10, db_path=db_path)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    parts = []
+    for r in rows:
+        cap = f"{r['market_cap']/1e9:.0f}B" if r.get("market_cap") else "—"
+        parts.append(f"{r['symbol']} ({cap})")
+    return "Excluded defensives (tape character): " + ", ".join(parts)
+
+
 def _options_pipeline_warning(
     candidates: list[dict],
     basing_cands: list[dict],
@@ -1297,10 +1351,17 @@ def generate(
     # Flag freshness: F fresh / FdN streak rendering in the Opts columns
     freshness_map = _load_options_freshness(report_date, db_path)
 
+    growth_funnel = _growth_funnel_line(report_date, db_path)
+    if growth_funnel:
+        print(f"  growth funnel: {growth_funnel}")
+    excluded_defensives = _excluded_defensive_line(report_date, db_path)
+
     story: list = []
     story += _page1(S, report_date, breadth, len(candidates), n_multi, open_positions,
                     vix_close=vix_close, warning=header_warning,
-                    options_rate=opts_rate, regime_gate=regime_gate)
+                    options_rate=opts_rate, regime_gate=regime_gate,
+                    growth_funnel=growth_funnel,
+                    excluded_defensives=excluded_defensives)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map, revenue_map,
                                   freshness_map=freshness_map, eps_map=eps_map)
