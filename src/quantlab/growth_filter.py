@@ -26,14 +26,18 @@ for.  Two tiers:
   TIER 2 — GROWTH QUALIFICATION (the prey; uses the period-matched EDGAR YoY
   from commit a0c5231 — winsorized, turned_positive flags)
     REVENUE is the qualification gate (the verified-trustworthy signal):
-        revenue YoY ≥ +40%   OR   (turned_positive AND revenue YoY ≥ +20%)
+        revenue YoY ≥ +40%
+        OR  (revenue YoY ≥ +25% AND EPS YoY ≥ +40%)     dual-growth: revenue
+            CONFIRMED by EPS (both required)
+        OR  (turned_positive AND revenue YoY ≥ +15%)    inflection
     A real demand inflection shows up in SALES; EPS crossing zero on flat
     revenue is an accounting blip, so turned_positive qualifies only above the
-    revenue floor.  EPS is REMOVED from qualification — now-correct GAAP EPS
-    still swings 341–900% off small/recovering bases (pool p95 ≈ +341%, often
-    GAAP-recovery artifacts off depressed bases), far too violent to gate on.
-    It becomes a RANKING input only (winsorized eps_yoy in growth_rank): a
-    noisy EPS never admits OR excludes a name.
+    revenue floor.  EPS is never a SOLE qualifier — now-correct GAAP EPS still
+    swings 341–900% off small/recovering bases (pool p95 ≈ +341%, often
+    GAAP-recovery artifacts off depressed bases), far too violent to gate on
+    alone; the dual path admits it ONLY alongside solid revenue (so the
+    GAAP-recovery tail stays out), and it remains a RANKING input (winsorized
+    eps_yoy in growth_rank).  A noisy EPS never admits a name by itself.
     Acceleration (revenue YoY accelerating, latest ≥ +15%) stays a live
     qualifier branch but is DORMANT today — rev_accel/eps_accel are NULL for
     every name (no symbol has ≥5 quarters of stored history yet); it
@@ -89,11 +93,16 @@ class GrowthFilterConfig:
     sector_exclude: tuple[str, ...] = ()
 
     # ── Tier 2: growth qualification — REVENUE is the gate ────────────────────
-    # Qualify on: rev_yoy ≥ rev_yoy_min  OR  (turned_positive AND
-    # rev_yoy ≥ turned_positive_rev_floor).  EPS is NOT a qualifier (it swings
-    # too violently off small bases) — it is a ranking input only.
-    rev_yoy_min: float = 0.40               # revenue YoY ≥ +40% (sole revenue gate)
-    turned_positive_rev_floor: float = 0.20  # turned_positive needs rev YoY ≥ +20%
+    # Qualify on ANY of:
+    #   rev_yoy ≥ rev_yoy_min                              (primary revenue gate)
+    #   rev_yoy ≥ dual_rev_min AND eps_yoy ≥ dual_eps_min  (dual-growth: solid
+    #       revenue CONFIRMED by strong EPS — both required, so EPS still never
+    #       admits a name alone and the GAAP-recovery tail stays excluded)
+    #   turned_positive AND rev_yoy ≥ turned_positive_rev_floor   (inflection)
+    rev_yoy_min: float = 0.40               # revenue YoY ≥ +40% (primary revenue gate)
+    dual_rev_min: float = 0.25              # dual path: revenue YoY ≥ +25% …
+    dual_eps_min: float = 0.40              # … AND EPS YoY ≥ +40% (both required)
+    turned_positive_rev_floor: float = 0.15  # turned_positive needs rev YoY ≥ +15%
     accel_min_yoy: float = 0.15             # accel qualifies at latest YoY ≥ +15%
     accel_min_quarters: int = 5             # ≥5q stored history to compute accel
                                             #   (signal dormant below this)
@@ -213,11 +222,17 @@ def qualify_growth(
     """Tier-2 growth status for a Tier-1 survivor — REVENUE is the gate.
 
     Qualify on:
-        rev_yoy ≥ rev_yoy_min  (≥ +40%)
-        OR  (turned_positive AND rev_yoy ≥ turned_positive_rev_floor)  (≥ +20%)
+        rev_yoy ≥ rev_yoy_min  (≥ +40%)                          primary gate
+        OR  (rev_yoy ≥ dual_rev_min AND eps_yoy ≥ dual_eps_min)  dual-growth:
+            solid revenue (≥ +25%) CONFIRMED by strong EPS (≥ +40%).  BOTH are
+            required, so EPS still never admits a name alone and the
+            GAAP-recovery tail (high EPS off a depressed base, weak revenue)
+            stays excluded.
+        OR  (turned_positive AND rev_yoy ≥ turned_positive_rev_floor)  (≥ +15%)
         OR  revenue acceleration (rev_accel AND rev_yoy ≥ accel_min_yoy) — a
             live branch but DORMANT today (rev_accel is NULL for every name).
-    EPS is NOT a qualifier — too noisy off small bases (ranking input only).
+    EPS is never a SOLE qualifier — too noisy off small bases; it only confirms
+    real revenue (dual path) and contributes to ranking.
 
     Returns ``(bucket, reasons)`` with bucket ∈ {qualified, unqualified_data,
     failed_growth}.  unqualified_data means the REVENUE gate input is
@@ -245,6 +260,13 @@ def qualify_growth(
     reasons: list[str] = []
     if facts.rev_yoy >= cfg.rev_yoy_min:
         reasons.append("rev")
+    # Dual-growth: solid revenue confirmed by strong EPS — BOTH required, so EPS
+    # never admits a name on its own and the GAAP-recovery tail (strong EPS off a
+    # depressed base, weak revenue) stays excluded.
+    if (facts.eps_yoy is not None
+            and facts.rev_yoy >= cfg.dual_rev_min
+            and facts.eps_yoy >= cfg.dual_eps_min):
+        reasons.append("dual")
     if facts.turned_positive and facts.rev_yoy >= cfg.turned_positive_rev_floor:
         reasons.append("turned_positive")
     # Revenue acceleration — live qualifier branch, DORMANT today: rev_accel is

@@ -114,14 +114,40 @@ class TestBucketOrdering:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestGrowthQualification:
-    """REVENUE is the sole qualification gate (EPS removed — ranking input only):
-    rev_yoy ≥ +40%  OR  (turned_positive AND rev_yoy ≥ +20%)  OR  rev acceleration.
+    """REVENUE is the gate; EPS only CONFIRMS revenue (never qualifies alone):
+        rev_yoy ≥ +40%
+        OR  (rev_yoy ≥ +25% AND eps_yoy ≥ +40%)        dual-growth
+        OR  (turned_positive AND rev_yoy ≥ +15%)        inflection
+        OR  revenue acceleration.
     """
 
-    def test_eps_yoy_no_longer_qualifies(self):
-        # EPS is a ranking input, NOT a qualifier: a high EPS with sub-gate
-        # revenue and no inflection fails growth (it never admits a name).
+    def test_eps_alone_never_qualifies(self):
+        # EPS never admits a name on its own: a huge EPS with sub-gate revenue
+        # (the GAAP-recovery tail) fails growth — dual needs revenue ≥ +25% too.
         b, _ = qualify_growth(_facts(eps_yoy=3.40, rev_yoy=0.05), CFG)
+        assert b == FAILED_GROWTH
+
+    def test_dual_growth_qualifies(self):
+        # Solid revenue (+34%) CONFIRMED by strong EPS (+90%) → dual path
+        # (AXON on 2026-06-12: below the +40% primary gate, but real dual growth).
+        b, reasons = qualify_growth(_facts(rev_yoy=0.34, eps_yoy=0.90), CFG)
+        assert b == QUALIFIED and "dual" in reasons
+
+    def test_dual_growth_boundary_qualifies(self):
+        # Exactly at both floors: rev +25% AND eps +40%.
+        b, reasons = qualify_growth(_facts(rev_yoy=0.25, eps_yoy=0.40), CFG)
+        assert b == QUALIFIED and "dual" in reasons
+
+    def test_dual_needs_eps_confirmation(self):
+        # Revenue clears the dual floor (+26.5%) but EPS (+23.6%) is below the
+        # +40% confirmation → no dual, not turned_positive → fails (DUOL case).
+        b, _ = qualify_growth(_facts(rev_yoy=0.265, eps_yoy=0.236), CFG)
+        assert b == FAILED_GROWTH
+
+    def test_dual_needs_revenue_floor(self):
+        # Strong EPS (+80%) but revenue only +20% (< +25% dual floor) → no dual
+        # (EPS must confirm REAL revenue, not rescue a weak top line).
+        b, _ = qualify_growth(_facts(rev_yoy=0.20, eps_yoy=0.80), CFG)
         assert b == FAILED_GROWTH
 
     def test_revenue_yoy_qualifies_at_40pct(self):
@@ -139,17 +165,24 @@ class TestGrowthQualification:
         assert b == FAILED_GROWTH
 
     def test_turned_positive_with_revenue_floor_qualifies(self):
-        # turned_positive qualifies only WITH a revenue floor (rev ≥ +20%): a
+        # turned_positive qualifies only WITH a revenue floor (rev ≥ +15%): a
         # real inflection shows up in sales.
         b, reasons = qualify_growth(
             _facts(eps_yoy=None, rev_yoy=0.25, turned_positive=True), CFG)
         assert b == QUALIFIED and "turned_positive" in reasons
 
-    def test_turned_positive_below_revenue_floor_fails(self):
-        # turned positive but revenue only +17% (< +20% floor): an accounting
-        # blip on flat sales, not demand-driven growth (DKNG on 2026-06-12).
-        b, _ = qualify_growth(
+    def test_turned_positive_at_lowered_floor_qualifies(self):
+        # Floor lowered 0.20 → 0.15: turned positive with revenue +17% now
+        # qualifies (DKNG on 2026-06-12: rev +16.8%, EPS turned positive).
+        b, reasons = qualify_growth(
             _facts(eps_yoy=None, rev_yoy=0.17, turned_positive=True), CFG)
+        assert b == QUALIFIED and "turned_positive" in reasons
+
+    def test_turned_positive_below_revenue_floor_fails(self):
+        # turned positive but revenue only +12% (< +15% floor): an accounting
+        # blip on flat sales, not demand-driven growth.
+        b, _ = qualify_growth(
+            _facts(eps_yoy=None, rev_yoy=0.12, turned_positive=True), CFG)
         assert b == FAILED_GROWTH
 
     def test_turned_positive_without_revenue_data_is_unqualified(self):
@@ -362,10 +395,12 @@ class TestConfig:
 
     def test_growth_qualification_thresholds(self):
         c = GrowthFilterConfig()
-        assert c.rev_yoy_min == 0.40              # sole revenue gate
-        assert c.turned_positive_rev_floor == 0.20
+        assert c.rev_yoy_min == 0.40              # primary revenue gate
+        assert c.dual_rev_min == 0.25             # dual-growth revenue floor …
+        assert c.dual_eps_min == 0.40             # … AND EPS confirmation
+        assert c.turned_positive_rev_floor == 0.15  # lowered 0.20 → 0.15
         assert c.accel_min_quarters == 5
-        # EPS is no longer a qualifier — its config threshold is gone
+        # EPS still never qualifies ALONE — there is no standalone EPS threshold
         assert not hasattr(c, "eps_yoy_min")
 
     def test_revenue_weighted_at_least_as_heavily_as_eps(self):
