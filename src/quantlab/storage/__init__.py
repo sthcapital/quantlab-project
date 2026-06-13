@@ -693,6 +693,39 @@ def _ensure_schema(con) -> None:
         )
     """)
 
+    # Closed-position journal (2026-06-13): final state of every flattened
+    # paper position — entry/exit/R-multiple/P&L/days held + reason — recorded
+    # BEFORE the watchlist row is marked closed, so the audit trail survives.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS closed_positions (
+            symbol        TEXT,
+            entry_date    DATE,
+            exit_date     DATE,
+            entry_price   DOUBLE,
+            exit_price    DOUBLE,
+            atr_stop      DOUBLE,
+            r_multiple    DOUBLE,
+            pnl_pct       DOUBLE,
+            days_held     INTEGER,
+            reason        TEXT,
+            closed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (symbol, exit_date)
+        )
+    """)
+
+    # Watchlist purge log (2026-06-13): auditable record of every
+    # institutional_watchlist entry removed by a growth-universe purge —
+    # one row per (purge_date, symbol) captures the full removed list + reason.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS watchlist_purge_log (
+            purge_date    DATE,
+            symbol        TEXT,
+            reason        TEXT,
+            logged_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (purge_date, symbol)
+        )
+    """)
+
 
 def save_equity_curve_chart(
     equity_curve: list[float],
