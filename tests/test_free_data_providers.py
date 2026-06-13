@@ -333,15 +333,17 @@ class TestEdgar:
         ticker_data = {
             "0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."},
         }
+        # Duration-explicit extraction requires period start dates (real
+        # companyfacts always carry them for income-statement facts)
         eps_obs = [
-            {"end": "2025-03-31", "val": 1.52, "form": "10-Q", "filed": "2025-05-01"},
-            {"end": "2025-06-30", "val": 1.65, "form": "10-Q", "filed": "2025-08-01"},
-            {"end": "2025-09-30", "val": 1.82, "form": "10-Q", "filed": "2025-11-01"},
+            {"start": "2025-01-01", "end": "2025-03-31", "val": 1.52, "form": "10-Q", "filed": "2025-05-01"},
+            {"start": "2025-04-01", "end": "2025-06-30", "val": 1.65, "form": "10-Q", "filed": "2025-08-01"},
+            {"start": "2025-07-01", "end": "2025-09-30", "val": 1.82, "form": "10-Q", "filed": "2025-11-01"},
         ]
         ni_obs = [
-            {"end": "2025-03-31", "val": 24780000000, "form": "10-Q", "filed": "2025-05-01"},
-            {"end": "2025-06-30", "val": 26870000000, "form": "10-Q", "filed": "2025-08-01"},
-            {"end": "2025-09-30", "val": 29600000000, "form": "10-Q", "filed": "2025-11-01"},
+            {"start": "2025-01-01", "end": "2025-03-31", "val": 24780000000, "form": "10-Q", "filed": "2025-05-01"},
+            {"start": "2025-04-01", "end": "2025-06-30", "val": 26870000000, "form": "10-Q", "filed": "2025-08-01"},
+            {"start": "2025-07-01", "end": "2025-09-30", "val": 29600000000, "form": "10-Q", "filed": "2025-11-01"},
         ]
         facts_data = {
             "facts": {

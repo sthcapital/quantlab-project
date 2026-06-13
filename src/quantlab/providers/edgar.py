@@ -105,6 +105,10 @@ class FundamentalSnapshot:
     eps_yoy_history: list[float] = field(default_factory=list)      # last 4 quarters, oldest-first
     # True when BOTH revenue AND eps YoY growth rates are increasing for 2+ consecutive quarters
     is_accelerating: bool = False
+    # Negative→positive EPS transition on the latest quarter: a max-strength
+    # earnings event stored as NULL% + this flag (a percentage of a negative
+    # base is meaningless — SNDK -0.30 → +23.41 is the canonical case)
+    eps_turned_positive: bool = False
     # Adjusted (non-GAAP) EPS from most recent 8-K press release (Exhibit 99.1)
     adj_eps: Optional[float] = None
     adj_eps_yoy_pct: Optional[float] = None   # (current - prior) / abs(prior)
@@ -169,6 +173,8 @@ def _ensure_edgar_table(con) -> None:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_surprise_pct DOUBLE")
         if "gross_margin" not in cols:
             con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN gross_margin DOUBLE")
+        if "eps_turned_positive" not in cols:
+            con.execute("ALTER TABLE edgar_fundamentals ADD COLUMN eps_turned_positive BOOLEAN")
     except Exception:
         pass
 
@@ -223,35 +229,32 @@ def _save_edgar_cache(
 
         con = duckdb.connect(str(DB_PATH))
         _ensure_edgar_table(con)
-        # Prefer YoY growth rates; fall back to QoQ; NULL when neither exists.
-        _rev_growth = (
-            snap.revenue_yoy_pct if snap.revenue_yoy_pct is not None
-            else snap.revenue_qoq_growth
-        )
-        _eps_growth = (
-            snap.eps_yoy_pct if snap.eps_yoy_pct is not None
-            else snap.eps_qoq_growth
-        )
+        # RAW period-matched YoY only, uncapped — NULL means not computable
+        # (quarantined / turned_positive / no base).  The old QoQ fallback is
+        # gone: a Q4→Q1 sequential rate in a column consumers read as YoY was
+        # itself a silent lie, and it backfilled quarantined values.
         con.execute(
             """
             INSERT OR REPLACE INTO edgar_fundamentals
                 (symbol, fetch_date, acceleration_score, revenue_growth,
                  eps_growth, consecutive_beats, eps_diluted,
-                 adj_eps, adj_eps_yoy_pct, eps_surprise_pct, gross_margin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 adj_eps, adj_eps_yoy_pct, eps_surprise_pct, gross_margin,
+                 eps_turned_positive)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 symbol,
                 date.today().isoformat(),
                 acceleration_score,
-                _rev_growth,
-                _eps_growth,
+                snap.revenue_yoy_pct,
+                snap.eps_yoy_pct,
                 consecutive_beats,
                 snap.eps_diluted,
                 snap.adj_eps,
                 snap.adj_eps_yoy_pct,
                 snap.eps_surprise_pct,
                 snap.gross_margin_trend,
+                snap.eps_turned_positive,
             ],
         )
         con.close()
@@ -261,22 +264,48 @@ def _save_edgar_cache(
 
 # ── Fundamental data fetching ─────────────────────────────────────────────────
 
-def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
-    """Extract up to `periods` quarterly values for a metric. Returns oldest-first.
+# Discrete fiscal quarter: a fact spanning ~3 months.  XBRL quarters run
+# 84–98 days in practice (4-4-5 calendars included); the window tolerates
+# leap/holiday drift without admitting 6-month YTD spans (~181 days).
+_QTR_DUR_MIN = 80
+_QTR_DUR_MAX = 100
 
-    Annual periods (duration > 120 days) are excluded so that 10-K full-year
-    totals — which EDGAR XBRL often reports alongside Q4 quarterly values under
-    the same period-end date — do not contaminate the quarterly history used for
-    YoY growth calculations.
+
+def _extract_quarterly_dated(
+    facts: dict, metric: str, periods: int,
+) -> list[tuple[date, float]]:
+    """
+    Extract up to ``periods`` DISCRETE quarterly values as (period_end, value),
+    oldest first.
+
+    Selection is by explicit duration, not by exclusion: a quarterly value
+    must come from a fact whose span is ~3 months (80–100 days).  Where a
+    quarter exists only inside YTD cumulatives — Q2/Q3 in many 10-Qs, and Q4
+    which most 10-Ks report only as the full-year total — the discrete
+    quarter is DERIVED by subtracting successive same-fiscal-year YTD facts
+    (facts sharing the same period start), accepting the difference only
+    when the implied span is itself ~3 months.  Grouping by exact start date
+    makes fiscal years that don't align to calendar quarters (CRDO: April
+    FYE; UNFI: early-August FYE) work without special cases.
+
+    2026-06-12 incident: the old end-date-keyed, position-aligned pipeline
+    silently dropped Q4s (no discrete fact in 10-Ks) and then compared
+    history[i] vs history[i-4] BY POSITION — with a quarter missing, "4 back"
+    is not the same fiscal quarter, producing AEIS Rev +167.5% (actual +26%)
+    and the wall of saturated EPS scores.
     """
     gaap_fields = _GAAP_FIELDS.get(metric, [])
     us_gaap = facts.get("us-gaap", {})
 
+    # Build a candidate series per GAAP tag, then choose the FRESHEST one —
+    # companies switch tags over time (UNFI: "Revenues" died in 2019, current
+    # data lives under RevenueFromContractWithCustomerExcludingAssessedTax);
+    # taking the first tag with any data can return a years-stale history.
+    best: list[tuple[date, float]] = []
     for field_name in gaap_fields:
         if field_name not in us_gaap:
             continue
         units = us_gaap[field_name].get("units", {})
-        # EPS fields use "USD/shares" (dollars per share); revenue/income use "USD".
         unit_data = (
             units.get("USD")
             or units.get("USD/shares")
@@ -286,43 +315,93 @@ def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
         if not unit_data:
             continue
 
-        quarterly = []
-        for obs in unit_data:
+        # Parse + dedupe by exact (start, end) span, keeping the latest filing
+        spans: dict[tuple[date, date], float] = {}
+        for obs in sorted(unit_data, key=lambda x: x.get("filed", "")):
             if obs.get("form") not in ("10-Q", "10-K"):
                 continue
-            if not obs.get("end"):
+            if not obs.get("start") or not obs.get("end"):
                 continue
-            # Duration filter: skip annual/semi-annual periods.
-            # Quarterly ≈ 60-105 days; annual ≈ 365 days.  Threshold 120 days
-            # correctly separates them while tolerating calendar irregularities.
-            # Only applied when "start" is present (instant balance-sheet facts
-            # such as Assets and SharesOutstanding have no "start" field).
-            if obs.get("start"):
-                try:
-                    duration = (
-                        date.fromisoformat(obs["end"])
-                        - date.fromisoformat(obs["start"])
-                    ).days
-                    if duration > 120:
-                        continue  # annual or semi-annual — exclude
-                except (ValueError, KeyError):
-                    pass  # malformed dates — keep conservatively
-            quarterly.append(obs)
+            try:
+                s = date.fromisoformat(obs["start"])
+                e = date.fromisoformat(obs["end"])
+            except ValueError:
+                continue
+            if (e - s).days > 372:
+                continue   # multi-year span — never useful here
+            spans[(s, e)] = float(obs["val"])
 
-        if not quarterly:
+        if not spans:
             continue
 
-        # Deduplicate by period end (keep latest filing per end date)
+        # 1) Direct discrete quarters (~3-month spans)
+        quarters: dict[date, float] = {}
+        for (s, e), v in spans.items():
+            if _QTR_DUR_MIN <= (e - s).days <= _QTR_DUR_MAX:
+                quarters[e] = v
+
+        # 2) Derive missing quarters from same-start YTD ladders:
+        #    Q2 = 6mo−Q1(3mo facts share the FY start), Q3 = 9mo−6mo,
+        #    Q4 = FY−9mo.  Same start date ⇒ same fiscal year by construction.
+        by_start: dict[date, list[tuple[date, float]]] = {}
+        for (s, e), v in spans.items():
+            by_start.setdefault(s, []).append((e, v))
+        for s, ladder in by_start.items():
+            ladder.sort()
+            for (e1, v1), (e2, v2) in zip(ladder, ladder[1:]):
+                if e2 in quarters:
+                    continue   # discrete fact exists — always preferred
+                if _QTR_DUR_MIN <= (e2 - e1).days <= _QTR_DUR_MAX:
+                    quarters[e2] = v2 - v1
+
+        if not quarters:
+            continue
+
+        dated = sorted(quarters.items())
+        if not best or dated[-1][0] > best[-1][0] or (
+            dated[-1][0] == best[-1][0] and len(dated) > len(best)
+        ):
+            best = dated
+
+    return best[-periods:]
+
+
+def _extract_periods(facts: dict, metric: str, periods: int) -> list[float]:
+    """Extract up to `periods` quarterly values for a metric. Returns oldest-first.
+
+    Duration metrics (revenue, EPS, income…) go through the duration-explicit
+    quarterly extraction (see _extract_quarterly_dated).  Instant balance-sheet
+    metrics (assets, shares outstanding…) have no period start and are keyed
+    by end date as before.
+    """
+    dated = _extract_quarterly_dated(facts, metric, periods)
+    if dated:
+        return [v for _, v in dated]
+
+    # Instant-fact fallback (no "start" field): assets, shares outstanding…
+    gaap_fields = _GAAP_FIELDS.get(metric, [])
+    us_gaap = facts.get("us-gaap", {})
+    for field_name in gaap_fields:
+        if field_name not in us_gaap:
+            continue
+        units = us_gaap[field_name].get("units", {})
+        unit_data = (
+            units.get("USD")
+            or units.get("USD/shares")
+            or units.get("shares")
+            or units.get("pure")
+        )
+        if not unit_data:
+            continue
         seen: dict[str, float] = {}
-        for obs in sorted(quarterly, key=lambda x: (x["end"], x.get("filed", ""))):
-            seen[obs["end"]] = obs["val"]
-
-        values = [seen[k] for k in sorted(seen.keys())]
-        # Secondary defense: remove any value that is >2.5x both its neighbors.
-        # Annual totals that slip through the duration filter are ~4x quarterly.
-        values = _remove_annual_outliers(values)
-        return values[-periods:]
-
+        for obs in sorted(unit_data, key=lambda x: (x.get("end", ""), x.get("filed", ""))):
+            if obs.get("form") not in ("10-Q", "10-K"):
+                continue
+            if not obs.get("end") or obs.get("start"):
+                continue
+            seen[obs["end"]] = float(obs["val"])
+        if seen:
+            return [seen[k] for k in sorted(seen)][-periods:]
     return []
 
 
@@ -383,6 +462,120 @@ def _qoq_growth(history: list[float]) -> Optional[float]:
 # items, so both tails are capped and the raw inputs logged for diagnosis.
 YOY_OUTLIER_HI = 2.0
 YOY_OUTLIER_LO = -0.90
+
+# Quarantine bound for residual suspect YoY values: beyond ±1000% the inputs
+# are almost certainly a data artifact (period mismatch survivor, restated
+# base, near-zero denominator).  Quarantined values are stored as NULL with
+# the raw inputs logged — clamping would convert "data problem" into a
+# plausible lie.
+YOY_QUARANTINE = 10.0
+
+# Materiality floors for the YoY denominator: a base below these cannot
+# support a growth-rate claim (quarantined, not computed).
+_EPS_MIN_BASE = 0.05       # $0.05/share
+_REV_MIN_BASE = 1_000_000  # $1M quarterly revenue
+
+
+def winsorize_yoy(rate: Optional[float], cap: Optional[float] = None) -> Optional[float]:
+    """
+    Winsorize a raw YoY rate for SCORING consumption (None → scanner config
+    ``yoy_winsorize``, default 3.0 = ±300%).  Storage stays raw/uncapped;
+    only score inputs are clamped so one extreme print cannot dominate a
+    composite.  None passes through (MISSING ≠ ZERO).
+    """
+    if rate is None:
+        return None
+    if cap is None:
+        try:
+            from quantlab.utils import get_config
+            cap = float(get_config("scanner").get("yoy_winsorize", 3.0))
+        except Exception:
+            cap = 3.0
+    return max(-cap, min(cap, rate))
+
+
+def _dated_yoy_series(
+    dated: list[tuple[date, float]],
+    max_quarters: int = 4,
+    label: str = "",
+    min_base: float = 0.0,
+) -> tuple[list[float], Optional[float], bool]:
+    """
+    Period-matched year-over-year growth from a dated quarterly series.
+
+    For each quarter the comparison base is the entry whose period end is
+    330–400 days earlier (closest to 365) — the SAME fiscal quarter one year
+    before, regardless of gaps in the series.  Position-based alignment
+    (history[i] vs history[i-4]) is exactly what corrupted AEIS/UNFI when a
+    quarter was missing.
+
+    Semantics:
+        base >  min_base            → raw uncapped rate
+        base ≤ 0, current > 0       → None + turned_positive (max-strength
+                                       earnings event, not a percentage)
+        base ≤ 0, current ≤ 0       → None (sign math is meaningless)
+        0 < base < min_base         → None, raw inputs logged (quarantine —
+                                       denominator too small to trust)
+        |rate| > YOY_QUARANTINE     → None, raw inputs logged (quarantine)
+
+    Returns:
+        (rates, latest_rate, latest_turned_positive) — ``rates`` contains the
+        computable rates oldest-first (Nones omitted) for trend/acceleration
+        use; ``latest_rate`` is the most recent quarter's rate (None when
+        not computable); ``latest_turned_positive`` flags a negative→positive
+        transition on the most recent quarter.
+    """
+    rates: list[float] = []
+    latest_rate: Optional[float] = None
+    latest_tp = False
+
+    for i, (end_i, curr) in enumerate(dated):
+        base = None
+        best_gap = None
+        for end_j, prior in dated[:i]:
+            gap = (end_i - end_j).days
+            if 330 <= gap <= 400 and (best_gap is None or abs(gap - 365) < abs(best_gap - 365)):
+                base, best_gap = prior, gap
+        is_latest = i == len(dated) - 1
+
+        if base is None:
+            continue
+        if base <= 0:
+            if is_latest:
+                latest_rate = None
+                latest_tp = curr > 0
+            continue
+        if base < min_base:
+            logger.warning(
+                "YoY quarantine %s: base %.4f below materiality floor "
+                "(current=%.4f end=%s) — stored NULL",
+                label or "(unlabelled)", base, curr, end_i,
+            )
+            if is_latest:
+                latest_rate, latest_tp = None, False
+            continue
+
+        rate = (curr - base) / base
+        if abs(rate) > YOY_QUARANTINE:
+            logger.warning(
+                "YoY quarantine %s: rate=%+.0f%% current=%s prior_year=%s "
+                "end=%s — stored NULL (suspect inputs, not clamped)",
+                label or "(unlabelled)", rate * 100, curr, base, end_i,
+            )
+            if is_latest:
+                latest_rate, latest_tp = None, False
+            continue
+
+        if rate > YOY_OUTLIER_HI or rate < YOY_OUTLIER_LO:
+            logger.info(
+                "YoY large move %s: rate=%+.1f%% current=%s prior_year=%s end=%s",
+                label or "(unlabelled)", rate * 100, curr, base, end_i,
+            )
+        rates.append(rate)
+        if is_latest:
+            latest_rate = rate
+
+    return rates[-max_quarters:], latest_rate, latest_tp
 
 
 def _yoy_growth_series(
@@ -481,34 +674,43 @@ def fetch_fundamentals(
 
     _rev_history: list[float] = []
     if "revenue" in metrics:
-        h = _extract_periods(facts, "revenue", effective_periods)
-        h = _remove_annual_outliers(h)  # secondary defense: re-checks endpoints missed inside _extract_periods
+        dated = _extract_quarterly_dated(facts, "revenue", effective_periods)
+        h = [v for _, v in dated]
+        # NOTE: _remove_annual_outliers is deliberately NOT applied — duration-
+        # explicit selection makes it unnecessary, and it would delete real
+        # hypergrowth quarters (SNDK revenue 3.5× its neighbors is genuine).
         if h:
             _rev_history = h
             snap.revenue = h[-1]
             snap.revenue_qoq_growth = _qoq_growth(h)
-            snap.revenue_yoy_history = _yoy_growth_series(h, label=f"{ticker}.revenue")
-            snap.revenue_yoy_pct = (
-                snap.revenue_yoy_history[-1] if snap.revenue_yoy_history else None
+            rates, latest, _ = _dated_yoy_series(
+                dated, label=f"{ticker}.revenue", min_base=_REV_MIN_BASE,
             )
+            snap.revenue_yoy_history = rates
+            snap.revenue_yoy_pct = latest
 
+    _ni_dated: list[tuple[date, float]] = []
     if "net_income" in metrics:
-        h = _extract_periods(facts, "net_income", effective_periods)
+        _ni_dated = _extract_quarterly_dated(facts, "net_income", effective_periods)
+        h = [v for _, v in _ni_dated]
         if h:
             snap.net_income = h[-1]
             snap.net_income_history = h
             snap.net_income_qoq_growth = _qoq_growth(h)
 
     if "eps_diluted" in metrics:
-        h = _extract_periods(facts, "eps_diluted", effective_periods)
+        dated = _extract_quarterly_dated(facts, "eps_diluted", effective_periods)
+        h = [v for _, v in dated]
         if h:
             snap.eps_diluted = h[-1]
             snap.eps_history = h
             snap.eps_qoq_growth = _qoq_growth(h)
-            snap.eps_yoy_history = _yoy_growth_series(h, label=f"{ticker}.eps")
-            snap.eps_yoy_pct = (
-                snap.eps_yoy_history[-1] if snap.eps_yoy_history else None
+            rates, latest, tp = _dated_yoy_series(
+                dated, label=f"{ticker}.eps", min_base=_EPS_MIN_BASE,
             )
+            snap.eps_yoy_history = rates
+            snap.eps_yoy_pct = latest
+            snap.eps_turned_positive = tp
 
     if "total_assets" in metrics:
         h = _extract_periods(facts, "total_assets", effective_periods)
@@ -542,9 +744,9 @@ def fetch_fundamentals(
 
     # is_accelerating: both revenue AND eps YoY growth rates increasing for 2+ quarters.
     # Falls back to net_income YoY when eps data is unavailable.
-    _eps_yoy = snap.eps_yoy_history or _yoy_growth_series(
-        snap.net_income_history, label=f"{ticker}.net_income"
-    )
+    _eps_yoy = snap.eps_yoy_history or _dated_yoy_series(
+        _ni_dated, label=f"{ticker}.net_income"
+    )[0]
     _rev_yoy = snap.revenue_yoy_history
     snap.is_accelerating = (
         bool(_rev_yoy) and bool(_eps_yoy)
@@ -1177,19 +1379,19 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> Optional[float]:
         +0.10 — acceleration trend on top of the above band
         ±0.05/0.10/0.20/0.30 — revenue quality modifier
     """
-    # ── Ensure EPS YoY is computed when not pre-filled ────────────────────────
-    # eps_yoy_history is empty when < 5 EDGAR periods are available OR when the
-    # GAAP field was not found on the first fetch pass.  If eps_history has 5+
-    # values, compute a direct same-quarter YoY: current vs 4 periods back.
-    # Write the result back to snap.eps_yoy_pct so _save_edgar_cache persists it.
-    if not snap.eps_yoy_history and len(snap.eps_history) >= 5:
-        _curr  = snap.eps_history[-1]
-        _prior = snap.eps_history[-5]   # same fiscal quarter, prior year
-        if abs(_prior) >= 1e-9:
-            _eps_yoy_direct = round((_curr - _prior) / abs(_prior), 6)
-            snap.eps_yoy_history = [_eps_yoy_direct]
-            if snap.eps_yoy_pct is None:
-                snap.eps_yoy_pct = _eps_yoy_direct
+    # NOTE: the old positional backfill (eps_history[-1] vs eps_history[-5])
+    # is gone — "5 back" in a list with missing quarters is NOT the same
+    # fiscal quarter (the 2026-06-12 AEIS/UNFI corruption).  YoY now comes
+    # exclusively from the period-matched _dated_yoy_series in fetch.
+
+    # ── Turned-positive: negative→positive EPS is a max-strength earnings
+    # event (stored as NULL% — a rate off a negative base is meaningless).
+    # It qualifies as the top band wherever "EPS YoY ≥ X%" is evaluated.
+    if snap.eps_turned_positive:
+        bonus = 0.10 if snap.is_accelerating else 0.0
+        rev_mod = _revenue_quality_modifier(winsorize_yoy(snap.revenue_yoy_pct))
+        gm_mod  = _gross_margin_modifier(snap.gross_margin_trend)
+        return round(min(1.0, max(0.0, 1.0 + bonus + rev_mod + gm_mod)), 4)
 
     # ── YoY path (preferred when ≥ 5 quarters of data available) ─────────────
     # Prefer adjusted EPS YoY (non-GAAP, from 8-K press release) over GAAP eps_yoy;
@@ -1199,7 +1401,9 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> Optional[float]:
     else:
         yoy_history = snap.eps_yoy_history or snap.revenue_yoy_history
     if yoy_history:
-        latest_yoy = yoy_history[-1]
+        # Winsorized at scoring time (config yoy_winsorize, default ±300%);
+        # the stored value stays raw
+        latest_yoy = winsorize_yoy(yoy_history[-1])
         if latest_yoy <= 0:
             base = 0.0
         elif latest_yoy < 0.20:
@@ -1213,7 +1417,7 @@ def compute_earnings_acceleration(snap: FundamentalSnapshot) -> Optional[float]:
         else:
             base = 1.0   # >100%  — explosive
         bonus = 0.10 if snap.is_accelerating else 0.0
-        rev_mod = _revenue_quality_modifier(snap.revenue_yoy_pct)
+        rev_mod = _revenue_quality_modifier(winsorize_yoy(snap.revenue_yoy_pct))
         gm_mod  = _gross_margin_modifier(snap.gross_margin_trend)
         return round(min(1.0, max(0.0, base + bonus + rev_mod + gm_mod)), 4)
 

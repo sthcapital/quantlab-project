@@ -104,6 +104,10 @@ DEFAULT_CONFIG = {
         # Flag-episode lapse: unflagged for this many gated sessions ends the
         # episode; a later re-flag starts a new one (new first_flagged_date).
         "options_flag_episode_lapse_sessions": 3,
+        # YoY winsorization for SCORING consumers (ExplosionScore earnings
+        # component, conviction layers, growth filters): raw values are
+        # stored uncapped; score inputs clamp to ±this (3.0 = ±300%).
+        "yoy_winsorize": 3.0,
         # Universe build stability (2026-06-12 incident: builds against
         # partial-day Polygon grouped data produced 457–2,325 symbol swings).
         # Floor on raw grouped-ticker count — below this the response is

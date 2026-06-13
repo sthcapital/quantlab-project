@@ -151,6 +151,19 @@ def main() -> None:
     args = parser.parse_args()
 
     symbols = load_universe(args.universe)
+    if args.universe == "tradeable" and len(symbols) < 100:
+        # load_universe falls back to a 50-name static list when no cache
+        # exists for TODAY — but since the completed-session resolver the
+        # universe cache is keyed by DATA date (yesterday on a live system).
+        # Walk back to the most recent cached tradeable universe instead.
+        from quantlab.universe import load_universe_cache
+        for back in range(1, 8):
+            cached = load_universe_cache(date.today() - timedelta(days=back))
+            if cached and cached[0]:
+                symbols = cached[0]
+                print(f"  Using cached tradeable universe from "
+                      f"{date.today() - timedelta(days=back)} ({len(symbols)} symbols)")
+                break
     if args.limit:
         symbols = symbols[: args.limit]
 

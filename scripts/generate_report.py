@@ -243,23 +243,40 @@ def _bv_ratio(v) -> str:
         return "—"
 
 
-def _rev_pct(v) -> str:
-    """Format revenue_growth for display; suppress outliers in BOTH tails as 'N/A'.
+# Display overflow cap for YoY percentages: beyond ±999% the precise figure
+# carries no signal at table resolution.  Data-quality suppression happens
+# UPSTREAM (quarantine → NULL → "—"); display only handles overflow, so real
+# hypergrowth (SNDK Rev +251%) renders as the number it is.
+_YOY_DISPLAY_CAP = 9.99
 
-    Bounds come from quantlab.providers.edgar (YOY_OUTLIER_HI/LO): growth above
-    +200% or decline beyond −90% is treated as a data artifact (period mismatch
-    or one-off prior-year item), not a real reading.  Missing renders as "—".
-    """
+
+def _rev_pct(v) -> str:
+    """Format raw revenue YoY: '—' for missing/quarantined, '>999%' overflow."""
     if v is None:
         return "—"
     try:
-        from quantlab.providers.edgar import YOY_OUTLIER_HI, YOY_OUTLIER_LO
         f = float(v)
-        if f > YOY_OUTLIER_HI or f < YOY_OUTLIER_LO:
-            return "N/A"
+        if f > _YOY_DISPLAY_CAP:
+            return ">999%"
         return f"{f * 100:+.1f}%"
     except (TypeError, ValueError):
         return "—"
+
+
+def _eps_cell(fresh: dict | None) -> str:
+    """EPS YoY display: raw % with '>999%' overflow, a distinct '−→+' marker
+    for negative→positive transitions (never a fake +100.0%), '—' for
+    missing/quarantined."""
+    if not fresh:
+        return "—"
+    if fresh.get("turned_positive"):
+        return "−→+"
+    v = fresh.get("eps_yoy")
+    if v is None:
+        return "—"
+    if v > _YOY_DISPLAY_CAP:
+        return ">999%"
+    return f"{v * 100:+.1f}%"
 
 
 # ── Footer callback ────────────────────────────────────────────────────────────
@@ -574,6 +591,7 @@ def _candidate_table(
     backtest_map: dict,
     revenue_map: dict | None = None,
     freshness_map: dict | None = None,
+    eps_map: dict | None = None,
 ) -> list:
     e: list = []
     e.append(PageBreak())
@@ -627,7 +645,7 @@ def _candidate_table(
                 _fmt(en.get("conviction_score")),
                 opts_str,
                 _tick(en.get("volume_dry_up")),
-                _pct(en.get("earnings_score")),
+                _eps_cell((eps_map or {}).get(en["symbol"])),
                 rev_str,
                 _fmt(en.get("peg_score")),
                 wr,
@@ -642,7 +660,7 @@ def _candidate_table(
                 _fmt(en.get("conviction_score")),
                 opts_str,
                 _tick(en.get("volume_dry_up")),
-                _pct(en.get("earnings_score")),
+                _eps_cell((eps_map or {}).get(en["symbol"])),
                 _fmt(en.get("peg_score")),
                 wr,
             ])
@@ -684,6 +702,7 @@ def _alert_section(
     candidates: list[dict],
     backtest_map: dict,
     revenue_map: dict | None = None,
+    eps_map: dict | None = None,
 ) -> list:
     top5 = [c for c in candidates if c.get("consecutive_days", 1) >= 2][:5]
     if not top5:
@@ -712,7 +731,7 @@ def _alert_section(
         )
         signal_line = (
             f"Stage: {_stage_lbl(stage)}   |   Conviction: {_fmt(en.get('conviction_score'))}"
-            f"   |   EPS YoY: {_pct(en.get('earnings_score'))}"
+            f"   |   EPS YoY: {_eps_cell((eps_map or {}).get(en['symbol']))}"
             f"   |   Rev YoY: {_rev_pct(rev_map.get(sym))}"
             f"   |   PEG: {_fmt(en.get('peg_score'))}"
         )
@@ -753,6 +772,7 @@ def _basing_table(
     basing_cands: list[dict],
     revenue_map: dict | None = None,
     freshness_map: dict | None = None,
+    eps_map: dict | None = None,
 ) -> list:
     """Render 'Basing Candidates — Weekend Watchlist' for Stage 1 stocks."""
     if not basing_cands:
@@ -785,7 +805,7 @@ def _basing_table(
             _opts_cell(en.get("options_signal", False),
                        freshness_map.get(en["symbol"]) if freshness_map else None),
             _tick(en.get("volume_dry_up", False)),
-            _pct(en.get("earnings_score")),
+            _eps_cell((eps_map or {}).get(en["symbol"])),
             _rev_pct(rev_map.get(en["symbol"])),
             _fmt(en.get("peg_score")),
             "",
@@ -869,7 +889,12 @@ def _load_revenue_map(symbols: list[str], db_path: str | None = None) -> dict:
 
 
 def _load_eps_map(symbols: list[str], db_path: str | None = None) -> dict:
-    """Return {symbol: eps_growth} from the edgar_fundamentals cache."""
+    """Return {symbol: {"eps_yoy", "turned_positive"}} from edgar_fundamentals.
+
+    eps_yoy is the RAW period-matched YoY rate (uncapped; None = not
+    computable / quarantined); turned_positive marks a negative→positive EPS
+    transition (max-strength earnings event stored as NULL%).
+    """
     if not symbols:
         return {}
     try:
@@ -878,16 +903,17 @@ def _load_eps_map(symbols: list[str], db_path: str | None = None) -> dict:
         con = duckdb.connect(db_path or str(DB_PATH))
         ph  = ",".join("?" * len(symbols))
         rows = con.execute(
-            f"SELECT symbol, eps_growth FROM edgar_fundamentals "
+            f"SELECT symbol, eps_growth, eps_turned_positive "
+            f"FROM edgar_fundamentals "
             f"WHERE symbol IN ({ph}) "
             f"ORDER BY fetch_date DESC",
             symbols,
         ).fetchall()
         con.close()
         result: dict = {}
-        for sym, eps in rows:
+        for sym, eps, tp in rows:
             if sym not in result:
-                result[sym] = eps
+                result[sym] = {"eps_yoy": eps, "turned_positive": bool(tp)}
         return result
     except Exception:
         return {}
@@ -1148,11 +1174,19 @@ def generate(
     # This prevents fundamentally deteriorating stocks (e.g. eps_growth < -10%) from
     # appearing in the candidate table even if they passed technical conviction thresholds.
     _pre_syms    = [c["symbol"] for c in _cands_pre]
-    _eps_map     = _load_eps_map(_pre_syms, db_path)
-    candidates   = [
-        c for c in _cands_pre
-        if _eps_map.get(c["symbol"]) is None or _eps_map[c["symbol"]] >= -0.10
-    ]
+    _basing_syms = [c["symbol"] for c in basing_cands]
+    eps_map      = _load_eps_map(_pre_syms + _basing_syms, db_path)
+
+    def _passes_eps_gate(sym: str) -> bool:
+        e = eps_map.get(sym)
+        if e is None:
+            return True                      # no data — gate can't judge
+        if e.get("turned_positive"):
+            return True                      # max-strength earnings event
+        v = e.get("eps_yoy")
+        return v is None or v >= -0.10
+
+    candidates = [c for c in _cands_pre if _passes_eps_gate(c["symbol"])]
 
     symbols         = [c["symbol"] for c in candidates]
     backtest_map    = _load_backtest_map(symbols, db_path)
@@ -1226,11 +1260,12 @@ def generate(
                     options_rate=opts_rate, regime_gate=regime_gate)
     if candidates:
         story += _candidate_table(S, candidates, backtest_map, revenue_map,
-                                  freshness_map=freshness_map)
-        story += _alert_section(S, candidates, backtest_map, revenue_map)
+                                  freshness_map=freshness_map, eps_map=eps_map)
+        story += _alert_section(S, candidates, backtest_map, revenue_map,
+                                eps_map=eps_map)
     if basing_cands:
         story += _basing_table(S, basing_cands, basing_rev_map,
-                               freshness_map=freshness_map)
+                               freshness_map=freshness_map, eps_map=eps_map)
 
     doc.build(story, onFirstPage=footer, onLaterPages=footer)
 

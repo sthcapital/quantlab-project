@@ -5973,12 +5973,20 @@ class TestEdgarYoYMetrics:
         eps_vals = [1.0, 1.0, 1.0, 1.0, 1.3, 1.5, 1.75, 2.1]
         rev_vals = [1e9 * v for v in eps_vals]
 
+        # Quarterly spans (duration-explicit extraction needs start dates);
+        # 8 calendar quarters Mar-2023 .. Dec-2024
+        def _span(i):
+            q_ends = ["03-31", "06-30", "09-30", "12-31"]
+            q_starts = ["01-01", "04-01", "07-01", "10-01"]
+            y = 2023 + i // 4
+            return f"{y}-{q_starts[i % 4]}", f"{y}-{q_ends[i % 4]}"
+
         fake_eps_obs = [
-            {"form": "10-Q", "end": f"202{i//4+3}-{(i%4)*3+1:02d}-31", "filed": "x", "val": v}
+            {"form": "10-Q", "start": _span(i)[0], "end": _span(i)[1], "filed": "x", "val": v}
             for i, v in enumerate(eps_vals)
         ]
         fake_rev_obs = [
-            {"form": "10-Q", "end": f"202{i//4+3}-{(i%4)*3+1:02d}-31", "filed": "x", "val": v}
+            {"form": "10-Q", "start": _span(i)[0], "end": _span(i)[1], "filed": "x", "val": v}
             for i, v in enumerate(rev_vals)
         ]
 
@@ -8349,19 +8357,21 @@ class TestMissingVsZeroSemantics:
         from generate_report import _rev_pct
         assert _rev_pct(None) == "—"
 
-    def test_downside_outlier_capped(self):
-        """Rev YoY beyond the artifact zone is suppressed on BOTH tails."""
+    def test_rev_pct_renders_raw_with_overflow_cap(self):
+        """Display no longer suppresses tails as 'N/A' — data-quality
+        suppression moved UPSTREAM (duration-explicit extraction + quarantine
+        → NULL → '—').  A value that reaches display is a real measurement
+        (SNDK +251% is FactSet-confirmed); display handles only overflow."""
         import sys
         from pathlib import Path
         scripts_dir = str(Path(__file__).parent.parent / "scripts")
         if scripts_dir not in sys.path:
             sys.path.insert(0, scripts_dir)
         from generate_report import _rev_pct
-        assert _rev_pct(-1.0) == "N/A"     # TNGX-style -100.0%
-        assert _rev_pct(-0.972) == "N/A"   # KALV-style -97.2%
-        assert _rev_pct(-0.941) == "N/A"   # NPKI-style -94.1%
-        assert _rev_pct(2.5) == "N/A"      # upside unchanged
-        assert _rev_pct(-0.50) == "-50.0%" # real collapse inside bounds still shown
+        assert _rev_pct(-1.0) == "-100.0%"   # real wind-down renders as itself
+        assert _rev_pct(2.51) == "+251.0%"   # real hypergrowth not suppressed
+        assert _rev_pct(25.0) == ">999%"     # overflow capped for layout only
+        assert _rev_pct(-0.50) == "-50.0%"
         assert _rev_pct(0.194) == "+19.4%"
 
     def test_save_edgar_cache_stores_null_not_zero(self, tmp_path, monkeypatch):
