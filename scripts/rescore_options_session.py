@@ -124,14 +124,18 @@ def main() -> None:
         scores, percentile_cut=pctl, zscores=zscores,
     ) - flagged - put_dominated
 
+    def _f2(v, width: int = 6) -> str:
+        """NULL-safe column format — '—' for unmeasured values (MISSING ≠ ZERO)."""
+        return f"{v:>{width}.2f}" if v is not None else "—".rjust(width)
+
     n_scored = sum(1 for v in scores.values() if v is not None)
     print(f"{'SYM':<8} {'CALL_VOL':>10} {'BASE_AVG':>10} {'VOL_Z':>7} "
           f"{'PCR':>6} {'SKEW':>6} {'REL':>7} {'LEGACY':>7}")
     for sym in sorted(flagged, key=lambda s: -(scores[s] or 0.0)):
         r = results[sym]
         print(f"{sym:<8} {r['call_volume']:>10,.0f} {r['baseline_mean']:>10,.0f} "
-              f"{r['vol_zscore']:>7.2f} {r['pcr']:>6.2f} {r['iv_skew']:>6.2f} "
-              f"{r['rel_score']:>7.4f} {r['legacy_score']:>7.2f}")
+              f"{r['vol_zscore']:>7.2f} {_f2(r['pcr'])} {r['iv_skew']:>6.2f} "
+              f"{r['rel_score']:>7.4f} {_f2(r['legacy_score'], 7)}")
 
     if floor_blocked:
         print(f"\nFloor-blocked (baseline avg < {min_base:g} contracts — "
@@ -146,7 +150,7 @@ def main() -> None:
               f"short-side signal data):")
         for sym in sorted(put_dominated, key=lambda s: -(scores[s] or 0.0)):
             r = results[sym]
-            print(f"  {sym:<8} pcr={r['pcr']:>6.2f}  vol_z={r['vol_zscore']:>6.2f}  "
+            print(f"  {sym:<8} pcr={_f2(r['pcr'])}  vol_z={r['vol_zscore']:>6.2f}  "
                   f"rel={r['rel_score']:.4f}")
 
     rate = (len(flagged) / n_scored) if n_scored else 0.0

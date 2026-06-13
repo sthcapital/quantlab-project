@@ -225,18 +225,24 @@ class MassiveOptionsProvider:
         symbol: str,
         spot_price: float = 0.0,
         atm_band_pct: float = 0.05,
-    ) -> float:
+    ) -> Optional[float]:
         """
         Total put OI / total call OI for ATM strikes within ±atm_band_pct of spot.
 
         When spot_price is 0 or not provided, uses the full chain (all strikes).
         Prefers open_interest; falls back to volume.
 
-        Returns 1.0 (neutral) when call activity is zero.
+        Returns None (MISSING ≠ MEASURED) when the ratio cannot be measured:
+        empty chain, zero call activity in the band (denominator undefined),
+        or a put side where no contract carries volume/OI data at all — absent
+        put data is not a measured PCR.  (Pre-2026-06 this returned a neutral
+        1.0 default in the first two cases and an exact 0.0 in the third,
+        indistinguishable from real measurements — VVV/RSI 2026-06-10.)
+        Puts with explicit zero activity are a measured 0.0.
         """
         chain = self._get_chain_cached(symbol)
         if not chain:
-            return 1.0
+            return None
 
         if spot_price > 0:
             lo, hi = spot_price * (1 - atm_band_pct), spot_price * (1 + atm_band_pct)
@@ -250,7 +256,12 @@ class MassiveOptionsProvider:
         put_act  = sum(c.activity for c in puts)
 
         if call_act <= 0:
-            return 1.0
+            return None
+        put_has_data = any(
+            c.volume is not None or c.open_interest is not None for c in puts
+        )
+        if not put_has_data:
+            return None
         return round(put_act / call_act, 4)
 
     def get_iv_skew(self, symbol: str, spot_price: float) -> float:
@@ -339,10 +350,12 @@ class MassiveOptionsProvider:
         unusual = self.get_unusual_call_activity(symbol)
 
         score = 0.0
-        if pcr < 0.50:
-            score += 0.60
-        elif pcr < 0.70:
-            score += 0.40
+        # pcr None = unmeasurable (MISSING ≠ MEASURED) — no PCR contribution
+        if pcr is not None:
+            if pcr < 0.50:
+                score += 0.60
+            elif pcr < 0.70:
+                score += 0.40
         if unusual:
             score += 0.25
         if skew > 0.60:
@@ -363,8 +376,10 @@ class MassiveOptionsProvider:
         )
 
         logger.info(
-            "%s: options_score=%.2f  pcr=%.2f  iv_skew=%.2f  unusual=%s",
-            symbol, result_score, pcr, skew, bool(unusual),
+            "%s: options_score=%.2f  pcr=%s  iv_skew=%.2f  unusual=%s",
+            symbol, result_score,
+            f"{pcr:.2f}" if pcr is not None else "None",
+            skew, bool(unusual),
         )
         return result_score
 
@@ -425,10 +440,12 @@ class MassiveOptionsProvider:
         unusual_legacy = bool(self.get_unusual_call_activity(symbol))
 
         legacy_score = 0.0
-        if pcr < 0.50:
-            legacy_score += 0.60
-        elif pcr < 0.70:
-            legacy_score += 0.40
+        # pcr None = unmeasurable (MISSING ≠ MEASURED) — no PCR contribution
+        if pcr is not None:
+            if pcr < 0.50:
+                legacy_score += 0.60
+            elif pcr < 0.70:
+                legacy_score += 0.40
         if unusual_legacy:
             legacy_score += 0.25
         if skew > 0.60:
@@ -454,11 +471,13 @@ class MassiveOptionsProvider:
         )
 
         logger.info(
-            "%s: rel_score=%s  vol_z=%s  call_vol=%.0f  pcr=%.2f  iv_skew=%.2f",
+            "%s: rel_score=%s  vol_z=%s  call_vol=%.0f  pcr=%s  iv_skew=%.2f",
             symbol,
             f"{rel:.4f}" if rel is not None else "None",
             f"{vol_z:.2f}" if vol_z is not None else "None",
-            call_volume, pcr, skew,
+            call_volume,
+            f"{pcr:.2f}" if pcr is not None else "None",
+            skew,
         )
         return {
             "call_volume": call_volume,
@@ -620,7 +639,8 @@ class MassiveOptionsProvider:
             logger.debug("relative cache read failed for %s: %s", symbol, exc)
             return None
 
-    def _save_relative_cache(self, symbol: str, spot_price: float, pcr: float,
+    def _save_relative_cache(self, symbol: str, spot_price: float,
+                             pcr: Optional[float],
                              iv_skew: float, unusual_calls: bool,
                              options_score: float, call_count: int,
                              put_count: int, call_volume: float,
@@ -807,6 +827,16 @@ class MassiveOptionsProvider:
             con.execute(
                 f"ALTER TABLE options_snapshots ADD COLUMN IF NOT EXISTS {col} {col_type}"
             )
+        # One-time data fix (MISSING ≠ MEASURED): pcr = 1.0 with call_count = 0
+        # is the pre-2026-06-12 empty-chain fallback — get_put_call_ratio
+        # returned a neutral 1.0 default when no chain data existed at all.
+        # The writer now stores NULL; this clears the certain historical cases.
+        # (pcr = 1.0 with a non-empty chain is left alone: a genuinely measured
+        # 1.0 is possible and cannot be distinguished retroactively.)
+        con.execute(
+            "UPDATE options_snapshots SET pcr = NULL "
+            "WHERE pcr = 1.0 AND call_count = 0"
+        )
 
     def _load_cache(self, symbol: str) -> Optional[float]:
         """Return today's cached options_score or None."""
@@ -833,7 +863,7 @@ class MassiveOptionsProvider:
         self,
         symbol: str,
         spot_price: float,
-        pcr: float,
+        pcr: Optional[float],
         iv_skew: float,
         unusual_calls: bool,
         options_score: float,

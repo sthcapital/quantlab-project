@@ -183,10 +183,60 @@ class TestPutCallRatio:
         pcr = p.get_put_call_ratio("AAPL", spot_price=200.0)
         assert pcr < 0.5  # heavy call bias
 
-    def test_neutral_on_empty_chain(self):
+    def test_none_on_empty_chain(self):
+        # MISSING ≠ MEASURED: no chain data is not a neutral 1.0 measurement
         p = _provider()
         p._chain_cache["AAPL"] = []
-        assert p.get_put_call_ratio("AAPL", spot_price=200.0) == 1.0
+        assert p.get_put_call_ratio("AAPL", spot_price=200.0) is None
+
+    def test_none_when_no_call_activity(self):
+        # Calls present but carry no OI/volume data → denominator unmeasurable
+        p = _provider()
+        p._chain_cache["AAPL"] = [
+            OptionContract(
+                ticker=f"O:AAPL260620{t}00200000",
+                expiry=date(2026, 6, 20), strike=200.0, option_type=t,
+                volume=None if t == "C" else 500.0,
+                open_interest=None if t == "C" else 500.0,
+            )
+            for t in ("C", "P")
+        ]
+        assert p.get_put_call_ratio("AAPL", spot_price=200.0) is None
+
+    def test_none_when_puts_carry_no_data(self):
+        # Put side exists but every contract lacks volume AND OI — absent put
+        # data is not a measured zero (VVV/RSI 2026-06-10 fallback class)
+        p = _provider()
+        p._chain_cache["AAPL"] = [
+            OptionContract(
+                ticker="O:AAPL260620C00200000",
+                expiry=date(2026, 6, 20), strike=200.0, option_type="C",
+                volume=800.0, open_interest=900.0,
+            ),
+            OptionContract(
+                ticker="O:AAPL260620P00200000",
+                expiry=date(2026, 6, 20), strike=200.0, option_type="P",
+                volume=None, open_interest=None,
+            ),
+        ]
+        assert p.get_put_call_ratio("AAPL", spot_price=200.0) is None
+
+    def test_measured_zero_when_puts_have_explicit_zero(self):
+        # Explicit zero activity IS a measurement — PCR 0.0, not NULL
+        p = _provider()
+        p._chain_cache["AAPL"] = [
+            OptionContract(
+                ticker="O:AAPL260620C00200000",
+                expiry=date(2026, 6, 20), strike=200.0, option_type="C",
+                volume=800.0, open_interest=900.0,
+            ),
+            OptionContract(
+                ticker="O:AAPL260620P00200000",
+                expiry=date(2026, 6, 20), strike=200.0, option_type="P",
+                volume=0.0, open_interest=0.0,
+            ),
+        ]
+        assert p.get_put_call_ratio("AAPL", spot_price=200.0) == 0.0
 
     def test_no_spot_uses_full_chain(self):
         p = _provider()
@@ -535,6 +585,71 @@ class TestOptionsCache:
         assert len(saved_calls) == 1
         assert saved_calls[0]["symbol"] == "AAPL"
         assert saved_calls[0]["options_score"] == pytest.approx(score)
+
+    def test_compute_options_score_persists_null_pcr(self):
+        # Puts carry no data → pcr None must reach the cache as None (NULL),
+        # contribute nothing to the score, and not crash the scorer
+        p = _provider()
+        p._chain_cache["AAPL"] = [
+            OptionContract(
+                ticker=f"O:AAPL260620C{int(s*1000):08d}",
+                expiry=date(2026, 6, 20), strike=s, option_type="C",
+                volume=500.0, open_interest=600.0, iv=0.25,
+            )
+            for s in (195.0, 200.0, 205.0)
+        ] + [
+            OptionContract(
+                ticker="O:AAPL260620P00200000",
+                expiry=date(2026, 6, 20), strike=200.0, option_type="P",
+                volume=None, open_interest=None,
+            ),
+        ]
+
+        saved_calls = []
+        with patch.object(p, "_load_cache", return_value=None):
+            with patch.object(p, "_save_cache", side_effect=lambda **kw: saved_calls.append(kw)):
+                score = p.compute_options_score("AAPL", spot_price=200.0)
+
+        assert saved_calls[0]["pcr"] is None
+        # No PCR component (0.60/0.40) — only unusual-calls/skew can contribute
+        assert score <= 0.40
+
+    def test_relative_score_with_null_pcr_renormalises(self):
+        # compute_relative_options_score path: None pcr flows into
+        # relative_options_score, which re-normalises weights — no crash,
+        # and the gate later treats the NULL as ceiling-ineligible
+        from quantlab.signals.options_relative import relative_options_score
+        score = relative_options_score(4.0, pcr=None, iv_skew=0.5)
+        assert score is not None
+        assert 0.0 <= score <= 1.0
+
+
+class TestPcrFallbackMigration:
+
+    def test_empty_chain_fallback_rows_nulled(self, tmp_path):
+        import duckdb
+        db = tmp_path / "mig.duckdb"
+        con = duckdb.connect(str(db))
+        MassiveOptionsProvider._ensure_table(con)
+        con.execute(
+            "INSERT INTO options_snapshots "
+            "(symbol, snap_date, spot_price, pcr, iv_skew, unusual_calls, "
+            " options_score, call_count, put_count) VALUES "
+            # certain fallback: pcr 1.0 from an empty chain
+            "('FBK', DATE '2026-06-10', 10.0, 1.0, 0.5, FALSE, 0.0, 0, 0), "
+            # measured 1.0 on a real chain — must survive
+            "('MSD', DATE '2026-06-10', 10.0, 1.0, 0.5, FALSE, 0.0, 40, 40), "
+            # measured non-1.0 — must survive
+            "('OKK', DATE '2026-06-10', 10.0, 0.62, 0.5, FALSE, 0.0, 40, 40)"
+        )
+        MassiveOptionsProvider._ensure_table(con)   # migration is idempotent
+        rows = dict(con.execute(
+            "SELECT symbol, pcr FROM options_snapshots"
+        ).fetchall())
+        con.close()
+        assert rows["FBK"] is None
+        assert rows["MSD"] == pytest.approx(1.0)
+        assert rows["OKK"] == pytest.approx(0.62)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
