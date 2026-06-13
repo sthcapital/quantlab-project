@@ -121,11 +121,11 @@ DEFAULT_CONFIG = {
         # / liquid / growth gate runs BEFORE stage analysis so every downstream
         # signal sees only the population it was designed for.  Defaults live in
         # GrowthFilterConfig; this dict supplies OVERRIDES only (any subset of
-        # the dataclass fields).  bypass=True (default) builds the funnel and
-        # persists per-gate values but scans the full universe — flip to False
-        # (or pass --growth-filter on) to scan only growth-qualified names.
+        # the dataclass fields).  bypass=False (ACTIVATED 2026-06-13) scans only
+        # the growth-qualified subset; set True (or pass --growth-filter off) to
+        # run the full universe for A/B while still building/persisting the funnel.
         "growth_filter": {
-            "bypass": True,                 # DEFAULT BYPASS ON — built, inactive
+            "bypass": False,                # ACTIVE — scan growth-qualified only
             "show_excluded_panel": False,   # optional report "tape character" panel
         },
     },

@@ -391,7 +391,7 @@ class TestConfig:
         c = GrowthFilterConfig()
         assert c.cap_min == 1e9 and c.cap_core_max == 1e10
         assert c.adr_min == 0.035 and c.min_dollar_vol == 2e7
-        assert c.bypass is True
+        assert c.bypass is False          # ACTIVATED 2026-06-13 (scan default)
 
     def test_growth_qualification_thresholds(self):
         c = GrowthFilterConfig()
@@ -407,8 +407,9 @@ class TestConfig:
         c = GrowthFilterConfig()
         assert c.rank_rev_weight >= c.rank_eps_weight
 
-    def test_from_config_default_bypass_on(self):
-        assert GrowthFilterConfig.from_config().bypass is True
+    def test_from_config_default_active(self):
+        # Activated 2026-06-13: config override and dataclass default both False.
+        assert GrowthFilterConfig.from_config().bypass is False
 
 
 # ══════════════════════════════════════════════════════════════════════════════

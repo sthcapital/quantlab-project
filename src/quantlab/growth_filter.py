@@ -117,7 +117,11 @@ class GrowthFilterConfig:
     rank_accel_bonus: float = 0.25
 
     # ── Pipeline ──────────────────────────────────────────────────────────────
-    bypass: bool = True                     # DEFAULT BYPASS ON (built, inactive)
+    # ACTIVATED 2026-06-13: dry run clean (1,477 → 113 growth-qualified ingested
+    # → 20 actionable, all stages clean).  The filter now reduces the scanned
+    # universe by default; set scanner config growth_filter.bypass=True or pass
+    # --growth-filter off to run full-universe (A/B) instead.
+    bypass: bool = False                    # DEFAULT ACTIVE — scan growth-qualified only
 
     @classmethod
     def from_config(cls) -> "GrowthFilterConfig":
