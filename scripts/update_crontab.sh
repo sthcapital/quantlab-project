@@ -60,7 +60,9 @@ NEW_CRONTAB="# QuantLab automated trading schedule
 # ── Morning check (08:45 AM ET, Mon–Fri) — lightweight, < 2 min ──────────────
 45 8 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && bash scripts/morning.sh' >> ${LOG_FILE} 2>&1
 
-# ── Evening scan (05:00 PM ET, Mon–Fri) — full 2,325-symbol universe scan ─────
+# ── Evening scan (05:00 PM ET, Mon–Fri) — full tradeable-universe scan ────────
+# (Universe size floats daily with the build — ~1,000–2,300 symbols; the gate
+# in quantlab/universe.py refuses degenerate builds.)
 0 17 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && bash scripts/evening_scan.sh' >> ${LOG_FILE} 2>&1
 
 # ── Evening scan (06:00 PM ET, Sunday) — weekend data refresh ─────────────────
@@ -72,7 +74,9 @@ NEW_CRONTAB="# QuantLab automated trading schedule
 # ── Intraday options monitor (every 30 min, 9:30 AM – 4:00 PM ET, Mon–Fri) ────
 # Script self-checks market hours (9:30 AM – 4:00 PM) and exits early if
 # outside — the 9:00 AM fire is skipped by that guard.
-*/30 9-15 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && [[ -f .env ]] && set -a && source .env && set +a; python scripts/monitor_options.py' >> ${LOG_FILE} 2>&1
+# Invoked via the run-locked wrapper: a duplicate scheduler entry logs
+# "DUPLICATE INVOCATION SUPPRESSED" and exits 0 instead of racing the lock.
+*/30 9-15 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && [[ -f .env ]] && set -a && source .env && set +a; bash scripts/monitor_options.sh' >> ${LOG_FILE} 2>&1
 
 # ── Daily health check (06:15 PM ET, Mon–Fri) ────────────────────────────────
 # Runs after evening scan completes; exits 1 if any critical job is missing.

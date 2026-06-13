@@ -39,6 +39,11 @@ log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE"; }
 sep() { printf '%s\n' "══════════════════════════════════════════════════════════" \
           | tee -a "$LOG_FILE"; }
 
+# ── Run lock — a duplicate invocation must never run a second check ────────────
+# shellcheck source=lib/run_lock.sh
+source "$PROJECT_DIR/scripts/lib/run_lock.sh"
+acquire_run_lock "morning" "$LOG_FILE"
+
 # ── Activate environment ────────────────────────────────────────────────────────
 # shellcheck disable=SC1091
 source "$CONDA_BASE/etc/profile.d/conda.sh"

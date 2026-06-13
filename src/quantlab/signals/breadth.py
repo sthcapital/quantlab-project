@@ -593,7 +593,14 @@ def load_recent_snapshots(n: int = 60) -> list[BreadthSnapshot]:
             snapshots.append(s)
         return snapshots
     except Exception as e:
-        logger.debug("load_recent_snapshots failed: %s", e)
+        # WARNING, never debug: a swallowed failure here once let a lost
+        # DuckDB lock race read an empty tape and gate the regime UNKNOWN
+        # (2026-06-12 duplicate-invocation incident).  Returning [] is the
+        # degraded path — it must be visible in the log every time.
+        logger.warning(
+            "load_recent_snapshots failed — returning EMPTY snapshot list "
+            "(tape readers will see no breadth data): %s", e,
+        )
         return []
 
 

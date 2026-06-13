@@ -3,7 +3,8 @@
 # scripts/evening_scan.sh — QuantLab evening full-universe scanner
 #
 # Runs Mon-Fri at 5:00 PM ET (21:00 UTC during EDT) and Sunday at 6:00 PM ET.
-# The full 2,325-symbol scan runs here so results are ready before market open
+# The full tradeable-universe scan (size floats daily with the build —
+# ~1,000–2,300 symbols) runs here so results are ready before market open
 # the following morning.  The morning.sh script is a lightweight check only.
 #
 # Steps:
@@ -11,7 +12,7 @@
 #   2. Update breadth (full S3 history load for SMA participation)
 #   3. Update macro/FRED regime
 #   4. Run EDGAR fundamentals refresh (Mondays only)
-#   5. Full 2,325-symbol scan with --with-news --with-options
+#   5. Full tradeable-universe scan with --with-news --with-options
 #      (degrades to --no-news if TWS is unreachable)
 #   6. Backtest high-conviction symbols (>0.70)
 #   7. IC monitor update
@@ -59,6 +60,11 @@ ts()  { date '+%Y-%m-%d %H:%M:%S'; }
 log() { echo "[$(ts)] $*" | tee -a "$LOG_FILE"; }
 sep() { printf '%s\n' "══════════════════════════════════════════════════════════" \
           | tee -a "$LOG_FILE"; }
+
+# ── Run lock — a duplicate invocation must never run a second scan ─────────────
+# shellcheck source=lib/run_lock.sh
+source "$PROJECT_DIR/scripts/lib/run_lock.sh"
+acquire_run_lock "evening-scan" "$LOG_FILE"
 
 # ── Activate environment ────────────────────────────────────────────────────────
 # shellcheck disable=SC1091
