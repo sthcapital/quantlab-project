@@ -204,18 +204,22 @@ def _tick(v) -> str:
 
 def _opts_cell(opts_signal, fresh: dict | None) -> str:
     """
-    Opts column with flag freshness: "⚑" for a fresh flag (streak 1),
-    "⚑dN" for the Nth consecutive flagged session — first-day flow
+    Opts column with flag freshness: "F" for a fresh flag (streak 1),
+    "FdN" for the Nth consecutive flagged session — first-day flow
     (positioning starting while price still bases) reads differently from
     campaign confirmation / crowding risk.
 
+    The marker is ASCII on purpose: the report's Helvetica Type1 font has no
+    U+2691 (⚑) glyph, which rendered as "n" in the generated PDF ("nd2"
+    where "⚑d2" was meant).
+
     Floor-blocked and put-dominated names are not flagged, so they keep
-    their existing treatment (no glyph); rows without snapshot freshness
+    their existing treatment (no marker); rows without snapshot freshness
     fall back to the legacy ✓/– tick.
     """
     if fresh and fresh.get("unusual_flag"):
         streak = fresh.get("flag_streak") or 1
-        return "⚑" if streak <= 1 else f"⚑d{streak}"
+        return "F" if streak <= 1 else f"Fd{streak}"
     if fresh is not None:
         return "–"   # gated today, not flagged (incl. floor/PCR-blocked)
     return _tick(opts_signal)
@@ -1213,7 +1217,7 @@ def generate(
     if regime_gate:
         print(f"  regime gate: {regime_gate.summary()}")
 
-    # Flag freshness: ⚑ fresh / ⚑dN streak rendering in the Opts columns
+    # Flag freshness: F fresh / FdN streak rendering in the Opts columns
     freshness_map = _load_options_freshness(report_date, db_path)
 
     story: list = []
