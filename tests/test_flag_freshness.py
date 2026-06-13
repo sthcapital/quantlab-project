@@ -274,22 +274,34 @@ class TestFreshnessPersistence:
 
 class TestFreshnessRendering:
 
-    def test_fresh_flag_renders_pennant(self):
+    # Marker is ASCII "F"/"FdN" — the report's Helvetica Type1 font has no
+    # U+2691 (⚑) glyph, which rendered as "n" in the generated PDF.
+
+    def test_fresh_flag_renders_marker(self):
         gr = _load_script("generate_report")
-        assert gr._opts_cell(True, {"unusual_flag": True, "flag_streak": 1}) == "⚑"
+        assert gr._opts_cell(True, {"unusual_flag": True, "flag_streak": 1}) == "F"
 
     def test_streak_renders_day_count(self):
         gr = _load_script("generate_report")
-        assert gr._opts_cell(True, {"unusual_flag": True, "flag_streak": 3}) == "⚑d3"
+        assert gr._opts_cell(True, {"unusual_flag": True, "flag_streak": 3}) == "Fd3"
 
-    def test_blocked_names_get_no_glyph(self):
+    def test_marker_is_winansi_safe(self):
+        """Every char of the marker must exist in the Type1 Helvetica
+        encoding ReportLab uses — non-encodable chars render as wrong
+        glyphs in the PDF (the original ⚑→'n' bug)."""
+        gr = _load_script("generate_report")
+        for streak in (1, 2, 12):
+            cell = gr._opts_cell(True, {"unusual_flag": True,
+                                        "flag_streak": streak})
+            assert all(ord(ch) < 128 for ch in cell), cell
+
+    def test_blocked_names_get_no_marker(self):
         """Floor-blocked / put-dominated rows are gated but unflagged — they
-        keep the plain dash, never a pennant."""
+        keep the plain dash, never a flag marker."""
         gr = _load_script("generate_report")
         cell = gr._opts_cell(False, {"unusual_flag": False, "flag_streak": 0,
                                      "put_dominated": True})
         assert cell == "–"
-        assert "⚑" not in cell
 
     def test_no_snapshot_data_falls_back_to_legacy_tick(self):
         gr = _load_script("generate_report")
