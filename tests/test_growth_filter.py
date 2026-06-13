@@ -114,19 +114,50 @@ class TestBucketOrdering:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestGrowthQualification:
+    """REVENUE is the sole qualification gate (EPS removed — ranking input only):
+    rev_yoy ≥ +40%  OR  (turned_positive AND rev_yoy ≥ +20%)  OR  rev acceleration.
+    """
 
-    def test_eps_yoy_qualifies(self):
-        b, _ = qualify_growth(_facts(eps_yoy=0.30, rev_yoy=0.05), CFG)
-        assert b == QUALIFIED
+    def test_eps_yoy_no_longer_qualifies(self):
+        # EPS is a ranking input, NOT a qualifier: a high EPS with sub-gate
+        # revenue and no inflection fails growth (it never admits a name).
+        b, _ = qualify_growth(_facts(eps_yoy=3.40, rev_yoy=0.05), CFG)
+        assert b == FAILED_GROWTH
 
-    def test_revenue_yoy_qualifies(self):
-        b, reasons = qualify_growth(_facts(eps_yoy=0.0, rev_yoy=0.25), CFG)
+    def test_revenue_yoy_qualifies_at_40pct(self):
+        b, reasons = qualify_growth(_facts(eps_yoy=0.0, rev_yoy=0.45), CFG)
         assert b == QUALIFIED and "rev" in reasons
 
-    def test_turned_positive_qualifies(self):
+    def test_revenue_at_40pct_boundary_qualifies(self):
+        b, reasons = qualify_growth(_facts(rev_yoy=0.40, eps_yoy=None), CFG)
+        assert b == QUALIFIED and "rev" in reasons
+
+    def test_revenue_just_below_40pct_fails(self):
+        # +39% revenue, not turned_positive → fails the sole revenue gate
+        # (RBLX on 2026-06-12: rev +39.3%).
+        b, _ = qualify_growth(_facts(rev_yoy=0.39, eps_yoy=None), CFG)
+        assert b == FAILED_GROWTH
+
+    def test_turned_positive_with_revenue_floor_qualifies(self):
+        # turned_positive qualifies only WITH a revenue floor (rev ≥ +20%): a
+        # real inflection shows up in sales.
         b, reasons = qualify_growth(
-            _facts(eps_yoy=None, rev_yoy=0.0, turned_positive=True), CFG)
+            _facts(eps_yoy=None, rev_yoy=0.25, turned_positive=True), CFG)
         assert b == QUALIFIED and "turned_positive" in reasons
+
+    def test_turned_positive_below_revenue_floor_fails(self):
+        # turned positive but revenue only +17% (< +20% floor): an accounting
+        # blip on flat sales, not demand-driven growth (DKNG on 2026-06-12).
+        b, _ = qualify_growth(
+            _facts(eps_yoy=None, rev_yoy=0.17, turned_positive=True), CFG)
+        assert b == FAILED_GROWTH
+
+    def test_turned_positive_without_revenue_data_is_unqualified(self):
+        # turned_positive but revenue YoY unavailable → cannot apply the floor →
+        # unqualified-data (gate input missing), never a measured failure.
+        b, _ = qualify_growth(
+            _facts(eps_yoy=None, rev_yoy=None, turned_positive=True), CFG)
+        assert b == UNQUALIFIED_DATA
 
     def test_below_thresholds_fails_growth(self):
         b, _ = qualify_growth(_facts(eps_yoy=0.10, rev_yoy=0.10), CFG)
@@ -204,7 +235,7 @@ class TestFunnel:
 
     def _mixed(self) -> list:
         return [
-            evaluate_symbol(_facts(symbol="QUAL", eps_yoy=0.50), CFG),       # qualified
+            evaluate_symbol(_facts(symbol="QUAL", rev_yoy=0.50), CFG),       # qualified
             evaluate_symbol(_facts(symbol="UNQ", eps_yoy=None, rev_yoy=None,
                                    turned_positive=False), CFG),             # unq-data
             evaluate_symbol(_facts(symbol="FG", eps_yoy=0.05, rev_yoy=0.05), CFG),  # failed growth
@@ -231,6 +262,22 @@ class TestFunnel:
         assert "Universe 1,477" in s
         assert "growth-qualified 42" in s
         assert "15 unqualified-data" in s
+
+    def test_accel_status_dormant_when_no_history(self):
+        # _mixed facts carry n_quarters=None → acceleration cannot compute →
+        # dormancy stated explicitly, never mistaken for "nothing accelerating".
+        f = compute_funnel(self._mixed())
+        assert f.accel_eligible == 0
+        assert "dormant" in f.accel_status()
+        assert "0/" in f.accel_status()
+
+    def test_accel_status_active_once_history_accrues(self):
+        cfg = GrowthFilterConfig()
+        results = [evaluate_symbol(
+            _facts(symbol="H", rev_yoy=0.50, n_quarters=6), cfg)]
+        f = compute_funnel(results, cfg)
+        assert f.accel_eligible == 1
+        assert "active" in f.accel_status()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -279,7 +326,7 @@ class TestBypass:
 
     def _facts_map(self):
         return {
-            "GOOD": _facts(symbol="GOOD", eps_yoy=0.50),
+            "GOOD": _facts(symbol="GOOD", rev_yoy=0.50),
             "BAD":  _facts(symbol="BAD", market_cap=300 * B, adr_pct=0.0),
         }
 
@@ -313,6 +360,14 @@ class TestConfig:
         assert c.adr_min == 0.035 and c.min_dollar_vol == 2e7
         assert c.bypass is True
 
+    def test_growth_qualification_thresholds(self):
+        c = GrowthFilterConfig()
+        assert c.rev_yoy_min == 0.40              # sole revenue gate
+        assert c.turned_positive_rev_floor == 0.20
+        assert c.accel_min_quarters == 5
+        # EPS is no longer a qualifier — its config threshold is gone
+        assert not hasattr(c, "eps_yoy_min")
+
     def test_revenue_weighted_at_least_as_heavily_as_eps(self):
         c = GrowthFilterConfig()
         assert c.rank_rev_weight >= c.rank_eps_weight
@@ -336,7 +391,7 @@ class TestPersistence:
         )
         as_of = date(2026, 6, 12)
         results = [
-            evaluate_symbol(_facts(symbol="QUAL", eps_yoy=0.50), CFG),
+            evaluate_symbol(_facts(symbol="QUAL", rev_yoy=0.50), CFG),
             evaluate_symbol(_facts(symbol="UNQ", eps_yoy=None, rev_yoy=None,
                                    turned_positive=False), CFG),
             evaluate_symbol(_facts(symbol="KO", market_cap=300 * B, adr_pct=0.017,
@@ -363,7 +418,7 @@ class TestPersistence:
         from quantlab.growth_filter import save_growth_universe, load_growth_funnel
         as_of = date(2026, 6, 12)
         db = self._db(tmp_path)
-        r = [evaluate_symbol(_facts(symbol="QUAL", eps_yoy=0.50), CFG)]
+        r = [evaluate_symbol(_facts(symbol="QUAL", rev_yoy=0.50), CFG)]
         save_growth_universe(as_of, r, db_path=db)
         save_growth_universe(as_of, r, db_path=db)   # re-run same date
         f = load_growth_funnel(as_of, db_path=db)

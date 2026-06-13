@@ -25,11 +25,19 @@ for.  Two tiers:
 
   TIER 2 — GROWTH QUALIFICATION (the prey; uses the period-matched EDGAR YoY
   from commit a0c5231 — winsorized, turned_positive flags)
-    Qualify on ANY of: EPS YoY ≥ +25% · revenue YoY ≥ +20% · turned_positive ·
-    acceleration (latest YoY rate > prior quarter's, latest YoY ≥ +15%).
-    Revenue acceleration is weighted at least as heavily as EPS in ranking —
-    now-correct GAAP EPS still swings 469–900% off small/recovering bases, so
-    revenue YoY is the cleaner acceleration signal.
+    REVENUE is the qualification gate (the verified-trustworthy signal):
+        revenue YoY ≥ +40%   OR   (turned_positive AND revenue YoY ≥ +20%)
+    A real demand inflection shows up in SALES; EPS crossing zero on flat
+    revenue is an accounting blip, so turned_positive qualifies only above the
+    revenue floor.  EPS is REMOVED from qualification — now-correct GAAP EPS
+    still swings 341–900% off small/recovering bases (pool p95 ≈ +341%, often
+    GAAP-recovery artifacts off depressed bases), far too violent to gate on.
+    It becomes a RANKING input only (winsorized eps_yoy in growth_rank): a
+    noisy EPS never admits OR excludes a name.
+    Acceleration (revenue YoY accelerating, latest ≥ +15%) stays a live
+    qualifier branch but is DORMANT today — rev_accel/eps_accel are NULL for
+    every name (no symbol has ≥5 quarters of stored history yet); it
+    self-activates as history deepens.
 
 DATA SEMANTICS (consistent with the EDGAR MISSING ≠ ZERO convention)
     Insufficient fundamental history (foreign filers, recent IPOs, < 4 quarters)
@@ -80,14 +88,19 @@ class GrowthFilterConfig:
     # Optional SIC/sector exclusion — default OFF (ADR% gate handles defensives)
     sector_exclude: tuple[str, ...] = ()
 
-    # ── Tier 2: growth qualification ──────────────────────────────────────────
-    eps_yoy_min: float = 0.25               # EPS YoY ≥ +25%
-    rev_yoy_min: float = 0.20               # revenue YoY ≥ +20%
-    accel_min_yoy: float = 0.15             # acceleration qualifies at ≥ +15%
+    # ── Tier 2: growth qualification — REVENUE is the gate ────────────────────
+    # Qualify on: rev_yoy ≥ rev_yoy_min  OR  (turned_positive AND
+    # rev_yoy ≥ turned_positive_rev_floor).  EPS is NOT a qualifier (it swings
+    # too violently off small bases) — it is a ranking input only.
+    rev_yoy_min: float = 0.40               # revenue YoY ≥ +40% (sole revenue gate)
+    turned_positive_rev_floor: float = 0.20  # turned_positive needs rev YoY ≥ +20%
+    accel_min_yoy: float = 0.15             # accel qualifies at latest YoY ≥ +15%
+    accel_min_quarters: int = 5             # ≥5q stored history to compute accel
+                                            #   (signal dormant below this)
     ipo_min_quarters: int = 2               # IPO revenue-only path needs ≥ 2 q
     min_quarters_for_growth: int = 4        # < this ⇒ IPO/insufficient path
 
-    # ── Ranking weights (revenue ≥ EPS) ───────────────────────────────────────
+    # ── Ranking weights (revenue ≥ EPS; EPS is ranking-only now) ──────────────
     rank_rev_weight: float = 1.0
     rank_eps_weight: float = 0.5            # EPS weighted half — noisier signal
     rank_winsorize: float = 3.0            # ±300% cap on YoY rank inputs
@@ -197,16 +210,21 @@ def passes_adr(facts: GrowthFacts, cfg: GrowthFilterConfig) -> bool:
 def qualify_growth(
     facts: GrowthFacts, cfg: GrowthFilterConfig
 ) -> tuple[str, tuple[str, ...]]:
-    """Tier-2 growth status for a Tier-1 survivor.
+    """Tier-2 growth status for a Tier-1 survivor — REVENUE is the gate.
 
-    Returns ``(bucket, reasons)`` where bucket ∈ {qualified, unqualified_data,
-    failed_growth}.  unqualified_data means the growth fundamentals are
-    UNAVAILABLE (foreign filer, quarantined/NULL YoY, too-new IPO) — never a
-    silent "failed growth."  failed_growth means data was present but no
-    qualifier met its threshold.
+    Qualify on:
+        rev_yoy ≥ rev_yoy_min  (≥ +40%)
+        OR  (turned_positive AND rev_yoy ≥ turned_positive_rev_floor)  (≥ +20%)
+        OR  revenue acceleration (rev_accel AND rev_yoy ≥ accel_min_yoy) — a
+            live branch but DORMANT today (rev_accel is NULL for every name).
+    EPS is NOT a qualifier — too noisy off small bases (ranking input only).
+
+    Returns ``(bucket, reasons)`` with bucket ∈ {qualified, unqualified_data,
+    failed_growth}.  unqualified_data means the REVENUE gate input is
+    UNAVAILABLE (foreign filer, quarantined/NULL rev YoY, too-new IPO) — never a
+    silent "failed growth"; EPS presence alone does NOT make a name judged.
+    failed_growth means revenue was present but cleared no qualifier.
     """
-    reasons: list[str] = []
-
     # ── IPO / insufficient-history path ───────────────────────────────────────
     if facts.n_quarters is not None and facts.n_quarters < cfg.min_quarters_for_growth:
         if facts.n_quarters < cfg.ipo_min_quarters:
@@ -218,33 +236,27 @@ def qualify_growth(
             return FAILED_GROWTH, ()
         return UNQUALIFIED_DATA, ()            # revenue YoY not computable yet
 
-    # ── Standard path ─────────────────────────────────────────────────────────
-    have_data = False
-    if facts.rev_yoy is not None:
-        have_data = True
-        if facts.rev_yoy >= cfg.rev_yoy_min:
-            reasons.append("rev")
-    if facts.eps_yoy is not None:
-        have_data = True
-        if facts.eps_yoy >= cfg.eps_yoy_min:
-            reasons.append("eps")
-    if facts.turned_positive:
-        have_data = True
+    # ── Standard path — revenue is the qualification gate ─────────────────────
+    if facts.rev_yoy is None:
+        # Gate input missing: cannot judge.  EPS alone never qualifies, so its
+        # presence does not turn this into a measured failed_growth.
+        return UNQUALIFIED_DATA, ()
+
+    reasons: list[str] = []
+    if facts.rev_yoy >= cfg.rev_yoy_min:
+        reasons.append("rev")
+    if facts.turned_positive and facts.rev_yoy >= cfg.turned_positive_rev_floor:
         reasons.append("turned_positive")
-    # Acceleration: latest YoY rate > prior quarter's, with latest YoY ≥ floor.
-    if facts.rev_accel is not None:
-        have_data = True
-        if facts.rev_accel and facts.rev_yoy is not None and facts.rev_yoy >= cfg.accel_min_yoy:
-            reasons.append("rev_accel")
-    if facts.eps_accel is not None:
-        have_data = True
-        if facts.eps_accel and facts.eps_yoy is not None and facts.eps_yoy >= cfg.accel_min_yoy:
-            reasons.append("eps_accel")
+    # Revenue acceleration — live qualifier branch, DORMANT today: rev_accel is
+    # NULL for every name (no symbol has ≥accel_min_quarters of stored history
+    # yet), so it contributes 0; it self-activates as history deepens.  EPS
+    # acceleration is intentionally NOT a qualifier (EPS never admits a name);
+    # eps_accel stays computed for diagnostics/ranking only.
+    if facts.rev_accel and facts.rev_yoy >= cfg.accel_min_yoy:
+        reasons.append("rev_accel")
 
     if reasons:
         return QUALIFIED, tuple(reasons)
-    if not have_data:
-        return UNQUALIFIED_DATA, ()
     return FAILED_GROWTH, ()
 
 
@@ -310,6 +322,10 @@ class FunnelCounts:
     growth_qualified: int = 0
     unqualified_data: int = 0
     failed_growth: int = 0
+    # Acceleration dormancy diagnostic: names with enough stored history for the
+    # acceleration signal to be computable at all (n_quarters ≥ accel_min_quarters).
+    accel_eligible: int = 0
+    accel_min_quarters: int = 5
 
     def render(self) -> str:
         """One-line funnel with the binding constraint always visible."""
@@ -321,10 +337,25 @@ class FunnelCounts:
         )
         return line
 
+    def accel_status(self) -> str:
+        """Acceleration's data status, so its silence is explained and never
+        mistaken for 'nothing is accelerating'."""
+        state = ("dormant until history deepens" if self.accel_eligible == 0
+                 else "active")
+        return (f"acceleration: {self.accel_eligible:,}/{self.total:,} names have "
+                f"≥{self.accel_min_quarters}q history — signal {state}")
 
-def compute_funnel(results: list[GrowthResult]) -> FunnelCounts:
+
+def compute_funnel(
+    results: list[GrowthResult], cfg: GrowthFilterConfig | None = None
+) -> FunnelCounts:
     f = FunnelCounts(total=len(results))
+    if cfg is not None:
+        f.accel_min_quarters = cfg.accel_min_quarters
     for r in results:
+        nq = r.facts.n_quarters
+        if nq is not None and nq >= f.accel_min_quarters:
+            f.accel_eligible += 1
         if r.pass_liquidity:
             f.after_liquidity += 1
             if r.pass_cap:
@@ -346,7 +377,7 @@ def evaluate_universe(
     """Pure core: evaluate every symbol, return results + funnel counts."""
     results = [evaluate_symbol(facts_by_symbol[s], cfg)
                for s in facts_by_symbol]
-    return results, compute_funnel(results)
+    return results, compute_funnel(results, cfg)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -633,6 +664,10 @@ def build_growth_universe(
         symbols, as_of, cfg, polygon_provider, db_path, skip_market_cap
     )
     results, funnel = evaluate_universe(facts, cfg)
+    # Explain acceleration's silence: it qualifies 0 names today because no name
+    # has ≥accel_min_quarters of stored history yet (dormant, not "nothing
+    # accelerating") — it self-activates as history accrues.
+    logger.info(funnel.accel_status())
     if persist:
         save_growth_universe(as_of, results, db_path)
 
@@ -696,7 +731,7 @@ def load_growth_funnel(as_of: date, db_path: str | None = None) -> Optional[Funn
         _ensure_schema(con)
         rows = con.execute(
             """
-            SELECT pass_liquidity, pass_cap, pass_adr, bucket
+            SELECT pass_liquidity, pass_cap, pass_adr, bucket, n_quarters
             FROM growth_universe WHERE as_of_date = ?
             """,
             [as_of.isoformat()],
@@ -707,7 +742,10 @@ def load_growth_funnel(as_of: date, db_path: str | None = None) -> Optional[Funn
     if not rows:
         return None
     f = FunnelCounts(total=len(rows))
-    for pl, pc, pa, bucket in rows:
+    f.accel_min_quarters = GrowthFilterConfig().accel_min_quarters
+    for pl, pc, pa, bucket, nq in rows:
+        if nq is not None and nq >= f.accel_min_quarters:
+            f.accel_eligible += 1
         if pl:
             f.after_liquidity += 1
             if pc:

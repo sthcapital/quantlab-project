@@ -1157,6 +1157,9 @@ def _growth_funnel_line(report_date: date, db_path: str | None = None) -> str | 
     line = f.render()
     if f.growth_qualified == 0:
         line += "  —  ZERO growth-qualified (correction tape); see basing/watchlist below"
+    # Explain acceleration's silence so a dormant signal isn't read as "nothing
+    # accelerating" (it qualifies 0 until names accrue ≥5q of stored history).
+    line += f"<br/>{f.accel_status()}"
     return line
 
 
