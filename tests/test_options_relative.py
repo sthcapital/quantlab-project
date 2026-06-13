@@ -354,8 +354,22 @@ class TestReportSignalRate:
         gr = _load_script("generate_report")
         db = tmp_path / "test.duckdb"
         self._seed(db, date(2026, 6, 12), n_total=357, n_flagged=31)
+        # No options_session_status row → session is unfinalized, so the header
+        # carries the intraday basis suffix (item 3d).
         line = gr._options_signal_rate(date(2026, 6, 12), str(db))
-        assert line == "Options: 31/357 unusual, 8.7%"
+        assert line == "Options: 31/357 unusual, 8.7% (intraday — finalizes overnight)"
+
+    def test_rate_line_marks_final_basis(self, tmp_path):
+        import duckdb
+        from quantlab.options_finalize import BASIS_FINAL, set_session_status
+        gr = _load_script("generate_report")
+        db = tmp_path / "test.duckdb"
+        self._seed(db, date(2026, 6, 12), n_total=357, n_flagged=31)
+        con = duckdb.connect(str(db))
+        set_session_status(con, date(2026, 6, 12), finalized=True, basis=BASIS_FINAL)
+        con.close()
+        line = gr._options_signal_rate(date(2026, 6, 12), str(db))
+        assert line == "Options: 31/357 unusual, 8.7% (final)"
 
     def test_legacy_fallback_for_prerecalibration_sessions(self, tmp_path):
         gr = _load_script("generate_report")

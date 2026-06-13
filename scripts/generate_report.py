@@ -1053,15 +1053,52 @@ def _options_signal_rate(
 
     if not total:
         return None
+    basis = _session_basis_suffix(report_date, db_path)
     if n_scored > 0:
         line = (f"Options: {n_flagged}/{n_scored} unusual, "
-                f"{n_flagged / n_scored:.1%}")
+                f"{n_flagged / n_scored:.1%}{basis}")
         if n_long_streak:
             line += (f"  |  {n_long_streak} streak≥5 "
                      f"(baseline-inflation watch)")
         return line
     return (f"Options: {n_legacy}/{total} unusual, "
-            f"{n_legacy / total:.1%} (legacy scorer)")
+            f"{n_legacy / total:.1%} (legacy scorer){basis}")
+
+
+def _session_basis_suffix(report_date: date, db_path: str | None = None) -> str:
+    """
+    Finalization-basis suffix for the options header line: " (final)" once the
+    session has been rescored against the EOD flat file, otherwise
+    " (intraday — finalizes overnight)".  Empty string only if the status table
+    is unavailable (old DB) — silence beats a misleading "(final)".
+    """
+    try:
+        from quantlab.options_finalize import get_session_status
+        st = get_session_status(report_date, db_path=db_path)
+    except Exception:
+        return ""
+    if st is None:
+        return " (intraday — finalizes overnight)"
+    return " (final)" if st.get("finalized") else " (intraday — finalizes overnight)"
+
+
+def _stale_finalization_warning(db_path: str | None = None) -> str | None:
+    """
+    WARNING string when any options session is still unfinalized past noon the
+    next trading day — finalization has stalled (most likely a credential /
+    permission failure that must not silently persist).  None when all clear.
+    """
+    try:
+        from quantlab.options_finalize import stale_unfinalized_sessions
+        stale = stale_unfinalized_sessions(db_path=db_path)
+    except Exception:
+        return None
+    if not stale:
+        return None
+    dates = ", ".join(d.isoformat() for d in stale)
+    return (f"WARNING: options finalization STALLED — session(s) {dates} still "
+            f"unfinalized past noon the next trading day; check POLYGON_S3 "
+            f"credentials (manual: scripts/rescore_options_session.py --write).")
 
 
 def _universe_gate_warning(report_date: date, db_path: str | None = None) -> str | None:
@@ -1233,7 +1270,13 @@ def generate(
     if gate_warning:
         print(f"  {gate_warning}")
 
-    header_warnings = [w for w in (opts_warning, gate_warning) if w]
+    # Finalization stalled past the noon-next-day deadline — credential/permission
+    # failure must not silently persist (item 3c loud alert)
+    stale_warning = _stale_finalization_warning(db_path)
+    if stale_warning:
+        print(f"  {stale_warning}")
+
+    header_warnings = [w for w in (opts_warning, gate_warning, stale_warning) if w]
     header_warning = "<br/>".join(header_warnings) if header_warnings else None
 
     # Day's options signal rate — saturation drift must be visible immediately

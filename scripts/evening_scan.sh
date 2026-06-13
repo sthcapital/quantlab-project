@@ -87,6 +87,25 @@ cd "$PROJECT_DIR"
     sep
 } | tee -a "$LOG_FILE"
 
+# ── Finalize the current options session (first step) ──────────────────────────
+# Attempt to rescore today's options_snapshots against the EOD flat file.  The
+# same-day file is usually not published yet at 5 PM ET, so this normally records
+# the session intraday/unfinalized and the morning sweep finalizes it tomorrow.
+# A 403 the finalizer can attribute to non-publication is fine; a credential
+# failure (exit 2) is surfaced loudly but does not abort the scan.
+{
+    echo ""
+    echo "══ [$(ts)] Options session finalize — $(date +%Y-%m-%d) ═════════════"
+} | tee -a "$LOG_FILE"
+
+if python scripts/finalize_sessions.py 2>&1 | tee -a "$LOG_FILE"; then
+    log "Options session finalize step complete."
+else
+    log "ALERT: options finalization reported a credential/permission failure — "
+    log "       same-day EOD flat file unreadable for a reason other than "
+    log "       non-publication.  Check POLYGON_S3_ACCESS_KEY_ID / POLYGON_API_KEY."
+fi
+
 # ── Tradeable universe build ────────────────────────────────────────────────────
 {
     echo ""

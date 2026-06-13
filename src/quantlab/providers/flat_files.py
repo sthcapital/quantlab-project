@@ -112,6 +112,55 @@ class FlatFileProvider:
         with gzip.open(io.BytesIO(raw), "rt", newline="") as f:
             return list(csv.DictReader(f))
 
+    # ── S3 access probe (publication vs permission) ─────────────────────────────
+
+    @staticmethod
+    def classify_s3_error(err) -> str:
+        """
+        Classify a botocore ClientError into one of:
+            'not_found' — the object does not exist (HTTP 404 / NoSuchKey).
+            'denied'    — access denied (HTTP 403 / AccessDenied / Signature
+                          errors).  On a bucket without ListBucket permission,
+                          S3 also returns 403 for an absent key, so 'denied'
+                          on a single date is NOT proof of a credential failure
+                          — disambiguate by probing a known-published date.
+            'error'     — any other / unexpected failure.
+        """
+        resp = getattr(err, "response", None) or {}
+        status = resp.get("ResponseMetadata", {}).get("HTTPStatusCode")
+        code = str(resp.get("Error", {}).get("Code", ""))
+        if status == 404 or code in ("404", "NoSuchKey", "NoSuchBucket"):
+            return "not_found"
+        if status == 403 or code in (
+            "403", "AccessDenied", "InvalidAccessKeyId",
+            "SignatureDoesNotMatch", "Forbidden",
+        ):
+            return "denied"
+        return "error"
+
+    def probe_options_access(self, d: date) -> str:
+        """
+        HEAD the options flat file for ``d`` without downloading or caching.
+
+        Returns 'ok' (object exists and is readable), 'not_found' (404 — not
+        yet published), 'denied' (403 — access denied or 403-masked absence),
+        or 'error'.  Used by the finalization pipeline to tell "EOD file not
+        published yet" apart from a genuine credential/permission failure
+        (the 2026-06-12 manual run saw a same-day 403 that looked identical to
+        access-denied).
+        """
+        try:
+            from botocore.exceptions import ClientError
+        except Exception:                     # botocore absent — cannot probe
+            return "error"
+        try:
+            self._get_s3().head_object(Bucket=self.bucket, Key=self.options_s3_key(d))
+            return "ok"
+        except ClientError as err:
+            return self.classify_s3_error(err)
+        except Exception:
+            return "error"
+
     # ── Stocks pipeline ────────────────────────────────────────────────────────
 
     def download_stocks_day(self, d: date) -> dict[str, Bar]:

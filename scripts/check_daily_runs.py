@@ -198,6 +198,24 @@ def check_options_heartbeat(check_date: date, db_path: Path | None = None) -> in
     return int(n)
 
 
+def check_stale_finalization(db_path: Path | None = None) -> list[str] | None:
+    """
+    Options sessions still unfinalized past noon the next trading day.
+
+    The evening scan records a session intraday/unfinalized when the EOD flat
+    file isn't published yet, and the morning sweep finalizes it once it lands.
+    A session still stuck past noon the next trading day means finalization has
+    stalled — almost always a Polygon S3 credential/permission failure — and
+    must be surfaced loudly (item 3c).  [] = all clear; None = DB unreadable.
+    """
+    try:
+        from quantlab.options_finalize import stale_unfinalized_sessions
+        stale = stale_unfinalized_sessions(db_path=db_path)
+    except Exception:
+        return None
+    return [d.isoformat() for d in stale]
+
+
 def check_position_prices(db_path: Path | None = None) -> list[str] | None:
     """
     Symbols of open ('watching') positions with a NULL current price.
@@ -431,6 +449,23 @@ def check_and_report(
         else:
             results.append((_tag("[OK]", _GREEN),
                             f"{'Universe gate':<18} build accepted for {check_date}"))
+
+    # Options finalization staleness — a session unfinalized past noon the next
+    # trading day means a credential/permission failure has stalled the overnight
+    # finalize (item 3c).  Critical: it must not persist silently.
+    stale_sessions = check_stale_finalization(db_path)
+    if stale_sessions is None:
+        results.append((_tag("[WARN]", _YELLOW),
+                        f"{'Options finalize':<18} DuckDB unreadable — cannot verify"))
+    elif stale_sessions:
+        results.append((_tag("[MISSING]", _RED),
+                        f"{'Options finalize':<18} session(s) unfinalized past noon "
+                        f"next trading day: {', '.join(stale_sessions)} "
+                        f"(check POLYGON_S3 creds)"))
+        exit_code = 1
+    else:
+        results.append((_tag("[OK]", _GREEN),
+                        f"{'Options finalize':<18} no stale unfinalized sessions"))
 
     # Position-price invariant — a null current price means the stop cannot
     # trigger (SNEX 2026-06-12).  Critical: monitoring blind is a failure.

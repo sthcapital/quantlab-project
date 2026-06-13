@@ -48,81 +48,44 @@ def main() -> None:
     from quantlab.storage import DB_PATH, connect_with_retry
     from quantlab.utils import get_config
     from quantlab.providers.flat_files import FlatFileProvider
-    from quantlab.signals.options_relative import (
-        cross_sectional_flags,
-        relative_options_score,
-        volume_zscore,
-    )
+    # Shared with the automated finalizer (scripts/finalize_sessions.py) so the
+    # manual override and the overnight path can never drift apart.
+    from quantlab.options_finalize import compute_session_scores
 
     pctl = args.percentile if args.percentile is not None else float(
         get_config("scanner").get("options_unusual_percentile", 90.0)
     )
 
     con = connect_with_retry(DB_PATH, read_only=True)
-    rows = con.execute(
-        "SELECT symbol, pcr, iv_skew, options_score FROM options_snapshots "
-        "WHERE snap_date = ? ORDER BY symbol",
+    n_rows = con.execute(
+        "SELECT COUNT(*) FROM options_snapshots WHERE snap_date = ?",
         [session],
-    ).fetchall()
-    con.close()
-
-    if not rows:
+    ).fetchone()[0]
+    if not n_rows:
+        con.close()
         print(f"No options_snapshots rows for {session} — nothing to rescore.")
         return
 
     flat = FlatFileProvider()
-
-    # Session EOD call volumes (downloads the flat file on first access)
     try:
-        flat.download_options_day(session)
+        ss = compute_session_scores(session, con, flat, pctl)
     except Exception as exc:
+        con.close()
         print(f"Options flat file for {session} unavailable: {exc}")
         return
-    session_vols = flat.get_underlying_call_volumes(session)
+    con.close()
 
-    # Trailing 20-session baselines (cached parquet reads only)
-    history = flat.get_call_volume_history(session, n_sessions=20)
-    print(f"Rescoring {len(rows)} symbols for {session} — "
-          f"{len(history)} baseline sessions, gate p{pctl:g}\n")
+    results        = ss.results
+    flagged        = ss.flagged
+    put_dominated  = ss.put_dominated   # PCR-ceiling-blocked: future short-side data
+    floor_blocked  = ss.floor_blocked   # would have flagged on score+z alone
+    print(f"Rescoring {n_rows} symbols for {session} — "
+          f"{ss.n_baseline} baseline sessions, gate p{pctl:g}\n")
 
-    results: dict[str, dict] = {}
-    for sym, pcr, iv_skew, legacy_score in rows:
-        baseline = [day.get(sym, 0.0) for day in history]
-        call_vol = session_vols.get(sym, 0.0)
-        vol_z = volume_zscore(call_vol, baseline)
-        rel = relative_options_score(vol_z, pcr=pcr, iv_skew=iv_skew)
-        results[sym] = {
-            "call_volume": call_vol,
-            "baseline_mean": (sum(baseline) / len(baseline)) if baseline else None,
-            "vol_zscore": vol_z,
-            "rel_score": rel,
-            "pcr": pcr,
-            "iv_skew": iv_skew,
-            "legacy_score": legacy_score,
-        }
-
-    _cfg = get_config("scanner")
+    scores = {sym: r["rel_score"] for sym, r in results.items()}
+    _cfg     = get_config("scanner")
     min_base = float(_cfg.get("options_min_baseline_contracts", 75))
     max_pcr  = float(_cfg.get("options_gate_max_pcr", 1.5))
-    scores     = {sym: r["rel_score"] for sym, r in results.items()}
-    zscores    = {sym: r["vol_zscore"] for sym, r in results.items()}
-    base_means = {sym: r["baseline_mean"] for sym, r in results.items()}
-    pcrs       = {sym: r["pcr"] for sym, r in results.items()}
-    flagged = cross_sectional_flags(
-        scores, percentile_cut=pctl, zscores=zscores,
-        baseline_means=base_means, min_baseline=min_base,
-        pcrs=pcrs, max_pcr=max_pcr,
-    )
-    # Put-dominated: cleared volume/liquidity gates, blocked by PCR ceiling —
-    # tagged in options_snapshots as future short-side signal data
-    put_dominated = cross_sectional_flags(
-        scores, percentile_cut=pctl, zscores=zscores,
-        baseline_means=base_means, min_baseline=min_base,
-    ) - flagged
-    # Floor-blocked: would have flagged on score+z alone — listed for review
-    floor_blocked = cross_sectional_flags(
-        scores, percentile_cut=pctl, zscores=zscores,
-    ) - flagged - put_dominated
 
     def _f2(v, width: int = 6) -> str:
         """NULL-safe column format — '—' for unmeasured values (MISSING ≠ ZERO)."""

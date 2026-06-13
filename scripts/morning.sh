@@ -61,6 +61,25 @@ cd "$PROJECT_DIR"
     sep
 } | tee -a "$LOG_FILE"
 
+# ── Step 0: Finalize prior options sessions ───────────────────────────────────
+# Yesterday's EOD options flat file is reliably published by now, so finalize any
+# session the evening scan left intraday/unfinalized.  This is the normal path to
+# a 'final' session.  A credential failure (exit 2) is surfaced loudly; a session
+# still stuck is also caught by the noon-deadline alert in the health check and
+# report header.
+{
+    echo ""
+    echo "══ [$(ts)] Options finalization sweep — $(date +%Y-%m-%d) ══════════"
+} | tee -a "$LOG_FILE"
+
+if python scripts/finalize_sessions.py --sweep 2>&1 | tee -a "$LOG_FILE"; then
+    log "Options finalization sweep complete."
+else
+    log "ALERT: options finalization sweep reported a credential/permission "
+    log "       failure — a prior session's EOD flat file is unreadable.  Check "
+    log "       POLYGON_S3_ACCESS_KEY_ID / POLYGON_API_KEY."
+fi
+
 # ── Step 1: Breadth tape (rolling recompute, no Polygon fetch) ────────────────
 {
     echo ""
