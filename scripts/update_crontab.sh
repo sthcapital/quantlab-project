@@ -44,7 +44,7 @@ echo "[$(ts)] update_crontab.sh"
 echo "  Host clock   : ${TZ_ABBREV} (UTC${UTC_OFFSET}) — cron fields are LOCAL Eastern time"
 echo "  Morning check: 08:45 AM ET  (cron: 45 8 * * 1-5)"
 echo "  Evening scan : 05:00 PM ET  (cron: 0 17 * * 1-5)"
-echo "  Evening scan : 06:00 PM ET  Sunday only (cron: 0 18 * * 0)"
+echo "  Weekend scan : 09:00 AM ET  Sunday only (cron: 0 9 * * 0)"
 echo "  EOD tracker  : 04:30 PM ET  (cron: 30 16 * * 1-5)"
 echo "  Health check : 06:15 PM ET  (cron: 15 18 * * 1-5)"
 echo "  Options      : 9:30 AM – 3:30 PM ET every 30 min (cron: */30 9-15 * * 1-5)"
@@ -65,8 +65,8 @@ NEW_CRONTAB="# QuantLab automated trading schedule
 # in quantlab/universe.py refuses degenerate builds.)
 0 17 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && bash scripts/evening_scan.sh' >> ${LOG_FILE} 2>&1
 
-# ── Evening scan (06:00 PM ET, Sunday) — weekend data refresh ─────────────────
-0 18 * * 0 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && bash scripts/evening_scan.sh' >> ${LOG_FILE} 2>&1
+# ── Weekend scan (09:00 AM ET, Sunday) — weekend data refresh ─────────────────
+0 9 * * 0 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && bash scripts/evening_scan.sh' >> ${LOG_FILE} 2>&1
 
 # ── End-of-day forward return tracker (04:30 PM ET, Mon–Fri) ─────────────────
 30 16 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && python scripts/track_forward_returns.py' >> ${LOG_FILE} 2>&1
@@ -75,7 +75,7 @@ NEW_CRONTAB="# QuantLab automated trading schedule
 # Script self-checks market hours (9:30 AM – 4:00 PM) and exits early if
 # outside — the 9:00 AM fire is skipped by that guard.
 # Invoked via the run-locked wrapper: a duplicate scheduler entry logs
-# "DUPLICATE INVOCATION SUPPRESSED" and exits 0 instead of racing the lock.
+# DUPLICATE INVOCATION SUPPRESSED and exits 0 instead of racing the lock.
 */30 9-15 * * 1-5 /bin/bash -lc 'source ${CONDA_BASE}/etc/profile.d/conda.sh && conda activate quantlab && cd ${PROJECT_DIR} && [[ -f .env ]] && set -a && source .env && set +a; bash scripts/monitor_options.sh' >> ${LOG_FILE} 2>&1
 
 # ── Daily health check (06:15 PM ET, Mon–Fri) ────────────────────────────────
