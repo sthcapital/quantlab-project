@@ -233,20 +233,44 @@ def most_recent_completed_session(trade_date: date, now=None) -> date:
     return d
 
 
+# Bootstrap seeding bounds: with no accepted-build history yet, only a build
+# that already looks like a full universe may seed the baseline.  The first
+# accepted build *defines* the trailing median, so a degenerate one poisons it
+# permanently.  The 2026-06-14 freeze was exactly this: the old unconditional
+# bootstrap accepted two final_count=1 builds (06-04/05), the median became 1,
+# and ±15% of 1 then refused every real ~2,000-symbol build forever.  A genuine
+# full universe has run ~2,000–2,325 names; require that range to seed.
+GATE_BOOTSTRAP_MIN = 2000
+GATE_BOOTSTRAP_MAX = 2400
+
+
 def universe_gate_check(
     final_count: int,
     baseline_median: float | None,
     max_deviation: float = 0.15,
+    bootstrap_min: int = GATE_BOOTSTRAP_MIN,
+    bootstrap_max: int = GATE_BOOTSTRAP_MAX,
 ) -> tuple[bool, str]:
     """
     Post-build sanity gate: does ``final_count`` look like a sane universe?
 
-    Returns ``(accepted, reason)``.  Refuses when the new count deviates more
-    than ``max_deviation`` from the trailing median of gate-accepted builds.
-    With no baseline yet (bootstrap), accepts.
+    Returns ``(accepted, reason)``.  With an established baseline, refuses when
+    the new count deviates more than ``max_deviation`` from the trailing median
+    of gate-accepted builds.
+
+    With no baseline yet (bootstrap), accepts only a build that already looks
+    like a full universe — ``final_count`` in ``[bootstrap_min, bootstrap_max]``
+    — so a degenerate first build can never seed the baseline and freeze the
+    gate.  Anything outside that range is refused rather than accepted blindly.
     """
     if baseline_median is None or baseline_median <= 0:
-        return True, ""
+        if bootstrap_min <= final_count <= bootstrap_max:
+            return True, ""
+        return False, (
+            f"bootstrap: final_count {final_count} is outside the sane seeding "
+            f"range [{bootstrap_min}, {bootstrap_max}] — refusing to seed the "
+            f"accepted-build baseline from a non-full build"
+        )
     deviation = (final_count - baseline_median) / baseline_median
     if abs(deviation) > max_deviation:
         return False, (
@@ -1053,6 +1077,9 @@ class UniverseManager:
                 "UNIVERSE GATE: no prior universe available — "
                 "using the flagged build (bootstrap)",
             )
+            # The DB row above recorded the refusal for the build-for date; the
+            # stats we return must reflect the data we're actually handing back.
+            stats.date = actual_date.isoformat()
             save_universe_cache(actual_date, candidates, dvols)
             return candidates, stats
 

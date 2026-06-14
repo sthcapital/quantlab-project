@@ -75,12 +75,45 @@ class TestUniverseGateCheck:
         ok, _ = universe_gate_check(2300, 2000.0, max_deviation=0.15)  # exactly +15%
         assert ok
 
-    def test_no_baseline_bootstrap_accepts(self):
-        ok, _ = universe_gate_check(457, None, max_deviation=0.15)
-        assert ok
-
     def test_deviation_configurable(self):
         ok, _ = universe_gate_check(2400, 2000.0, max_deviation=0.25)  # +20% < 25%
+        assert ok
+
+
+class TestBootstrapSeeding:
+    """With no accepted history, only a full-universe build may seed the
+    baseline — a degenerate first build must NOT be accepted (the 2026-06-14
+    freeze: final_count=1 bootstrap-accepted → median 1 → everything refused)."""
+
+    def test_sane_full_build_seeds_baseline(self):
+        # Today's 2,093 build: no baseline yet, within the seeding range
+        ok, reason = universe_gate_check(2093, None, max_deviation=0.15)
+        assert ok and reason == ""
+
+    def test_degenerate_build_refused_not_seeded(self):
+        # The poison: a single-symbol build must never become the baseline
+        ok, reason = universe_gate_check(1, None, max_deviation=0.15)
+        assert not ok
+        assert "bootstrap" in reason and "[2000, 2400]" in reason
+
+    def test_truncated_build_not_seeded(self):
+        # The 06-04 truncation (457 names) is below the seeding floor
+        ok, reason = universe_gate_check(457, None, max_deviation=0.15)
+        assert not ok and "bootstrap" in reason
+
+    def test_oversized_build_not_seeded(self):
+        ok, _ = universe_gate_check(5000, None, max_deviation=0.15)
+        assert not ok
+
+    def test_seeding_bounds_inclusive(self):
+        assert universe_gate_check(2000, None)[0]    # lower bound
+        assert universe_gate_check(2400, None)[0]    # upper bound
+        assert not universe_gate_check(1999, None)[0]
+        assert not universe_gate_check(2401, None)[0]
+
+    def test_zero_baseline_treated_as_bootstrap(self):
+        # A baseline that computed to 0 must not divide-by-zero; bootstrap path
+        ok, _ = universe_gate_check(2093, 0.0, max_deviation=0.15)
         assert ok
 
 
@@ -144,6 +177,37 @@ class TestGateBaseline:
         db = tmp_path / "test.duckdb"
         _seed_history(db, [])
         assert gate_baseline_median(db_path=db) is None
+
+    def test_degenerate_accepted_rows_self_heal(self, tmp_path):
+        """The 2026-06-14 poison: final_count=1 builds marked accepted.  The
+        schema migration must correct them so the median is no longer 1 and the
+        gate can recover (median over the remaining real accepted build)."""
+        from quantlab.storage import _ensure_schema
+        db = tmp_path / "test.duckdb"
+        _seed_history(db, [
+            (date(2026, 6, 4), 1, True),       # poison
+            (date(2026, 6, 5), 1, True),       # poison
+            (date(2026, 6, 16), 2100, True),   # genuine accepted build
+        ])
+        # Re-running the schema migration corrects the degenerate accepted rows
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.close()
+        # Median now reflects only the real build, not the poison
+        assert gate_baseline_median(db_path=db) == pytest.approx(2100.0)
+
+    def test_self_heal_to_none_rebootstraps(self, tmp_path):
+        """When the poison rows were the ONLY accepted rows, the baseline
+        becomes None and the gate falls back to bootstrap seeding."""
+        from quantlab.storage import _ensure_schema
+        db = tmp_path / "test.duckdb"
+        _seed_history(db, [(date(2026, 6, 4), 1, True), (date(2026, 6, 5), 1, True)])
+        con = duckdb.connect(str(db))
+        _ensure_schema(con)
+        con.close()
+        assert gate_baseline_median(db_path=db) is None
+        # …and 2,093 now seeds cleanly via the bootstrap path
+        assert universe_gate_check(2093, gate_baseline_median(db_path=db))[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

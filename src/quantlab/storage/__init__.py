@@ -547,6 +547,21 @@ def _ensure_schema(con) -> None:
     except Exception:
         pass
 
+    # 2026-06-14 fix: the old unconditional bootstrap marked two degenerate
+    # builds (final_count=1, 2026-06-04/05) as gate_accepted=TRUE.  Being the
+    # only accepted rows, they poisoned the trailing median to 1, so the ±15%
+    # sanity gate refused every real ~2,000-symbol build and froze the universe
+    # at the 1,477 fallback.  Correct any degenerate accepted row — a genuine
+    # universe is never a handful of symbols — so the baseline rebuilds from
+    # real full builds (or bootstraps cleanly when none remain).  Idempotent.
+    try:
+        con.execute(
+            "UPDATE universe_history SET gate_accepted = FALSE "
+            "WHERE gate_accepted = TRUE AND final_count < 100"
+        )
+    except Exception:
+        pass
+
     con.execute("""
         CREATE TABLE IF NOT EXISTS institutional_watchlist (
             symbol                TEXT PRIMARY KEY,
